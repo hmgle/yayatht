@@ -1,3 +1,4 @@
+use crate::buffer::{BufferPool, FRAME_CAPACITY, FrameBuffer};
 use crate::flow_table::{EpollToken, FlowId, FlowTable, Resource};
 use getrandom::fill as random_fill;
 use std::collections::{HashMap, VecDeque};
@@ -19,6 +20,8 @@ use yayatht_tcp_adapter::flow::{
 use yayatht_tcp_adapter::sequence;
 
 const TAP_BUDGET: usize = 32;
+const TAP_TX_BUDGET: usize = 32;
+const TAP_FRAME_POOL_SIZE: usize = 4096;
 const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 const MAX_RETRIES: u8 = 5;
@@ -218,8 +221,29 @@ impl SentSegment {
 
 struct QueuedFrame {
     flow: Option<FlowId>,
-    bytes: Vec<u8>,
+    frame: PooledFrame,
     plan: Option<SendPlan>,
+}
+
+struct PooledFrame {
+    pool_index: usize,
+    buffer: FrameBuffer,
+}
+
+enum PeekedFrame {
+    Data { frame: PooledFrame, length: usize },
+    Eof,
+    WouldBlock,
+}
+
+#[derive(Clone, Copy)]
+struct TcpFrameSpec {
+    key: FlowKey,
+    plan: SendPlan,
+    flags: TcpFlags,
+    mss: Option<u16>,
+    window: u16,
+    payload_len: usize,
 }
 
 pub struct Reactor {
@@ -230,6 +254,7 @@ pub struct Reactor {
     timer: yayatht_sys::reactor::TimerFd,
     flows: FlowTable<FlowEntry>,
     by_key: HashMap<FlowKey, FlowId>,
+    frame_pool: BufferPool,
     tap_queue: VecDeque<QueuedFrame>,
     metrics: Metrics,
     shutting_down: bool,
@@ -263,6 +288,7 @@ impl Reactor {
             timer,
             flows: FlowTable::with_capacity(max_tcp_flows),
             by_key: HashMap::with_capacity(max_tcp_flows),
+            frame_pool: BufferPool::new(TAP_FRAME_POOL_SIZE),
             tap_queue: VecDeque::new(),
             metrics: Metrics::default(),
             shutting_down: false,
@@ -325,6 +351,10 @@ impl Reactor {
 
     fn handle_tap(&mut self) -> Result<(), Error> {
         for _ in 0..TAP_BUDGET {
+            if self.frame_pool.available() == 0 {
+                self.update_tap_interest()?;
+                break;
+            }
             let mut bytes = [0u8; 2048];
             let length = match yayatht_sys::reactor::read(self.tap.as_raw_fd(), &mut bytes) {
                 Ok(0) => return Err(Error::Invariant("TAP returned EOF")),
@@ -359,14 +389,20 @@ impl Reactor {
         if request.target_ip != gateway.octets() {
             return Ok(());
         }
-        let mut frame = vec![0u8; 64];
-        let length = neighbor::write_arp_reply(
-            &mut frame,
+        let mut frame = self.acquire_frame()?;
+        let length = match neighbor::write_arp_reply(
+            frame.buffer.writable(),
             self.config.gateway_mac,
             gateway.octets(),
             request,
-        )?;
-        frame.truncate(length);
+        ) {
+            Ok(length) => length,
+            Err(error) => {
+                self.release_frame(frame);
+                return Err(error.into());
+            }
+        };
+        frame.buffer.set_len(length);
         self.queue_tap(None, frame, None)
     }
 
@@ -403,15 +439,21 @@ impl Reactor {
             if target != gateway.octets() {
                 return Ok(());
             }
-            let mut frame = vec![0u8; 128];
-            let length = neighbor::write_neighbor_advertisement(
-                &mut frame,
+            let mut frame = self.acquire_frame()?;
+            let length = match neighbor::write_neighbor_advertisement(
+                frame.buffer.writable(),
                 self.config.gateway_mac,
                 ethernet.source(),
                 gateway.octets(),
                 packet.source(),
-            )?;
-            frame.truncate(length);
+            ) {
+                Ok(length) => length,
+                Err(error) => {
+                    self.release_frame(frame);
+                    return Err(error.into());
+                }
+            };
+            frame.buffer.set_len(length);
             debug!(gateway = %gateway, "sending neighbor advertisement");
             return self.queue_tap(None, frame, None);
         }
@@ -455,6 +497,11 @@ impl Reactor {
         random_fill(&mut random)
             .map_err(|error| io::Error::other(format!("getrandom failed: {error:?}")))?;
         let default_mss = if key.target.is_ipv4() { 1460 } else { 1440 };
+        let negotiated_mss = segment
+            .mss()
+            .filter(|mss| *mss >= 536)
+            .unwrap_or(default_mss)
+            .min(default_mss);
         let mut construction = FlowConstruction::new();
         construction
             .set_initiating(FlowSide {
@@ -474,7 +521,7 @@ impl Reactor {
                 key,
                 segment.sequence(),
                 u32::from_ne_bytes(random),
-                segment.mss().unwrap_or(default_mss),
+                negotiated_mss,
             ),
             construction,
             socket,
@@ -980,81 +1027,80 @@ impl Reactor {
     }
 
     fn send_socket_data(&mut self, id: FlowId) -> Result<(), Error> {
-        if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
-            return Ok(());
-        }
-        let (state, payload_offset, window, mss, fd) = {
-            let entry = self.flows.get(id).expect("flow exists");
-            (
-                entry.flow.state(),
-                entry
-                    .sent_segments
-                    .iter()
-                    .map(|segment| segment.payload_len)
-                    .sum::<usize>(),
-                entry.flow.available_namespace_window(),
-                usize::from(entry.flow.mss()),
-                entry.socket.as_raw_fd(),
-            )
-        };
-        if !matches!(state, State::Established | State::NamespaceFinReceived) {
-            return Ok(());
-        }
-        if window == 0 {
-            return Ok(());
-        }
-        let offset = i32::try_from(payload_offset)
-            .map_err(|_| Error::Invariant("socket peek offset exceeds i32"))?;
-        yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
-        let mut payload = vec![0u8; mss.min(window)];
-        match yayatht_sys::socket::peek(fd, &mut payload) {
-            Ok(0) => {
-                let plan = self
-                    .flows
-                    .get(id)
-                    .expect("flow exists")
-                    .flow
-                    .plan_send(0, true)
-                    .ok_or(Error::Invariant("unable to plan FIN"))?;
-                let frame = self.build_flow_frame(
-                    id,
-                    plan,
-                    &[],
-                    TcpFlags {
-                        fin: true,
-                        ack: true,
-                        ..TcpFlags::default()
-                    },
-                )?;
-                self.queue_tap(Some(id), frame, Some(plan))?;
+        for _ in 0..TAP_TX_BUDGET {
+            if self.frame_pool.available() == 0 {
+                break;
             }
-            Ok(length) => {
-                payload.truncate(length);
-                self.flows
-                    .get_mut(id)
-                    .expect("flow exists")
-                    .last_namespace_byte = payload.last().copied();
-                let plan = self
-                    .flows
-                    .get(id)
-                    .expect("flow exists")
-                    .flow
-                    .plan_send(length, false)
-                    .ok_or(Error::Invariant("unable to plan TCP payload"))?;
-                let frame = self.build_flow_frame(
-                    id,
-                    plan,
-                    &payload,
-                    TcpFlags {
-                        psh: true,
-                        ack: true,
-                        ..TcpFlags::default()
-                    },
-                )?;
-                self.queue_tap(Some(id), frame, Some(plan))?;
+            if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
+                break;
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-            Err(error) => return Err(error.into()),
+            let (state, payload_offset, window, mss) = {
+                let entry = self.flows.get(id).expect("flow exists");
+                (
+                    entry.flow.state(),
+                    entry
+                        .sent_segments
+                        .iter()
+                        .map(|segment| segment.payload_len)
+                        .sum::<usize>(),
+                    entry.flow.available_namespace_window(),
+                    usize::from(entry.flow.mss()),
+                )
+            };
+            if !matches!(state, State::Established | State::NamespaceFinReceived) || window == 0 {
+                break;
+            }
+            match self.peek_socket_frame(id, payload_offset, mss.min(window))? {
+                PeekedFrame::Eof => {
+                    let plan = self
+                        .flows
+                        .get(id)
+                        .expect("flow exists")
+                        .flow
+                        .plan_send(0, true)
+                        .ok_or(Error::Invariant("unable to plan FIN"))?;
+                    let frame = self.build_flow_frame(
+                        id,
+                        plan,
+                        &[],
+                        TcpFlags {
+                            fin: true,
+                            ack: true,
+                            ..TcpFlags::default()
+                        },
+                    )?;
+                    self.queue_tap(Some(id), frame, Some(plan))?;
+                }
+                PeekedFrame::Data { mut frame, length } => {
+                    let plan = self
+                        .flows
+                        .get(id)
+                        .expect("flow exists")
+                        .flow
+                        .plan_send(length, false)
+                        .ok_or(Error::Invariant("unable to plan TCP payload"))?;
+                    let key = self.flows.get(id).expect("flow exists").flow.key();
+                    let last_byte =
+                        frame.buffer.writable()[Self::tcp_payload_offset(key, None) + length - 1];
+                    self.flows
+                        .get_mut(id)
+                        .expect("flow exists")
+                        .last_namespace_byte = Some(last_byte);
+                    let frame = self.finalize_flow_payload_frame(
+                        id,
+                        frame,
+                        plan,
+                        TcpFlags {
+                            psh: true,
+                            ack: true,
+                            ..TcpFlags::default()
+                        },
+                        length,
+                    )?;
+                    self.queue_tap(Some(id), frame, Some(plan))?;
+                }
+                PeekedFrame::WouldBlock => break,
+            }
         }
         Ok(())
     }
@@ -1085,6 +1131,9 @@ impl Reactor {
     fn handle_timers(&mut self) -> Result<(), Error> {
         let now = Instant::now();
         for id in self.flows.active_ids() {
+            if self.frame_pool.available() == 0 {
+                break;
+            }
             let retransmit = {
                 let entry = self.flows.get(id).expect("flow exists");
                 entry.zero_window_probe.is_none()
@@ -1196,36 +1245,13 @@ impl Reactor {
         if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
             return Ok(());
         }
-        let (segment, fd, acknowledgment) = {
+        let (segment, acknowledgment) = {
             let entry = self.flows.get(id).expect("flow exists");
             let Some(segment) = entry.sent_segments.front() else {
                 return Ok(());
             };
-            (
-                segment.clone(),
-                entry.socket.as_raw_fd(),
-                entry.flow.namespace_ack(),
-            )
+            (segment.clone(), entry.flow.namespace_ack())
         };
-        let mut payload = vec![0u8; segment.payload_len];
-        if segment.payload_len > 0 {
-            yayatht_sys::tcp_info::set_peek_offset(fd, 0)?;
-            match yayatht_sys::socket::peek(fd, &mut payload) {
-                Ok(length) if length == payload.len() => {}
-                Ok(_) => {
-                    self.fail_tcp_flow(id, "retained socket payload is shorter than segment")?;
-                    return Ok(());
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.fail_tcp_flow(id, "retained socket payload is unavailable")?;
-                    return Ok(());
-                }
-                Err(error) => {
-                    self.fail_tcp_flow(id, &error.to_string())?;
-                    return Ok(());
-                }
-            }
-        }
         let plan = SendPlan {
             sequence: segment.sequence,
             acknowledgment,
@@ -1233,7 +1259,28 @@ impl Reactor {
             syn: segment.syn,
             fin: segment.fin,
         };
-        let frame = self.build_flow_frame(id, plan, &payload, segment.flags())?;
+        let frame = if segment.payload_len > 0 {
+            match self.peek_socket_frame(id, 0, segment.payload_len)? {
+                PeekedFrame::Data { frame, length } if length == segment.payload_len => {
+                    self.finalize_flow_payload_frame(id, frame, plan, segment.flags(), length)?
+                }
+                PeekedFrame::Data { frame, .. } => {
+                    self.release_frame(frame);
+                    self.fail_tcp_flow(id, "retained socket payload is shorter than segment")?;
+                    return Ok(());
+                }
+                PeekedFrame::WouldBlock => {
+                    self.fail_tcp_flow(id, "retained socket payload is unavailable")?;
+                    return Ok(());
+                }
+                PeekedFrame::Eof => {
+                    self.fail_tcp_flow(id, "retained socket payload reached EOF")?;
+                    return Ok(());
+                }
+            }
+        } else {
+            self.build_flow_frame(id, plan, &[], segment.flags())?
+        };
         self.queue_tap(Some(id), frame, None)?;
         let segment = self
             .flows
@@ -1301,13 +1348,44 @@ impl Reactor {
         }
     }
 
-    fn build_flow_frame(
-        &self,
+    fn peek_socket_frame(
+        &mut self,
         id: FlowId,
-        plan: SendPlan,
-        payload: &[u8],
-        flags: TcpFlags,
-    ) -> Result<Vec<u8>, Error> {
+        offset: usize,
+        capacity: usize,
+    ) -> Result<PeekedFrame, Error> {
+        let (key, fd) = {
+            let entry = self.flows.get(id).expect("flow exists");
+            (entry.flow.key(), entry.socket.as_raw_fd())
+        };
+        let payload_offset = Self::tcp_payload_offset(key, None);
+        let capacity = capacity.min(FRAME_CAPACITY - payload_offset);
+        let offset = i32::try_from(offset)
+            .map_err(|_| Error::Invariant("socket peek offset exceeds i32"))?;
+        yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
+        let mut frame = self.acquire_frame()?;
+        let result = yayatht_sys::socket::peek(
+            fd,
+            &mut frame.buffer.writable()[payload_offset..payload_offset + capacity],
+        );
+        match result {
+            Ok(0) => {
+                self.release_frame(frame);
+                Ok(PeekedFrame::Eof)
+            }
+            Ok(length) => Ok(PeekedFrame::Data { frame, length }),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.release_frame(frame);
+                Ok(PeekedFrame::WouldBlock)
+            }
+            Err(error) => {
+                self.release_frame(frame);
+                Err(error.into())
+            }
+        }
+    }
+
+    fn flow_frame_parameters(&self, id: FlowId) -> Result<(FlowKey, u16, u16), Error> {
         let entry = self
             .flows
             .get(id)
@@ -1317,18 +1395,55 @@ impl Reactor {
         {
             return Err(Error::Invariant("inactive flow reached packet builder"));
         }
-        let flow = &entry.flow;
-        self.build_tcp_frame(
-            flow.key(),
-            plan,
-            payload,
-            flags,
-            flags.syn.then_some(flow.mss()),
-            flow.advertised_window(),
-        )
+        Ok((
+            entry.flow.key(),
+            entry.flow.mss(),
+            entry.flow.advertised_window(),
+        ))
     }
 
-    fn build_reset(&self, key: FlowKey, acknowledgment: u32) -> Result<Vec<u8>, Error> {
+    fn finalize_flow_payload_frame(
+        &mut self,
+        id: FlowId,
+        mut frame: PooledFrame,
+        plan: SendPlan,
+        flags: TcpFlags,
+        payload_len: usize,
+    ) -> Result<PooledFrame, Error> {
+        let (key, _, window) = match self.flow_frame_parameters(id) {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                self.release_frame(frame);
+                return Err(error);
+            }
+        };
+        let spec = TcpFrameSpec {
+            key,
+            plan,
+            flags,
+            mss: None,
+            window,
+            payload_len,
+        };
+        if let Err(error) = self.finalize_tcp_frame(&mut frame, spec) {
+            self.release_frame(frame);
+            return Err(error);
+        }
+        Ok(frame)
+    }
+
+    fn build_flow_frame(
+        &mut self,
+        id: FlowId,
+        plan: SendPlan,
+        payload: &[u8],
+        flags: TcpFlags,
+    ) -> Result<PooledFrame, Error> {
+        let (key, mss, window) = self.flow_frame_parameters(id)?;
+        self.build_tcp_frame(key, plan, payload, flags, flags.syn.then_some(mss), window)
+    }
+
+    fn build_reset(&mut self, key: FlowKey, acknowledgment: u32) -> Result<PooledFrame, Error> {
         self.build_tcp_frame(
             key,
             SendPlan {
@@ -1350,23 +1465,69 @@ impl Reactor {
     }
 
     fn build_tcp_frame(
-        &self,
+        &mut self,
         key: FlowKey,
         plan: SendPlan,
         payload: &[u8],
         flags: TcpFlags,
         mss: Option<u16>,
         window: u16,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<PooledFrame, Error> {
+        let mut frame = self.acquire_frame()?;
+        let payload_offset = Self::tcp_payload_offset(key, mss);
+        let frame_len = payload_offset + payload.len();
+        if frame_len > FRAME_CAPACITY {
+            self.release_frame(frame);
+            return Err(Error::Invariant("TCP frame exceeds buffer capacity"));
+        }
+        frame.buffer.writable()[payload_offset..frame_len].copy_from_slice(payload);
+        let spec = TcpFrameSpec {
+            key,
+            plan,
+            flags,
+            mss,
+            window,
+            payload_len: payload.len(),
+        };
+        if let Err(error) = self.finalize_tcp_frame(&mut frame, spec) {
+            self.release_frame(frame);
+            return Err(error);
+        }
+        Ok(frame)
+    }
+
+    fn acquire_frame(&mut self) -> Result<PooledFrame, Error> {
+        self.frame_pool
+            .acquire()
+            .map(|(pool_index, buffer)| PooledFrame { pool_index, buffer })
+            .ok_or(Error::Invariant("TAP frame pool exhausted"))
+    }
+
+    fn release_frame(&mut self, frame: PooledFrame) {
+        self.frame_pool.release(frame.pool_index, frame.buffer);
+    }
+
+    fn tcp_payload_offset(key: FlowKey, mss: Option<u16>) -> usize {
         let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
         let tcp_header_len = if mss.is_some() { 24 } else { 20 };
-        let mut frame =
-            vec![
-                0u8;
-                ethernet::ETHERNET_HEADER_LEN + ip_header_len + tcp_header_len + payload.len()
-            ];
+        ethernet::ETHERNET_HEADER_LEN + ip_header_len + tcp_header_len
+    }
+
+    fn finalize_tcp_frame(&self, frame: &mut PooledFrame, spec: TcpFrameSpec) -> Result<(), Error> {
+        let TcpFrameSpec {
+            key,
+            plan,
+            flags,
+            mss,
+            window,
+            payload_len,
+        } = spec;
+        let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
+        let payload_offset = Self::tcp_payload_offset(key, mss);
+        let frame_len = payload_offset + payload_len;
+        let bytes = frame.buffer.writable();
         ethernet::write_header(
-            &mut frame,
+            bytes,
             self.config.target_mac,
             self.config.gateway_mac,
             if key.target.is_ipv4() {
@@ -1378,7 +1539,7 @@ impl Reactor {
         let ip_offset = ethernet::ETHERNET_HEADER_LEN;
         let tcp_offset = ip_offset + ip_header_len;
         let written = tcp::write_header(
-            &mut frame[tcp_offset..],
+            &mut bytes[tcp_offset..frame_len],
             TcpHeaderSpec {
                 source_port: key.target.port(),
                 destination_port: key.namespace.port(),
@@ -1389,40 +1550,40 @@ impl Reactor {
                 mss,
             },
         )?;
-        frame[tcp_offset + written..].copy_from_slice(payload);
         match (key.target.ip(), key.namespace.ip()) {
             (IpAddr::V4(source), IpAddr::V4(destination)) => {
                 ip::write_ipv4_header(
-                    &mut frame[ip_offset..],
+                    &mut bytes[ip_offset..frame_len],
                     source.octets(),
                     destination.octets(),
                     ip::IPPROTO_TCP,
-                    written + payload.len(),
+                    written + payload_len,
                     0,
                 )?;
                 tcp::set_ipv4_checksum(
-                    &mut frame[tcp_offset..],
+                    &mut bytes[tcp_offset..frame_len],
                     source.octets(),
                     destination.octets(),
                 )?;
             }
             (IpAddr::V6(source), IpAddr::V6(destination)) => {
                 ip::write_ipv6_header(
-                    &mut frame[ip_offset..],
+                    &mut bytes[ip_offset..frame_len],
                     source.octets(),
                     destination.octets(),
                     ip::IPPROTO_TCP,
-                    written + payload.len(),
+                    written + payload_len,
                 )?;
                 tcp::set_ipv6_checksum(
-                    &mut frame[tcp_offset..],
+                    &mut bytes[tcp_offset..frame_len],
                     source.octets(),
                     destination.octets(),
                 )?;
             }
             _ => return Err(Error::Invariant("mixed address families in flow")),
         }
-        Ok(frame)
+        frame.buffer.set_len(frame_len);
+        Ok(())
     }
 
     fn send_reset_for_flow(&mut self, id: FlowId) -> Result<(), Error> {
@@ -1435,59 +1596,83 @@ impl Reactor {
     fn queue_tap(
         &mut self,
         flow: Option<FlowId>,
-        bytes: Vec<u8>,
+        frame: PooledFrame,
         plan: Option<SendPlan>,
     ) -> Result<(), Error> {
         if self.tap_queue.is_empty() {
-            match yayatht_sys::reactor::write(self.tap.as_raw_fd(), &bytes) {
-                Ok(written) if written == bytes.len() => {
+            match yayatht_sys::reactor::write(self.tap.as_raw_fd(), frame.buffer.bytes()) {
+                Ok(written) if written == frame.buffer.bytes().len() => {
                     self.metrics.tap_tx_packets += 1;
-                    self.commit_tap_send(flow, bytes, plan)?;
+                    self.commit_tap_send(flow, frame, plan)?;
                     return Ok(());
                 }
-                Ok(_) => return Err(Error::Invariant("short TAP frame write")),
+                Ok(_) => {
+                    self.release_frame(frame);
+                    return Err(Error::Invariant("short TAP frame write"));
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    self.release_frame(frame);
+                    return Err(error.into());
+                }
             }
         }
-        self.tap_queue.push_back(QueuedFrame { flow, bytes, plan });
-        self.epoll.modify(
-            self.tap.as_raw_fd(),
-            yayatht_sys::reactor::READABLE | yayatht_sys::reactor::WRITABLE,
-            EpollToken::global(Resource::Tap).raw(),
-        )?;
+        self.tap_queue.push_back(QueuedFrame { flow, frame, plan });
+        self.update_tap_interest()?;
         Ok(())
     }
 
     fn flush_tap_queue(&mut self) -> Result<(), Error> {
-        while let Some(frame) = self.tap_queue.pop_front() {
-            match yayatht_sys::reactor::write(self.tap.as_raw_fd(), &frame.bytes) {
-                Ok(written) if written == frame.bytes.len() => {
+        for _ in 0..TAP_TX_BUDGET {
+            let Some(frame) = self.tap_queue.pop_front() else {
+                break;
+            };
+            match yayatht_sys::reactor::write(self.tap.as_raw_fd(), frame.frame.buffer.bytes()) {
+                Ok(written) if written == frame.frame.buffer.bytes().len() => {
                     self.metrics.tap_tx_packets += 1;
-                    self.commit_tap_send(frame.flow, frame.bytes, frame.plan)?;
+                    self.commit_tap_send(frame.flow, frame.frame, frame.plan)?;
                 }
-                Ok(_) => return Err(Error::Invariant("short TAP frame write")),
+                Ok(_) => {
+                    self.release_frame(frame.frame);
+                    return Err(Error::Invariant("short TAP frame write"));
+                }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
                     self.tap_queue.push_front(frame);
                     break;
                 }
-                Err(error) => return Err(error.into()),
+                Err(error) => {
+                    self.release_frame(frame.frame);
+                    return Err(error.into());
+                }
             }
         }
-        if self.tap_queue.is_empty() {
-            self.epoll.modify(
-                self.tap.as_raw_fd(),
-                yayatht_sys::reactor::READABLE,
-                EpollToken::global(Resource::Tap).raw(),
-            )?;
+        self.update_tap_interest()?;
+        Ok(())
+    }
+
+    fn update_tap_interest(&self) -> Result<(), Error> {
+        let mut events = 0;
+        if self.frame_pool.available() > 0 {
+            events |= yayatht_sys::reactor::READABLE;
         }
+        if !self.tap_queue.is_empty() {
+            events |= yayatht_sys::reactor::WRITABLE;
+        }
+        if events == 0 {
+            return Err(Error::Invariant("TAP has neither read nor write capacity"));
+        }
+        self.epoll.modify(
+            self.tap.as_raw_fd(),
+            events,
+            EpollToken::global(Resource::Tap).raw(),
+        )?;
         Ok(())
     }
 
     fn commit_tap_send(
         &mut self,
         flow: Option<FlowId>,
-        _bytes: Vec<u8>,
+        frame: PooledFrame,
         plan: Option<SendPlan>,
     ) -> Result<(), Error> {
         if let (Some(id), Some(plan)) = (flow, plan) {
@@ -1515,6 +1700,7 @@ impl Reactor {
                 retries: 0,
             });
         }
+        self.release_frame(frame);
         Ok(())
     }
 
@@ -1526,14 +1712,16 @@ impl Reactor {
         let key = entry.flow.key();
         self.epoll.delete(fd)?;
         self.by_key.remove(&key);
-        self.tap_queue.retain(|frame| frame.flow != Some(id));
-        if self.tap_queue.is_empty() {
-            self.epoll.modify(
-                self.tap.as_raw_fd(),
-                yayatht_sys::reactor::READABLE,
-                EpollToken::global(Resource::Tap).raw(),
-            )?;
+        let mut retained = VecDeque::with_capacity(self.tap_queue.len());
+        while let Some(frame) = self.tap_queue.pop_front() {
+            if frame.flow == Some(id) {
+                self.release_frame(frame.frame);
+            } else {
+                retained.push_back(frame);
+            }
         }
+        self.tap_queue = retained;
+        self.update_tap_interest()?;
         self.flows.get_mut(id).expect("flow exists").flow.close();
         self.flows.defer_remove(id);
         Ok(())

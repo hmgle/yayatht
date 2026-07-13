@@ -62,3 +62,21 @@ impl BufferPool {
         self.free.len()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn released_frame_returns_to_fixed_pool() {
+        let mut pool = BufferPool::new(1);
+        let (index, mut frame) = pool.acquire().unwrap();
+        frame.writable()[..3].copy_from_slice(b"tap");
+        frame.set_len(3);
+        assert_eq!(pool.available(), 0);
+        pool.release(index, frame);
+
+        let (_, frame) = pool.acquire().unwrap();
+        assert_eq!(frame.bytes(), b"tap");
+    }
+}

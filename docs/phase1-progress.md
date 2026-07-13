@@ -27,6 +27,9 @@
 - Namespace zero windows activate a TCP persist probe with bounded exponential
   backoff. Probe frames reuse retained socket data, do not advance `snd_nxt`, and
   are cancelled immediately when a non-zero window is observed.
+- TAP output frames now come from a fixed startup pool. Socket payload is peeked
+  directly into the final frame, and each readiness event can schedule a bounded
+  batch of MSS-sized segments without steady-state frame or payload allocation.
 - Credential files are opened before namespace creation with `O_NOFOLLOW`,
   owner and mode checks. Supervisor and ns-init copies are dropped before the
   target namespace is cloned.
