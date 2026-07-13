@@ -22,6 +22,8 @@ const TAP_BUDGET: usize = 32;
 const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 const MAX_RETRIES: u8 = 5;
+const ZERO_WINDOW_PROBE_INITIAL: Duration = Duration::from_secs(1);
+const ZERO_WINDOW_PROBE_MAX: Duration = Duration::from_secs(8);
 const PROXY_RESPONSE_CAPACITY: usize = 8 * 1024;
 const MAX_PENDING_SOCKET_BYTES: usize = 256 * 1024;
 
@@ -57,6 +59,7 @@ pub struct Metrics {
     pub tcp_created: u64,
     pub tcp_closed: u64,
     pub tcp_retransmits: u64,
+    pub tcp_zero_window_probes: u64,
     pub tcp_resets: u64,
     pub proxy_handshakes: u64,
     pub proxy_failures: u64,
@@ -82,6 +85,28 @@ struct FlowEntry {
     pending_shutdown: bool,
     sent_segments: VecDeque<SentSegment>,
     upstream_window_clamp: Option<u16>,
+    zero_window_probe: Option<ZeroWindowProbe>,
+    last_namespace_byte: Option<u8>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ZeroWindowProbe {
+    deadline: Instant,
+    interval: Duration,
+}
+
+impl ZeroWindowProbe {
+    fn new(now: Instant) -> Self {
+        Self {
+            deadline: now + ZERO_WINDOW_PROBE_INITIAL,
+            interval: ZERO_WINDOW_PROBE_INITIAL,
+        }
+    }
+
+    fn advance(&mut self, now: Instant) {
+        self.interval = (self.interval * 2).min(ZERO_WINDOW_PROBE_MAX);
+        self.deadline = now + self.interval;
+    }
 }
 
 #[derive(Debug)]
@@ -459,6 +484,8 @@ impl Reactor {
             pending_shutdown: false,
             sent_segments: VecDeque::new(),
             upstream_window_clamp: None,
+            zero_window_probe: None,
+            last_namespace_byte: None,
         };
         let id = match self.flows.insert(entry) {
             Ok(id) => id,
@@ -533,6 +560,7 @@ impl Reactor {
             return self.close_flow(id);
         }
         self.refresh_window_clamp(id)?;
+        self.refresh_zero_window_probe(id, Instant::now());
         let current_ack = self
             .flows
             .get(id)
@@ -935,6 +963,22 @@ impl Reactor {
         Ok(())
     }
 
+    fn refresh_zero_window_probe(&mut self, id: FlowId, now: Instant) {
+        let entry = self.flows.get_mut(id).expect("flow exists");
+        let should_probe = entry.flow.peer_window() == 0
+            && matches!(
+                entry.flow.state(),
+                State::Established | State::NamespaceFinReceived
+            );
+        if should_probe {
+            entry
+                .zero_window_probe
+                .get_or_insert_with(|| ZeroWindowProbe::new(now));
+        } else {
+            entry.zero_window_probe = None;
+        }
+    }
+
     fn send_socket_data(&mut self, id: FlowId) -> Result<(), Error> {
         if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
             return Ok(());
@@ -986,6 +1030,10 @@ impl Reactor {
             }
             Ok(length) => {
                 payload.truncate(length);
+                self.flows
+                    .get_mut(id)
+                    .expect("flow exists")
+                    .last_namespace_byte = payload.last().copied();
                 let plan = self
                     .flows
                     .get(id)
@@ -1039,27 +1087,108 @@ impl Reactor {
         for id in self.flows.active_ids() {
             let retransmit = {
                 let entry = self.flows.get(id).expect("flow exists");
-                entry.sent_segments.front().is_some_and(|segment| {
-                    now.duration_since(segment.last_sent) >= segment.retransmit_timeout
-                })
+                entry.zero_window_probe.is_none()
+                    && entry.sent_segments.front().is_some_and(|segment| {
+                        now.duration_since(segment.last_sent) >= segment.retransmit_timeout
+                    })
             };
-            if !retransmit {
-                continue;
+            if retransmit {
+                if self
+                    .flows
+                    .get(id)
+                    .expect("flow exists")
+                    .sent_segments
+                    .front()
+                    .is_some_and(|segment| segment.retries >= MAX_RETRIES)
+                {
+                    self.send_reset_for_flow(id)?;
+                    self.close_flow(id)?;
+                    continue;
+                }
+                self.retransmit_oldest(id, true)?;
             }
-            if self
+            let probe_due = self
                 .flows
                 .get(id)
-                .expect("flow exists")
+                .and_then(|entry| entry.zero_window_probe)
+                .is_some_and(|probe| probe.deadline <= now);
+            if probe_due {
+                self.send_zero_window_probe(id, now)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_zero_window_probe(&mut self, id: FlowId, now: Instant) -> Result<(), Error> {
+        if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
+            return Ok(());
+        }
+        let (fd, sequence, acknowledgment, fallback_byte, retained_payload) = {
+            let entry = self.flows.get(id).expect("flow exists");
+            let retained = entry
                 .sent_segments
                 .front()
-                .is_some_and(|segment| segment.retries >= MAX_RETRIES)
+                .filter(|segment| segment.payload_len > 0);
+            (
+                entry.socket.as_raw_fd(),
+                retained.map_or_else(|| entry.flow.local_next().wrapping_sub(1), |s| s.sequence),
+                entry.flow.namespace_ack(),
+                entry.last_namespace_byte,
+                retained.is_some(),
+            )
+        };
+        yayatht_sys::tcp_info::set_peek_offset(fd, 0)?;
+        let mut socket_byte = [0u8; 1];
+        let length = match yayatht_sys::socket::peek(fd, &mut socket_byte) {
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
+            Err(error) => return Err(error.into()),
+        };
+        if length == 0 {
+            if let Some(probe) = self
+                .flows
+                .get_mut(id)
+                .expect("flow exists")
+                .zero_window_probe
+                .as_mut()
             {
-                self.send_reset_for_flow(id)?;
-                self.close_flow(id)?;
-                continue;
+                probe.advance(now);
             }
-            self.retransmit_oldest(id, true)?;
+            return Ok(());
         }
+        let payload = if retained_payload {
+            socket_byte
+        } else {
+            [fallback_byte.unwrap_or(socket_byte[0])]
+        };
+        let plan = SendPlan {
+            sequence,
+            acknowledgment,
+            length: 1,
+            syn: false,
+            fin: false,
+        };
+        let frame = self.build_flow_frame(
+            id,
+            plan,
+            &payload,
+            TcpFlags {
+                psh: true,
+                ack: true,
+                ..TcpFlags::default()
+            },
+        )?;
+        self.queue_tap(Some(id), frame, None)?;
+        if let Some(probe) = self
+            .flows
+            .get_mut(id)
+            .expect("flow exists")
+            .zero_window_probe
+            .as_mut()
+        {
+            probe.advance(now);
+        }
+        self.metrics.tcp_zero_window_probes += 1;
         Ok(())
     }
 
@@ -1471,5 +1600,19 @@ mod tests {
         queue.consume(2);
         assert!(queue.is_empty());
         assert_eq!(queue.remaining(), 5);
+    }
+
+    #[test]
+    fn zero_window_probe_uses_bounded_exponential_backoff() {
+        let now = Instant::now();
+        let mut probe = ZeroWindowProbe::new(now);
+        assert_eq!(probe.deadline, now + Duration::from_secs(1));
+        probe.advance(now);
+        assert_eq!(probe.interval, Duration::from_secs(2));
+        probe.advance(now);
+        probe.advance(now);
+        probe.advance(now);
+        assert_eq!(probe.interval, ZERO_WINDOW_PROBE_MAX);
+        assert_eq!(probe.deadline, now + ZERO_WINDOW_PROBE_MAX);
     }
 }
