@@ -1,6 +1,118 @@
 use crate::sequence;
 use std::net::{IpAddr, SocketAddr};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowInterface {
+    NamespaceTap,
+    HostSocket,
+    ProxyTunnel,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowSide {
+    pub endpoint: SocketAddr,
+    pub transport_endpoint: SocketAddr,
+    pub interface: FlowInterface,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowSides {
+    pub initiating: FlowSide,
+    pub target: FlowSide,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FlowType {
+    Tcp,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConstructionState {
+    New,
+    Initiated,
+    Targeted,
+    Typed,
+    Active,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FlowConstruction {
+    state: ConstructionState,
+    initiating: Option<FlowSide>,
+    target: Option<FlowSide>,
+    flow_type: Option<FlowType>,
+}
+
+impl Default for FlowConstruction {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FlowConstruction {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            state: ConstructionState::New,
+            initiating: None,
+            target: None,
+            flow_type: None,
+        }
+    }
+
+    #[must_use]
+    pub const fn state(&self) -> ConstructionState {
+        self.state
+    }
+
+    pub fn set_initiating(&mut self, side: FlowSide) -> Result<(), ConstructionState> {
+        if self.state != ConstructionState::New {
+            return Err(self.state);
+        }
+        self.initiating = Some(side);
+        self.state = ConstructionState::Initiated;
+        Ok(())
+    }
+
+    pub fn set_target(&mut self, side: FlowSide) -> Result<(), ConstructionState> {
+        if self.state != ConstructionState::Initiated {
+            return Err(self.state);
+        }
+        self.target = Some(side);
+        self.state = ConstructionState::Targeted;
+        Ok(())
+    }
+
+    pub fn set_type(&mut self, flow_type: FlowType) -> Result<(), ConstructionState> {
+        if self.state != ConstructionState::Targeted {
+            return Err(self.state);
+        }
+        self.flow_type = Some(flow_type);
+        self.state = ConstructionState::Typed;
+        Ok(())
+    }
+
+    pub fn activate(&mut self) -> Result<FlowSides, ConstructionState> {
+        if self.state != ConstructionState::Typed || self.flow_type != Some(FlowType::Tcp) {
+            return Err(self.state);
+        }
+        let sides = FlowSides {
+            initiating: self.initiating.expect("initiating side set before typed"),
+            target: self.target.expect("target side set before typed"),
+        };
+        self.state = ConstructionState::Active;
+        Ok(sides)
+    }
+
+    #[must_use]
+    pub fn active_sides(&self) -> Option<FlowSides> {
+        (self.state == ConstructionState::Active).then(|| FlowSides {
+            initiating: self.initiating.expect("active flow has initiating side"),
+            target: self.target.expect("active flow has target side"),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct FlowKey {
     pub namespace: SocketAddr,
@@ -375,5 +487,40 @@ mod tests {
         assert_eq!(flow.available_namespace_window(), 4);
         assert!(flow.plan_send(5, false).is_none());
         assert!(flow.plan_send(4, false).is_some());
+    }
+
+    #[test]
+    fn flow_construction_separates_logical_and_transport_targets() {
+        let namespace = FlowSide {
+            endpoint: "192.0.2.2:40000".parse().unwrap(),
+            transport_endpoint: "192.0.2.2:40000".parse().unwrap(),
+            interface: FlowInterface::NamespaceTap,
+        };
+        let target = FlowSide {
+            endpoint: "198.51.100.7:443".parse().unwrap(),
+            transport_endpoint: "127.0.0.1:7890".parse().unwrap(),
+            interface: FlowInterface::ProxyTunnel,
+        };
+        let mut construction = FlowConstruction::new();
+        construction.set_initiating(namespace).unwrap();
+        construction.set_target(target).unwrap();
+        construction.set_type(FlowType::Tcp).unwrap();
+        assert_eq!(construction.state(), ConstructionState::Typed);
+
+        let sides = construction.activate().unwrap();
+        assert_eq!(construction.state(), ConstructionState::Active);
+        assert_eq!(sides.target.endpoint, target.endpoint);
+        assert_eq!(sides.target.transport_endpoint, target.transport_endpoint);
+        assert_ne!(sides.target.endpoint, sides.target.transport_endpoint);
+    }
+
+    #[test]
+    fn flow_construction_rejects_out_of_order_transitions() {
+        let mut construction = FlowConstruction::new();
+        assert_eq!(
+            construction.set_type(FlowType::Tcp),
+            Err(ConstructionState::New)
+        );
+        assert!(construction.active_sides().is_none());
     }
 }

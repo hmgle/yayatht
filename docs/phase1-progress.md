@@ -16,6 +16,10 @@
   window. Segment metadata is tracked without copying payload; new sends use a
   socket peek offset and retransmission rebuilds the oldest unacknowledged
   frame from the retained socket prefix.
+- Flow construction records distinct initiating and target sides, including
+  separate logical and transport endpoints. Entries pass through explicit
+  `NEW -> INITIATED -> TARGETED -> TYPED -> ACTIVE` states before reactor events
+  can use them.
 - Credential files are opened before namespace creation with `O_NOFOLLOW`,
   owner and mode checks. Supervisor and ns-init copies are dropped before the
   target namespace is cloned.
@@ -30,8 +34,7 @@ DNS, or external routing.
 ## Remaining Phase 1 Work
 
 - Zero-window probes and broader loss and retransmission injection.
-- Explicit two-sided flow construction states and bounded handshake-pending
-  namespace payload queues.
+- Bounded handshake-pending namespace payload queues.
 - DNS proxy-tcp and resolver mount isolation.
 - Generated seccomp profiles, pivoted data-plane filesystem, and rlimits.
 - Structured metrics export, failure matrix expansion, and 24-hour soak tests.

@@ -12,7 +12,10 @@ use yayatht_packet::ip::{self, Ipv4Packet, Ipv6Packet};
 use yayatht_packet::neighbor;
 use yayatht_packet::tcp::{self, TcpFlags, TcpHeaderSpec, TcpSegment};
 use yayatht_proxy_proto::{Credentials, Handshake, Protocol};
-use yayatht_tcp_adapter::flow::{Flow, FlowKey, ReceiveDisposition, SendPlan, State};
+use yayatht_tcp_adapter::flow::{
+    ConstructionState, Flow, FlowConstruction, FlowInterface, FlowKey, FlowSide, FlowType,
+    ReceiveDisposition, SendPlan, State,
+};
 use yayatht_tcp_adapter::sequence;
 
 const TAP_BUDGET: usize = 32;
@@ -70,6 +73,7 @@ pub enum Error {
 
 struct FlowEntry {
     flow: Flow,
+    construction: FlowConstruction,
     socket: OwnedFd,
     transport_connected: bool,
     handshake: Option<Handshake>,
@@ -358,19 +362,34 @@ impl Reactor {
         if !flags.syn || flags.ack || flags.rst {
             return Ok(());
         }
-        let target = self.transport_target(key.target);
-        let (socket, connected) = match yayatht_sys::socket::connect_nonblocking(target) {
-            Ok(result) => result,
-            Err(_) => {
-                let frame = self.build_reset(key, segment.sequence().wrapping_add(1))?;
-                self.metrics.tcp_resets += 1;
-                return self.queue_tap(None, frame, None);
-            }
-        };
+        let target_side = self.target_side(key.target);
+        let (socket, connected) =
+            match yayatht_sys::socket::connect_nonblocking(target_side.transport_endpoint) {
+                Ok(result) => result,
+                Err(_) => {
+                    let frame = self.build_reset(key, segment.sequence().wrapping_add(1))?;
+                    self.metrics.tcp_resets += 1;
+                    return self.queue_tap(None, frame, None);
+                }
+            };
         let mut random = [0u8; 4];
         random_fill(&mut random)
             .map_err(|error| io::Error::other(format!("getrandom failed: {error:?}")))?;
         let default_mss = if key.target.is_ipv4() { 1460 } else { 1440 };
+        let mut construction = FlowConstruction::new();
+        construction
+            .set_initiating(FlowSide {
+                endpoint: key.namespace,
+                transport_endpoint: key.namespace,
+                interface: FlowInterface::NamespaceTap,
+            })
+            .map_err(|_| Error::Invariant("unable to set initiating flow side"))?;
+        construction
+            .set_target(target_side)
+            .map_err(|_| Error::Invariant("unable to set target flow side"))?;
+        construction
+            .set_type(FlowType::Tcp)
+            .map_err(|_| Error::Invariant("unable to type TCP flow"))?;
         let entry = FlowEntry {
             flow: Flow::new(
                 key,
@@ -378,6 +397,7 @@ impl Reactor {
                 u32::from_ne_bytes(random),
                 segment.mss().unwrap_or(default_mss),
             ),
+            construction,
             socket,
             transport_connected: false,
             handshake: self.proxy_handshake(key.target),
@@ -410,6 +430,12 @@ impl Reactor {
                 | yayatht_sys::reactor::READ_HANGUP,
             token.raw(),
         )?;
+        self.flows
+            .get_mut(id)
+            .expect("inserted flow")
+            .construction
+            .activate()
+            .map_err(|_| Error::Invariant("unable to activate TCP flow"))?;
         self.metrics.tcp_created += 1;
         if connected {
             self.finish_transport_connect(id)?;
@@ -1001,22 +1027,34 @@ impl Reactor {
         self.close_flow(id)
     }
 
-    fn transport_target(&self, logical: SocketAddr) -> SocketAddr {
+    fn target_side(&self, logical: SocketAddr) -> FlowSide {
         match &self.config.upstream {
-            Upstream::Proxy { address, .. } => *address,
+            Upstream::Proxy { address, .. } => FlowSide {
+                endpoint: logical,
+                transport_endpoint: *address,
+                interface: FlowInterface::ProxyTunnel,
+            },
             Upstream::Direct {
                 host_loopback: false,
-            } => logical,
+            } => FlowSide {
+                endpoint: logical,
+                transport_endpoint: logical,
+                interface: FlowInterface::HostSocket,
+            },
             Upstream::Direct {
                 host_loopback: true,
-            } => match logical {
-                SocketAddr::V4(address) if Some(*address.ip()) == self.config.gateway_ipv4 => {
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
-                }
-                SocketAddr::V6(address) if Some(*address.ip()) == self.config.gateway_ipv6 => {
-                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), address.port())
-                }
-                _ => logical,
+            } => FlowSide {
+                endpoint: logical,
+                transport_endpoint: match logical {
+                    SocketAddr::V4(address) if Some(*address.ip()) == self.config.gateway_ipv4 => {
+                        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
+                    }
+                    SocketAddr::V6(address) if Some(*address.ip()) == self.config.gateway_ipv6 => {
+                        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), address.port())
+                    }
+                    _ => logical,
+                },
+                interface: FlowInterface::HostSocket,
             },
         }
     }
@@ -1039,11 +1077,16 @@ impl Reactor {
         payload: &[u8],
         flags: TcpFlags,
     ) -> Result<Vec<u8>, Error> {
-        let flow = &self
+        let entry = self
             .flows
             .get(id)
-            .ok_or(Error::Invariant("flow disappeared"))?
-            .flow;
+            .ok_or(Error::Invariant("flow disappeared"))?;
+        if entry.construction.state() != ConstructionState::Active
+            || entry.construction.active_sides().is_none()
+        {
+            return Err(Error::Invariant("inactive flow reached packet builder"));
+        }
+        let flow = &entry.flow;
         self.build_tcp_frame(
             flow.key(),
             plan,
