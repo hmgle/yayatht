@@ -136,6 +136,7 @@ pub enum ReceiveDisposition {
     InOrder { payload_len: usize, fin: bool },
     Duplicate,
     OutOfOrder,
+    OutsideWindow,
     Reset,
     Invalid,
 }
@@ -160,6 +161,7 @@ pub struct Flow {
     local_unacked: u32,
     local_next: u32,
     peer_window: u16,
+    advertised_window: u16,
     mss: u16,
     upstream_ack_baseline: u64,
     upstream_submitted: u64,
@@ -182,6 +184,7 @@ impl Flow {
             local_unacked: local_initial,
             local_next: local_initial,
             peer_window: u16::MAX,
+            advertised_window: u16::MAX,
             mss,
             upstream_ack_baseline: 0,
             upstream_submitted: 0,
@@ -225,6 +228,19 @@ impl Flow {
     #[must_use]
     pub const fn peer_window(&self) -> u16 {
         self.peer_window
+    }
+
+    #[must_use]
+    pub const fn advertised_window(&self) -> u16 {
+        self.advertised_window
+    }
+
+    pub fn set_advertised_window(&mut self, window: u16) -> bool {
+        if self.advertised_window == window {
+            return false;
+        }
+        self.advertised_window = window;
+        true
     }
 
     #[must_use]
@@ -279,6 +295,9 @@ impl Flow {
                 ReceiveDisposition::OutOfOrder
             };
         }
+        if payload_len > usize::from(self.advertised_window) {
+            return ReceiveDisposition::OutsideWindow;
+        }
         if payload_len == 0 && !fin {
             return ReceiveDisposition::InOrder {
                 payload_len: 0,
@@ -289,6 +308,7 @@ impl Flow {
             return ReceiveDisposition::Invalid;
         };
         self.namespace_next = self.namespace_next.wrapping_add(length);
+        self.advertised_window = self.advertised_window.saturating_sub(length as u16);
         if fin {
             self.namespace_next = self.namespace_next.wrapping_add(1);
             self.namespace_fin = true;
@@ -487,6 +507,28 @@ mod tests {
         assert_eq!(flow.available_namespace_window(), 4);
         assert!(flow.plan_send(5, false).is_none());
         assert!(flow.plan_send(4, false).is_some());
+    }
+
+    #[test]
+    fn receive_window_rejects_unreserved_payload() {
+        let mut flow = flow();
+        flow.socket_connected(0);
+        flow.set_advertised_window(4);
+        assert_eq!(
+            flow.receive(u32::MAX - 3, Some(101), 65535, 5, false, false),
+            ReceiveDisposition::OutsideWindow
+        );
+        assert_eq!(flow.namespace_ack(), u32::MAX - 3);
+        assert_eq!(flow.advertised_window(), 4);
+
+        assert_eq!(
+            flow.receive(u32::MAX - 3, Some(101), 65535, 4, false, false),
+            ReceiveDisposition::InOrder {
+                payload_len: 4,
+                fin: false
+            }
+        );
+        assert_eq!(flow.advertised_window(), 0);
     }
 
     #[test]

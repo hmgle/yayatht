@@ -23,6 +23,7 @@ const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 const MAX_RETRIES: u8 = 5;
 const PROXY_RESPONSE_CAPACITY: usize = 8 * 1024;
+const MAX_PENDING_SOCKET_BYTES: usize = 256 * 1024;
 
 #[derive(Clone, Debug)]
 pub enum Upstream {
@@ -77,9 +78,62 @@ struct FlowEntry {
     socket: OwnedFd,
     transport_connected: bool,
     handshake: Option<Handshake>,
-    pending_socket: VecDeque<Vec<u8>>,
+    pending_socket: PendingSocketQueue,
     pending_shutdown: bool,
     sent_segments: VecDeque<SentSegment>,
+    upstream_window_clamp: Option<u16>,
+}
+
+#[derive(Debug)]
+struct PendingSocketQueue {
+    chunks: VecDeque<Vec<u8>>,
+    bytes: usize,
+    limit: usize,
+}
+
+impl PendingSocketQueue {
+    fn new(limit: usize) -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            bytes: 0,
+            limit,
+        }
+    }
+
+    fn push(&mut self, bytes: &[u8]) -> Result<(), ()> {
+        if bytes.len() > self.remaining() {
+            return Err(());
+        }
+        if !bytes.is_empty() {
+            self.chunks.push_back(bytes.to_vec());
+            self.bytes += bytes.len();
+        }
+        Ok(())
+    }
+
+    fn front(&self) -> Option<&[u8]> {
+        self.chunks.front().map(Vec::as_slice)
+    }
+
+    fn consume(&mut self, length: usize) {
+        let Some(front) = self.chunks.front_mut() else {
+            return;
+        };
+        let length = length.min(front.len());
+        front.drain(..length);
+        self.bytes -= length;
+        if front.is_empty() {
+            self.chunks.pop_front();
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes == 0
+    }
+
+    fn remaining(&self) -> usize {
+        self.limit.saturating_sub(self.bytes)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -401,9 +455,10 @@ impl Reactor {
             socket,
             transport_connected: false,
             handshake: self.proxy_handshake(key.target),
-            pending_socket: VecDeque::new(),
+            pending_socket: PendingSocketQueue::new(MAX_PENDING_SOCKET_BYTES),
             pending_shutdown: false,
             sent_segments: VecDeque::new(),
+            upstream_window_clamp: None,
         };
         let id = match self.flows.insert(entry) {
             Ok(id) => id,
@@ -477,6 +532,7 @@ impl Reactor {
         if disposition == ReceiveDisposition::Reset {
             return self.close_flow(id);
         }
+        self.refresh_window_clamp(id)?;
         let current_ack = self
             .flows
             .get(id)
@@ -520,7 +576,9 @@ impl Reactor {
                     self.send_ack(id)?;
                 }
             }
-            ReceiveDisposition::Duplicate | ReceiveDisposition::OutOfOrder => self.send_ack(id)?,
+            ReceiveDisposition::Duplicate
+            | ReceiveDisposition::OutOfOrder
+            | ReceiveDisposition::OutsideWindow => self.send_ack(id)?,
             ReceiveDisposition::Invalid => self.close_flow(id)?,
             ReceiveDisposition::Reset => {}
         }
@@ -549,7 +607,8 @@ impl Reactor {
                         .get_mut(id)
                         .expect("flow exists")
                         .pending_socket
-                        .push_back(payload[sent..].to_vec());
+                        .push(&payload[sent..])
+                        .map_err(|()| Error::Invariant("pending socket queue exceeded limit"))?;
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -557,7 +616,8 @@ impl Reactor {
                     .get_mut(id)
                     .expect("flow exists")
                     .pending_socket
-                    .push_back(payload.to_vec());
+                    .push(payload)
+                    .map_err(|()| Error::Invariant("pending socket queue exceeded limit"))?;
             }
             Err(error) => return Err(error.into()),
         }
@@ -638,6 +698,7 @@ impl Reactor {
     }
 
     fn activate_flow(&mut self, id: FlowId) -> Result<(), Error> {
+        self.refresh_namespace_window(id)?;
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         let info = yayatht_sys::tcp_info::get(fd)?;
         let plan = self
@@ -772,42 +833,33 @@ impl Reactor {
 
     fn flush_socket_queue(&mut self, id: FlowId) -> Result<(), Error> {
         loop {
-            let Some(mut bytes) = self
+            let send_result = {
+                let entry = self.flows.get(id).expect("flow exists");
+                let Some(bytes) = entry.pending_socket.front() else {
+                    break;
+                };
+                yayatht_sys::socket::send(entry.socket.as_raw_fd(), bytes)
+            };
+            match send_result {
+                Ok(0) => {
+                    return Err(Error::Invariant("socket queue send returned zero"));
+                }
+                Ok(sent) => {
+                    let entry = self.flows.get_mut(id).expect("flow exists");
+                    entry.pending_socket.consume(sent);
+                    entry.flow.record_upstream_submitted(sent);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => return Err(error.into()),
+            }
+            if !self
                 .flows
-                .get_mut(id)
+                .get(id)
                 .expect("flow exists")
                 .pending_socket
-                .pop_front()
-            else {
+                .is_empty()
+            {
                 break;
-            };
-            let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
-            match yayatht_sys::socket::send(fd, &bytes) {
-                Ok(sent) => {
-                    self.flows
-                        .get_mut(id)
-                        .expect("flow exists")
-                        .flow
-                        .record_upstream_submitted(sent);
-                    if sent < bytes.len() {
-                        bytes.drain(..sent);
-                        self.flows
-                            .get_mut(id)
-                            .expect("flow exists")
-                            .pending_socket
-                            .push_front(bytes);
-                        break;
-                    }
-                }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                    self.flows
-                        .get_mut(id)
-                        .expect("flow exists")
-                        .pending_socket
-                        .push_front(bytes);
-                    break;
-                }
-                Err(error) => return Err(error.into()),
             }
         }
         let entry = self.flows.get_mut(id).expect("flow exists");
@@ -827,9 +879,59 @@ impl Reactor {
             .expect("flow exists")
             .flow
             .record_upstream_ack(info.bytes_acked);
-        if advanced {
+        let window_changed = self.update_namespace_window(id, info.send_window)?;
+        if advanced || window_changed {
             self.send_ack(id)?;
         }
+        Ok(())
+    }
+
+    fn refresh_namespace_window(&mut self, id: FlowId) -> Result<(), Error> {
+        let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
+        let info = yayatht_sys::tcp_info::get(fd)?;
+        self.update_namespace_window(id, info.send_window)?;
+        Ok(())
+    }
+
+    fn update_namespace_window(&mut self, id: FlowId, send_window: u32) -> Result<bool, Error> {
+        let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
+        let socket_available = yayatht_sys::socket::send_buffer_available(fd)?;
+        let queue_available = self
+            .flows
+            .get(id)
+            .expect("flow exists")
+            .pending_socket
+            .remaining();
+        let available = socket_available
+            .min(queue_available)
+            .min(send_window as usize)
+            .min(usize::from(u16::MAX));
+        let window = u16::try_from(available).expect("window clamped to u16");
+        Ok(self
+            .flows
+            .get_mut(id)
+            .expect("flow exists")
+            .flow
+            .set_advertised_window(window))
+    }
+
+    fn refresh_window_clamp(&mut self, id: FlowId) -> Result<(), Error> {
+        let (fd, window, previous) = {
+            let entry = self.flows.get(id).expect("flow exists");
+            (
+                entry.socket.as_raw_fd(),
+                entry.flow.peer_window(),
+                entry.upstream_window_clamp,
+            )
+        };
+        if previous == Some(window) {
+            return Ok(());
+        }
+        yayatht_sys::tcp_info::set_window_clamp(fd, u32::from(window).max(1))?;
+        self.flows
+            .get_mut(id)
+            .expect("flow exists")
+            .upstream_window_clamp = Some(window);
         Ok(())
     }
 
@@ -1093,6 +1195,7 @@ impl Reactor {
             payload,
             flags,
             flags.syn.then_some(flow.mss()),
+            flow.advertised_window(),
         )
     }
 
@@ -1113,6 +1216,7 @@ impl Reactor {
                 ..TcpFlags::default()
             },
             None,
+            0,
         )
     }
 
@@ -1123,6 +1227,7 @@ impl Reactor {
         payload: &[u8],
         flags: TcpFlags,
         mss: Option<u16>,
+        window: u16,
     ) -> Result<Vec<u8>, Error> {
         let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
         let tcp_header_len = if mss.is_some() { 24 } else { 20 };
@@ -1151,7 +1256,7 @@ impl Reactor {
                 sequence: plan.sequence,
                 acknowledgment: plan.acknowledgment,
                 flags,
-                window: u16::MAX,
+                window,
                 mss,
             },
         )?;
@@ -1351,5 +1456,20 @@ mod tests {
         assert_eq!(data_fin.payload_len, 0);
         assert!(data_fin.fin);
         assert!(data_fin.acknowledge(204));
+    }
+
+    #[test]
+    fn pending_socket_queue_enforces_its_byte_limit() {
+        let mut queue = PendingSocketQueue::new(5);
+        queue.push(b"abc").unwrap();
+        assert_eq!(queue.remaining(), 2);
+        assert_eq!(queue.push(b"def"), Err(()));
+        queue.consume(2);
+        assert_eq!(queue.front(), Some(b"c".as_slice()));
+        queue.push(b"de").unwrap();
+        queue.consume(1);
+        queue.consume(2);
+        assert!(queue.is_empty());
+        assert_eq!(queue.remaining(), 5);
     }
 }

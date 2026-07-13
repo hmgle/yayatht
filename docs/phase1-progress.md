@@ -20,6 +20,10 @@
   separate logical and transport endpoints. Entries pass through explicit
   `NEW -> INITIATED -> TARGETED -> TYPED -> ACTIVE` states before reactor events
   can use them.
+- Namespace receive windows now follow the upstream TCP send window, available
+  socket send-buffer space and a bounded per-flow pending queue. Payload outside
+  the advertised window is rejected without advancing sequence state, and the
+  namespace receive window is also applied as an upstream `TCP_WINDOW_CLAMP`.
 - Credential files are opened before namespace creation with `O_NOFOLLOW`,
   owner and mode checks. Supervisor and ns-init copies are dropped before the
   target namespace is cloned.
@@ -34,7 +38,6 @@ DNS, or external routing.
 ## Remaining Phase 1 Work
 
 - Zero-window probes and broader loss and retransmission injection.
-- Bounded handshake-pending namespace payload queues.
 - DNS proxy-tcp and resolver mount isolation.
 - Generated seccomp profiles, pivoted data-plane filesystem, and rlimits.
 - Structured metrics export, failure matrix expansion, and 24-hour soak tests.

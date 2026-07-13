@@ -51,3 +51,20 @@ pub fn set_peek_offset(fd: RawFd, offset: i32) -> io::Result<()> {
     }
     Ok(())
 }
+
+pub fn set_window_clamp(fd: RawFd, window: u32) -> io::Result<()> {
+    // SAFETY: window points to a valid u32 TCP_WINDOW_CLAMP option value.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_WINDOW_CLAMP,
+            std::ptr::from_ref(&window).cast(),
+            size_of::<u32>() as libc::socklen_t,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
