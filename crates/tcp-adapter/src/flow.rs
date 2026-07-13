@@ -33,6 +33,7 @@ pub struct SendPlan {
     pub sequence: u32,
     pub acknowledgment: u32,
     pub length: usize,
+    pub syn: bool,
     pub fin: bool,
 }
 
@@ -121,8 +122,8 @@ impl Flow {
 
     #[must_use]
     pub const fn available_namespace_window(&self) -> usize {
-        let used = self.unacked_to_namespace();
-        self.peer_window.saturating_sub(used as u16) as usize
+        let used = self.unacked_to_namespace() as usize;
+        (self.peer_window as usize).saturating_sub(used)
     }
 
     pub fn socket_connected(&mut self, bytes_acked: u64) -> SendPlan {
@@ -132,6 +133,7 @@ impl Flow {
             sequence: self.local_initial,
             acknowledgment: self.namespace_next,
             length: 0,
+            syn: true,
             fin: false,
         };
         self.local_next = self.local_initial.wrapping_add(1);
@@ -222,6 +224,7 @@ impl Flow {
             sequence: self.local_next,
             acknowledgment: self.namespace_acked,
             length,
+            syn: false,
             fin,
         })
     }
@@ -355,5 +358,22 @@ mod tests {
         flow.receive(u32::MAX - 3, Some(flow.local_next()), 65535, 0, true, false);
         assert_eq!(flow.state(), State::TimeWait);
         assert_eq!(flow.namespace_ack(), u32::MAX - 2);
+    }
+
+    #[test]
+    fn window_allows_multiple_inflight_segments() {
+        let mut flow = flow();
+        flow.socket_connected(0);
+        flow.receive(u32::MAX - 3, Some(101), 12, 0, false, false);
+
+        let first = flow.plan_send(4, false).unwrap();
+        flow.commit_send(first);
+        let second = flow.plan_send(4, false).unwrap();
+        flow.commit_send(second);
+
+        assert_eq!(flow.unacked_to_namespace(), 8);
+        assert_eq!(flow.available_namespace_window(), 4);
+        assert!(flow.plan_send(5, false).is_none());
+        assert!(flow.plan_send(4, false).is_some());
     }
 }

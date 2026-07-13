@@ -12,6 +12,10 @@
   handshake bytes do not advance namespace application ACKs.
 - Proxy replies are parsed from `MSG_PEEK` data and only the validated response
   prefix is consumed, preserving target data already queued after the reply.
+- Multiple namespace-bound segments can remain in flight up to the advertised
+  window. Segment metadata is tracked without copying payload; new sends use a
+  socket peek offset and retransmission rebuilds the oldest unacknowledged
+  frame from the retained socket prefix.
 - Credential files are opened before namespace creation with `O_NOFOLLOW`,
   owner and mode checks. Supervisor and ns-init copies are dropped before the
   target namespace is cloned.
@@ -25,8 +29,7 @@ DNS, or external routing.
 
 ## Remaining Phase 1 Work
 
-- Windowed namespace segment scheduling, zero-window probes, and broader loss
-  and retransmission injection.
+- Zero-window probes and broader loss and retransmission injection.
 - Explicit two-sided flow construction states and bounded handshake-pending
   namespace payload queues.
 - DNS proxy-tcp and resolver mount isolation.

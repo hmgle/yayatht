@@ -13,6 +13,7 @@ use yayatht_packet::neighbor;
 use yayatht_packet::tcp::{self, TcpFlags, TcpHeaderSpec, TcpSegment};
 use yayatht_proxy_proto::{Credentials, Handshake, Protocol};
 use yayatht_tcp_adapter::flow::{Flow, FlowKey, ReceiveDisposition, SendPlan, State};
+use yayatht_tcp_adapter::sequence;
 
 const TAP_BUDGET: usize = 32;
 const EVENT_CAPACITY: usize = 128;
@@ -74,10 +75,62 @@ struct FlowEntry {
     handshake: Option<Handshake>,
     pending_socket: VecDeque<Vec<u8>>,
     pending_shutdown: bool,
-    last_frame: Option<Vec<u8>>,
+    sent_segments: VecDeque<SentSegment>,
+}
+
+#[derive(Clone, Debug)]
+struct SentSegment {
+    sequence: u32,
+    payload_len: usize,
+    syn: bool,
+    fin: bool,
     last_sent: Instant,
     retransmit_timeout: Duration,
     retries: u8,
+}
+
+impl SentSegment {
+    fn sequence_len(&self) -> u32 {
+        self.payload_len as u32 + u32::from(self.syn) + u32::from(self.fin)
+    }
+
+    fn end_sequence(&self) -> u32 {
+        self.sequence.wrapping_add(self.sequence_len())
+    }
+
+    fn acknowledge(&mut self, acknowledgment: u32) -> bool {
+        if !sequence::after(acknowledgment, self.sequence) {
+            return false;
+        }
+        if !sequence::before(acknowledgment, self.end_sequence()) {
+            return true;
+        }
+        let mut acknowledged = sequence::distance(self.sequence, acknowledgment);
+        self.sequence = acknowledgment;
+        if self.syn && acknowledged > 0 {
+            self.syn = false;
+            acknowledged -= 1;
+        }
+        let payload = usize::try_from(acknowledged)
+            .unwrap_or(usize::MAX)
+            .min(self.payload_len);
+        self.payload_len -= payload;
+        acknowledged -= payload as u32;
+        if self.fin && acknowledged > 0 {
+            self.fin = false;
+        }
+        false
+    }
+
+    fn flags(&self) -> TcpFlags {
+        TcpFlags {
+            syn: self.syn,
+            fin: self.fin,
+            psh: self.payload_len > 0,
+            ack: true,
+            ..TcpFlags::default()
+        }
+    }
 }
 
 struct QueuedFrame {
@@ -330,10 +383,7 @@ impl Reactor {
             handshake: self.proxy_handshake(key.target),
             pending_socket: VecDeque::new(),
             pending_shutdown: false,
-            last_frame: None,
-            last_sent: Instant::now(),
-            retransmit_timeout: RETRANSMIT_INITIAL,
-            retries: 0,
+            sent_segments: VecDeque::new(),
         };
         let id = match self.flows.insert(entry) {
             Ok(id) => id,
@@ -374,10 +424,8 @@ impl Reactor {
             if state == State::Connecting {
                 return Ok(());
             }
-            if state == State::SynReceived
-                && let Some(frame) = self.flows.get(id).expect("flow exists").last_frame.clone()
-            {
-                return self.queue_tap(None, frame, None);
+            if state == State::SynReceived {
+                return self.retransmit_oldest(id, false);
             }
         }
         let previous_ack = self
@@ -403,22 +451,33 @@ impl Reactor {
         if disposition == ReceiveDisposition::Reset {
             return self.close_flow(id);
         }
-        let acked = self
+        let current_ack = self
             .flows
             .get(id)
             .expect("flow exists")
             .flow
-            .newly_acked_payload(previous_ack);
-        if acked > 0 {
-            let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
-            let discarded = yayatht_sys::socket::discard(fd, acked)?;
-            if discarded != acked {
-                return Err(Error::Invariant("socket ACK consume length mismatch"));
+            .local_unacked();
+        if current_ack != previous_ack {
+            let acked = self
+                .flows
+                .get(id)
+                .expect("flow exists")
+                .flow
+                .newly_acked_payload(previous_ack);
+            if acked > 0 {
+                let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
+                let discarded = yayatht_sys::socket::discard(fd, acked)?;
+                if discarded != acked {
+                    return Err(Error::Invariant("socket ACK consume length mismatch"));
+                }
             }
-            let entry = self.flows.get_mut(id).expect("flow exists");
-            entry.last_frame = None;
-            entry.retries = 0;
-            entry.retransmit_timeout = RETRANSMIT_INITIAL;
+            let segments = &mut self.flows.get_mut(id).expect("flow exists").sent_segments;
+            while segments
+                .front_mut()
+                .is_some_and(|segment| segment.acknowledge(current_ack))
+            {
+                segments.pop_front();
+            }
         }
         match disposition {
             ReceiveDisposition::InOrder { payload_len, fin } => {
@@ -749,23 +808,32 @@ impl Reactor {
     }
 
     fn send_socket_data(&mut self, id: FlowId) -> Result<(), Error> {
-        let (state, unacked, window, mss, fd) = {
+        if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
+            return Ok(());
+        }
+        let (state, payload_offset, window, mss, fd) = {
             let entry = self.flows.get(id).expect("flow exists");
             (
                 entry.flow.state(),
-                entry.flow.unacked_to_namespace(),
+                entry
+                    .sent_segments
+                    .iter()
+                    .map(|segment| segment.payload_len)
+                    .sum::<usize>(),
                 entry.flow.available_namespace_window(),
                 usize::from(entry.flow.mss()),
                 entry.socket.as_raw_fd(),
             )
         };
-        if !matches!(state, State::Established | State::NamespaceFinReceived) || unacked != 0 {
+        if !matches!(state, State::Established | State::NamespaceFinReceived) {
             return Ok(());
         }
         if window == 0 {
             return Ok(());
         }
-        yayatht_sys::tcp_info::set_peek_offset(fd, 0)?;
+        let offset = i32::try_from(payload_offset)
+            .map_err(|_| Error::Invariant("socket peek offset exceeds i32"))?;
+        yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
         let mut payload = vec![0u8; mss.min(window)];
         match yayatht_sys::socket::peek(fd, &mut payload) {
             Ok(0) => {
@@ -822,6 +890,7 @@ impl Reactor {
                 sequence: flow.local_next(),
                 acknowledgment: flow.namespace_ack(),
                 length: 0,
+                syn: false,
                 fin: false,
             }
         };
@@ -842,33 +911,94 @@ impl Reactor {
         for id in self.flows.active_ids() {
             let retransmit = {
                 let entry = self.flows.get(id).expect("flow exists");
-                entry.flow.unacked_to_namespace() > 0
-                    && entry.last_frame.is_some()
-                    && now.duration_since(entry.last_sent) >= entry.retransmit_timeout
+                entry.sent_segments.front().is_some_and(|segment| {
+                    now.duration_since(segment.last_sent) >= segment.retransmit_timeout
+                })
             };
             if !retransmit {
                 continue;
             }
-            if self.flows.get(id).expect("flow exists").retries >= MAX_RETRIES {
+            if self
+                .flows
+                .get(id)
+                .expect("flow exists")
+                .sent_segments
+                .front()
+                .is_some_and(|segment| segment.retries >= MAX_RETRIES)
+            {
                 self.send_reset_for_flow(id)?;
                 self.close_flow(id)?;
                 continue;
             }
-            let frame = self
-                .flows
-                .get(id)
-                .expect("flow exists")
-                .last_frame
-                .clone()
-                .expect("checked frame");
-            self.queue_tap(None, frame, None)?;
-            let entry = self.flows.get_mut(id).expect("flow exists");
-            entry.last_sent = now;
-            entry.retries += 1;
-            entry.retransmit_timeout = (entry.retransmit_timeout * 2).min(Duration::from_secs(8));
-            self.metrics.tcp_retransmits += 1;
+            self.retransmit_oldest(id, true)?;
         }
         Ok(())
+    }
+
+    fn retransmit_oldest(&mut self, id: FlowId, backoff: bool) -> Result<(), Error> {
+        if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
+            return Ok(());
+        }
+        let (segment, fd, acknowledgment) = {
+            let entry = self.flows.get(id).expect("flow exists");
+            let Some(segment) = entry.sent_segments.front() else {
+                return Ok(());
+            };
+            (
+                segment.clone(),
+                entry.socket.as_raw_fd(),
+                entry.flow.namespace_ack(),
+            )
+        };
+        let mut payload = vec![0u8; segment.payload_len];
+        if segment.payload_len > 0 {
+            yayatht_sys::tcp_info::set_peek_offset(fd, 0)?;
+            match yayatht_sys::socket::peek(fd, &mut payload) {
+                Ok(length) if length == payload.len() => {}
+                Ok(_) => {
+                    self.fail_tcp_flow(id, "retained socket payload is shorter than segment")?;
+                    return Ok(());
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    self.fail_tcp_flow(id, "retained socket payload is unavailable")?;
+                    return Ok(());
+                }
+                Err(error) => {
+                    self.fail_tcp_flow(id, &error.to_string())?;
+                    return Ok(());
+                }
+            }
+        }
+        let plan = SendPlan {
+            sequence: segment.sequence,
+            acknowledgment,
+            length: segment.payload_len,
+            syn: segment.syn,
+            fin: segment.fin,
+        };
+        let frame = self.build_flow_frame(id, plan, &payload, segment.flags())?;
+        self.queue_tap(Some(id), frame, None)?;
+        let segment = self
+            .flows
+            .get_mut(id)
+            .expect("flow exists")
+            .sent_segments
+            .front_mut()
+            .ok_or(Error::Invariant("retransmitted segment disappeared"))?;
+        segment.last_sent = Instant::now();
+        if backoff {
+            segment.retries += 1;
+            segment.retransmit_timeout =
+                (segment.retransmit_timeout * 2).min(Duration::from_secs(8));
+        }
+        self.metrics.tcp_retransmits += 1;
+        Ok(())
+    }
+
+    fn fail_tcp_flow(&mut self, id: FlowId, reason: &str) -> Result<(), Error> {
+        warn!(%reason, "TCP flow invariant failed");
+        self.send_reset_for_flow(id)?;
+        self.close_flow(id)
     }
 
     fn transport_target(&self, logical: SocketAddr) -> SocketAddr {
@@ -930,6 +1060,7 @@ impl Reactor {
                 sequence: 0,
                 acknowledgment,
                 length: 0,
+                syn: false,
                 fin: false,
             },
             &[],
@@ -1079,7 +1210,7 @@ impl Reactor {
     fn commit_tap_send(
         &mut self,
         flow: Option<FlowId>,
-        bytes: Vec<u8>,
+        _bytes: Vec<u8>,
         plan: Option<SendPlan>,
     ) -> Result<(), Error> {
         if let (Some(id), Some(plan)) = (flow, plan) {
@@ -1090,8 +1221,22 @@ impl Reactor {
             if plan.length > 0 || plan.fin {
                 entry.flow.commit_send(plan);
             }
-            entry.last_frame = Some(bytes);
-            entry.last_sent = Instant::now();
+            let sequence_len = sequence::distance(plan.sequence, entry.flow.local_next());
+            let expected = plan.length as u32 + u32::from(plan.syn) + u32::from(plan.fin);
+            if sequence_len != expected || expected == 0 {
+                return Err(Error::Invariant(
+                    "TAP transmission sequence commitment mismatch",
+                ));
+            }
+            entry.sent_segments.push_back(SentSegment {
+                sequence: plan.sequence,
+                payload_len: plan.length,
+                syn: plan.syn,
+                fin: plan.fin,
+                last_sent: Instant::now(),
+                retransmit_timeout: RETRANSMIT_INITIAL,
+                retries: 0,
+            });
         }
         Ok(())
     }
@@ -1100,8 +1245,19 @@ impl Reactor {
         let Some(entry) = self.flows.get(id) else {
             return Ok(());
         };
-        self.epoll.delete(entry.socket.as_raw_fd())?;
-        self.by_key.remove(&entry.flow.key());
+        let fd = entry.socket.as_raw_fd();
+        let key = entry.flow.key();
+        self.epoll.delete(fd)?;
+        self.by_key.remove(&key);
+        self.tap_queue.retain(|frame| frame.flow != Some(id));
+        if self.tap_queue.is_empty() {
+            self.epoll.modify(
+                self.tap.as_raw_fd(),
+                yayatht_sys::reactor::READABLE,
+                EpollToken::global(Resource::Tap).raw(),
+            )?;
+        }
+        self.flows.get_mut(id).expect("flow exists").flow.close();
         self.flows.defer_remove(id);
         Ok(())
     }
@@ -1114,4 +1270,43 @@ impl Reactor {
 
 pub fn run(config: Config, tap: OwnedFd, control: OwnedFd) -> Result<Metrics, Error> {
     Reactor::new(config, tap, control)?.run()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segment(sequence: u32, payload_len: usize, syn: bool, fin: bool) -> SentSegment {
+        SentSegment {
+            sequence,
+            payload_len,
+            syn,
+            fin,
+            last_sent: Instant::now(),
+            retransmit_timeout: RETRANSMIT_INITIAL,
+            retries: 0,
+        }
+    }
+
+    #[test]
+    fn partial_ack_trims_wrapped_segment() {
+        let mut segment = segment(u32::MAX - 2, 5, false, false);
+        assert!(!segment.acknowledge(0));
+        assert_eq!(segment.sequence, 0);
+        assert_eq!(segment.payload_len, 2);
+        assert!(segment.acknowledge(2));
+    }
+
+    #[test]
+    fn acknowledgment_accounts_for_syn_and_fin_sequence_space() {
+        let mut syn = segment(100, 0, true, false);
+        assert!(syn.acknowledge(101));
+
+        let mut data_fin = segment(200, 3, false, true);
+        assert!(!data_fin.acknowledge(203));
+        assert_eq!(data_fin.sequence, 203);
+        assert_eq!(data_fin.payload_len, 0);
+        assert!(data_fin.fin);
+        assert!(data_fin.acknowledge(204));
+    }
 }

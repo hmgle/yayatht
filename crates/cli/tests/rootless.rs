@@ -243,7 +243,10 @@ fn socks5_no_auth_busybox_echo() {
     }
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
     let address = listener.local_addr().unwrap();
-    let payload = b"yayatht-socks5\n";
+    let payload = (0..32 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let expected = payload.clone();
     let server = thread::spawn(move || {
         let mut stream = proxy_stream(listener);
         let mut greeting = [0u8; 3];
@@ -255,12 +258,12 @@ fn socks5_no_auth_busybox_echo() {
             "198.51.100.77:443".parse().unwrap()
         );
         stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
-        proxy_echo(stream, payload);
+        proxy_echo(stream, &expected);
     });
     proxy_client_case(
         &["--socks5".to_owned(), address.to_string()],
         "socks5",
-        payload,
+        &payload,
     );
     server.join().unwrap();
 }
