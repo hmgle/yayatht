@@ -1,8 +1,21 @@
 use std::ffi::OsString;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use thiserror::Error;
 use yayatht_packet::MacAddress;
+use yayatht_proxy_proto::{Credentials, Protocol};
+
+#[derive(Clone, Debug)]
+pub enum UpstreamConfig {
+    Direct {
+        host_loopback: bool,
+    },
+    Proxy {
+        protocol: Protocol,
+        address: SocketAddr,
+        credentials: Option<Credentials>,
+    },
+}
 
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
@@ -41,7 +54,7 @@ impl NetworkConfig {
     #[must_use]
     pub fn dataplane(
         &self,
-        host_loopback: bool,
+        upstream: &UpstreamConfig,
         max_tcp_flows: usize,
     ) -> yayatht_dataplane::reactor::Config {
         yayatht_dataplane::reactor::Config {
@@ -51,7 +64,22 @@ impl NetworkConfig {
             gateway_ipv4: self.gateway_ipv4,
             target_ipv6: self.target_ipv6.map(|(address, _)| address),
             gateway_ipv6: self.gateway_ipv6,
-            host_loopback,
+            upstream: match upstream {
+                UpstreamConfig::Direct { host_loopback } => {
+                    yayatht_dataplane::reactor::Upstream::Direct {
+                        host_loopback: *host_loopback,
+                    }
+                }
+                UpstreamConfig::Proxy {
+                    protocol,
+                    address,
+                    credentials,
+                } => yayatht_dataplane::reactor::Upstream::Proxy {
+                    protocol: *protocol,
+                    address: *address,
+                    credentials: credentials.clone(),
+                },
+            },
             max_tcp_flows,
         }
     }
@@ -63,7 +91,7 @@ pub struct LaunchConfig {
     pub name: Option<String>,
     pub runtime_root: Option<PathBuf>,
     pub network: NetworkConfig,
-    pub host_loopback: bool,
+    pub upstream: UpstreamConfig,
     pub max_tcp_flows: usize,
 }
 
@@ -99,5 +127,11 @@ impl LaunchConfig {
             return Err(ConfigError::InvalidName);
         }
         Ok(())
+    }
+
+    pub(crate) fn clear_proxy_credentials(&mut self) {
+        if let UpstreamConfig::Proxy { credentials, .. } = &mut self.upstream {
+            *credentials = None;
+        }
     }
 }

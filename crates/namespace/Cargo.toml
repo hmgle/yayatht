@@ -15,6 +15,7 @@ thiserror.workspace = true
 tracing.workspace = true
 yayatht-dataplane = { path = "../dataplane" }
 yayatht-packet = { path = "../packet" }
+yayatht-proxy-proto = { path = "../proxy-proto" }
 yayatht-sys = { path = "../sys" }
 
 [lints]

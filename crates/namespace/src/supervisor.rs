@@ -40,7 +40,7 @@ pub enum Error {
 pub struct Supervisor;
 
 impl Supervisor {
-    pub fn run(config: LaunchConfig) -> Result<ExitStatus, Error> {
+    pub fn run(mut config: LaunchConfig) -> Result<ExitStatus, Error> {
         config.validate()?;
         yayatht_sys::caps::set_child_subreaper()?;
         let signal_fd = yayatht_sys::signal::SignalFd::block(&[
@@ -60,7 +60,7 @@ impl Supervisor {
 
         let dataplane_config = config
             .network
-            .dataplane(config.host_loopback, config.max_tcp_flows);
+            .dataplane(&config.upstream, config.max_tcp_flows);
         let (dataplane_pid, dataplane_pidfd) = match clone_namespaced(COMMON_NAMESPACES)? {
             CloneResult::Child => {
                 drop(signal_fd);
@@ -72,6 +72,8 @@ impl Supervisor {
             }
             CloneResult::Parent { pid, pidfd } => (pid, pidfd),
         };
+        drop(dataplane_config);
+        config.clear_proxy_credentials();
 
         let (namespace_pid, namespace_pidfd) =
             match clone_namespaced(COMMON_NAMESPACES | libc::CLONE_NEWNET as u64) {

@@ -518,11 +518,14 @@ name = "yayatht"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "libc",
+ "rustix",
  "serde_json",
  "tracing",
  "tracing-subscriber",
  "wait-timeout",
  "yayatht-namespace",
+ "yayatht-proxy-proto",
  "yayatht-sys",
 ]
 
@@ -537,6 +540,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "yayatht-packet",
+ "yayatht-proxy-proto",
  "yayatht-sys",
  "yayatht-tcp-adapter",
 ]
@@ -554,6 +558,7 @@ dependencies = [
  "tracing",
  "yayatht-dataplane",
  "yayatht-packet",
+ "yayatht-proxy-proto",
  "yayatht-sys",
 ]
 

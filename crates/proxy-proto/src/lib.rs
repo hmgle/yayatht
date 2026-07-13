@@ -360,10 +360,11 @@ fn http_connect_request(target: SocketAddr, credentials: Option<&Credentials>) -
         raw.extend_from_slice(credentials.username());
         raw.push(b':');
         raw.extend_from_slice(credentials.password());
-        let encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
+        let mut encoded = base64::engine::general_purpose::STANDARD.encode(&raw);
         raw.zeroize();
         write!(request, "Proxy-Authorization: Basic {encoded}\r\n")
             .expect("writing to String cannot fail");
+        encoded.zeroize();
     }
     request.push_str("\r\n");
     request.into_bytes()

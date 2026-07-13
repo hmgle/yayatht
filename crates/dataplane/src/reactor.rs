@@ -11,12 +11,26 @@ use yayatht_packet::ethernet::{self, EtherType, EthernetFrame, MacAddress};
 use yayatht_packet::ip::{self, Ipv4Packet, Ipv6Packet};
 use yayatht_packet::neighbor;
 use yayatht_packet::tcp::{self, TcpFlags, TcpHeaderSpec, TcpSegment};
+use yayatht_proxy_proto::{Credentials, Handshake, Protocol};
 use yayatht_tcp_adapter::flow::{Flow, FlowKey, ReceiveDisposition, SendPlan, State};
 
 const TAP_BUDGET: usize = 32;
 const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 const MAX_RETRIES: u8 = 5;
+const PROXY_RESPONSE_CAPACITY: usize = 8 * 1024;
+
+#[derive(Clone, Debug)]
+pub enum Upstream {
+    Direct {
+        host_loopback: bool,
+    },
+    Proxy {
+        protocol: Protocol,
+        address: SocketAddr,
+        credentials: Option<Credentials>,
+    },
+}
 
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -26,7 +40,7 @@ pub struct Config {
     pub gateway_ipv4: Option<Ipv4Addr>,
     pub target_ipv6: Option<Ipv6Addr>,
     pub gateway_ipv6: Option<Ipv6Addr>,
-    pub host_loopback: bool,
+    pub upstream: Upstream,
     pub max_tcp_flows: usize,
 }
 
@@ -39,6 +53,8 @@ pub struct Metrics {
     pub tcp_closed: u64,
     pub tcp_retransmits: u64,
     pub tcp_resets: u64,
+    pub proxy_handshakes: u64,
+    pub proxy_failures: u64,
 }
 
 #[derive(Debug, Error)]
@@ -54,7 +70,8 @@ pub enum Error {
 struct FlowEntry {
     flow: Flow,
     socket: OwnedFd,
-    connected: bool,
+    transport_connected: bool,
+    handshake: Option<Handshake>,
     pending_socket: VecDeque<Vec<u8>>,
     pending_shutdown: bool,
     last_frame: Option<Vec<u8>>,
@@ -309,7 +326,8 @@ impl Reactor {
                 segment.mss().unwrap_or(default_mss),
             ),
             socket,
-            connected: false,
+            transport_connected: false,
+            handshake: self.proxy_handshake(key.target),
             pending_socket: VecDeque::new(),
             pending_shutdown: false,
             last_frame: None,
@@ -317,10 +335,14 @@ impl Reactor {
             retransmit_timeout: RETRANSMIT_INITIAL,
             retries: 0,
         };
-        let id = self
-            .flows
-            .insert(entry)
-            .map_err(|_| Error::Invariant("flow table full"))?;
+        let id = match self.flows.insert(entry) {
+            Ok(id) => id,
+            Err(_) => {
+                let frame = self.build_reset(key, segment.sequence().wrapping_add(1))?;
+                self.metrics.tcp_resets += 1;
+                return self.queue_tap(None, frame, None);
+            }
+        };
         self.by_key.insert(key, id);
         let token = EpollToken::flow(id, Resource::UpstreamSocket, true)
             .ok_or(Error::Invariant("unable to encode flow token"))?;
@@ -340,7 +362,7 @@ impl Reactor {
         )?;
         self.metrics.tcp_created += 1;
         if connected {
-            self.finish_connect(id)?;
+            self.finish_transport_connect(id)?;
         }
         Ok(())
     }
@@ -458,7 +480,7 @@ impl Reactor {
     }
 
     fn handle_socket(&mut self, id: FlowId, events: u32) -> Result<(), Error> {
-        if self.flows.get(id).is_none() {
+        if self.flow_is_closed(id) {
             return Ok(());
         }
         if events & yayatht_sys::reactor::ERROR != 0 {
@@ -468,13 +490,36 @@ impl Reactor {
                 return self.close_flow(id);
             }
         }
-        if !self.flows.get(id).expect("flow exists").connected
+        if !self.flows.get(id).expect("flow exists").transport_connected
             && events & yayatht_sys::reactor::WRITABLE != 0
         {
-            self.finish_connect(id)?;
+            self.finish_transport_connect(id)?;
         }
-        if self.flows.get(id).is_none() {
+        if self.flow_is_closed(id) {
             return Ok(());
+        }
+        if self
+            .flows
+            .get(id)
+            .is_some_and(|entry| entry.handshake.is_some())
+        {
+            if events & yayatht_sys::reactor::WRITABLE != 0 {
+                self.flush_proxy_output(id)?;
+            }
+            if self.flow_is_closed(id) {
+                return Ok(());
+            }
+            if events & (yayatht_sys::reactor::READABLE | yayatht_sys::reactor::READ_HANGUP) != 0 {
+                self.receive_proxy_input(id)?;
+            }
+            if self.flow_is_closed(id)
+                || self
+                    .flows
+                    .get(id)
+                    .is_none_or(|entry| entry.handshake.is_some())
+            {
+                return Ok(());
+            }
         }
         if events & yayatht_sys::reactor::WRITABLE != 0 {
             self.flush_socket_queue(id)?;
@@ -486,18 +531,36 @@ impl Reactor {
         Ok(())
     }
 
-    fn finish_connect(&mut self, id: FlowId) -> Result<(), Error> {
+    fn finish_transport_connect(&mut self, id: FlowId) -> Result<(), Error> {
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         if yayatht_sys::socket::pending_error(fd)?.is_some() {
             self.send_reset_for_flow(id)?;
             return self.close_flow(id);
         }
+        self.flows
+            .get_mut(id)
+            .expect("flow exists")
+            .transport_connected = true;
+        if self
+            .flows
+            .get(id)
+            .is_some_and(|entry| entry.handshake.is_some())
+        {
+            self.flush_proxy_output(id)
+        } else {
+            self.activate_flow(id)
+        }
+    }
+
+    fn activate_flow(&mut self, id: FlowId) -> Result<(), Error> {
+        let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         let info = yayatht_sys::tcp_info::get(fd)?;
-        let plan = {
-            let entry = self.flows.get_mut(id).expect("flow exists");
-            entry.connected = true;
-            entry.flow.socket_connected(info.bytes_acked)
-        };
+        let plan = self
+            .flows
+            .get_mut(id)
+            .expect("flow exists")
+            .flow
+            .socket_connected(info.bytes_acked);
         let frame = self.build_flow_frame(
             id,
             plan,
@@ -509,6 +572,117 @@ impl Reactor {
             },
         )?;
         self.queue_tap(Some(id), frame, Some(plan))
+    }
+
+    fn flush_proxy_output(&mut self, id: FlowId) -> Result<(), Error> {
+        loop {
+            let send_result = {
+                let entry = self.flows.get(id).expect("flow exists");
+                let handshake = entry.handshake.as_ref().expect("proxy handshake exists");
+                if handshake.output().is_empty() {
+                    break;
+                }
+                yayatht_sys::socket::send(entry.socket.as_raw_fd(), handshake.output())
+            };
+            match send_result {
+                Ok(0) => {
+                    self.fail_proxy_handshake(id, "proxy handshake send returned zero")?;
+                    break;
+                }
+                Ok(sent) => self
+                    .flows
+                    .get_mut(id)
+                    .expect("flow exists")
+                    .handshake
+                    .as_mut()
+                    .expect("proxy handshake exists")
+                    .advance_output(sent)
+                    .map_err(|error| io::Error::other(error.to_string()))?,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(error) => {
+                    self.fail_proxy_handshake(id, &error.to_string())?;
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn receive_proxy_input(&mut self, id: FlowId) -> Result<(), Error> {
+        let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
+        let mut response = [0u8; PROXY_RESPONSE_CAPACITY];
+        let length = match yayatht_sys::socket::peek(fd, &mut response) {
+            Ok(0) => {
+                self.fail_proxy_handshake(id, "proxy closed during handshake")?;
+                return Ok(());
+            }
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+            Err(error) => {
+                self.fail_proxy_handshake(id, &error.to_string())?;
+                return Ok(());
+            }
+        };
+        let consumed = match self
+            .flows
+            .get_mut(id)
+            .expect("flow exists")
+            .handshake
+            .as_mut()
+            .expect("proxy handshake exists")
+            .receive(&response[..length])
+        {
+            Ok(consumed) => consumed,
+            Err(error) => {
+                self.fail_proxy_handshake(id, &error.to_string())?;
+                return Ok(());
+            }
+        };
+        if consumed > 0 {
+            let discarded = match yayatht_sys::socket::discard(fd, consumed) {
+                Ok(discarded) => discarded,
+                Err(error) => {
+                    self.fail_proxy_handshake(id, &error.to_string())?;
+                    return Ok(());
+                }
+            };
+            if discarded != consumed {
+                self.fail_proxy_handshake(id, "proxy response consume length mismatch")?;
+                return Ok(());
+            }
+        }
+        if self.flows.get(id).is_none() {
+            return Ok(());
+        }
+        if self
+            .flows
+            .get(id)
+            .expect("flow exists")
+            .handshake
+            .as_ref()
+            .expect("proxy handshake exists")
+            .is_complete()
+        {
+            self.flows.get_mut(id).expect("flow exists").handshake = None;
+            self.metrics.proxy_handshakes += 1;
+            self.activate_flow(id)?;
+        } else {
+            self.flush_proxy_output(id)?;
+        }
+        Ok(())
+    }
+
+    fn fail_proxy_handshake(&mut self, id: FlowId, reason: &str) -> Result<(), Error> {
+        warn!(%reason, "proxy handshake failed");
+        self.metrics.proxy_failures += 1;
+        self.send_reset_for_flow(id)?;
+        self.close_flow(id)
+    }
+
+    fn flow_is_closed(&self, id: FlowId) -> bool {
+        self.flows
+            .get(id)
+            .is_none_or(|entry| entry.flow.state() == State::Closed)
     }
 
     fn flush_socket_queue(&mut self, id: FlowId) -> Result<(), Error> {
@@ -698,17 +872,33 @@ impl Reactor {
     }
 
     fn transport_target(&self, logical: SocketAddr) -> SocketAddr {
-        if !self.config.host_loopback {
-            return logical;
+        match &self.config.upstream {
+            Upstream::Proxy { address, .. } => *address,
+            Upstream::Direct {
+                host_loopback: false,
+            } => logical,
+            Upstream::Direct {
+                host_loopback: true,
+            } => match logical {
+                SocketAddr::V4(address) if Some(*address.ip()) == self.config.gateway_ipv4 => {
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
+                }
+                SocketAddr::V6(address) if Some(*address.ip()) == self.config.gateway_ipv6 => {
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), address.port())
+                }
+                _ => logical,
+            },
         }
-        match logical {
-            SocketAddr::V4(address) if Some(*address.ip()) == self.config.gateway_ipv4 => {
-                SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
-            }
-            SocketAddr::V6(address) if Some(*address.ip()) == self.config.gateway_ipv6 => {
-                SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), address.port())
-            }
-            _ => logical,
+    }
+
+    fn proxy_handshake(&self, logical: SocketAddr) -> Option<Handshake> {
+        match &self.config.upstream {
+            Upstream::Direct { .. } => None,
+            Upstream::Proxy {
+                protocol,
+                credentials,
+                ..
+            } => Some(Handshake::new(*protocol, logical, credentials.clone())),
         }
     }
 

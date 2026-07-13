@@ -13,6 +13,7 @@ rustix.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 yayatht-packet = { path = "../packet" }
+yayatht-proxy-proto = { path = "../proxy-proto" }
 yayatht-sys = { path = "../sys" }
 yayatht-tcp-adapter = { path = "../tcp-adapter" }
 

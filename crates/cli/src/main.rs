@@ -1,10 +1,14 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{ArgGroup, Args, Parser, Subcommand};
 use std::ffi::OsString;
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
+use std::net::SocketAddr;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
-use yayatht_namespace::{LaunchConfig, NetworkConfig, Supervisor};
+use yayatht_namespace::{LaunchConfig, NetworkConfig, Supervisor, UpstreamConfig};
+use yayatht_proxy_proto::{Credentials, Protocol};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -24,9 +28,41 @@ enum Command {
 }
 
 #[derive(Debug, Args)]
+#[command(group(
+    ArgGroup::new("upstream")
+        .required(true)
+        .multiple(false)
+        .args(["direct", "socks5", "http_connect"])
+))]
 struct RunArgs {
-    #[arg(long, required = true, help = "Enable the Phase 0 direct TCP backend")]
+    #[arg(long, help = "Connect namespace TCP flows directly")]
     direct: bool,
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Route TCP through a numeric SOCKS5 proxy"
+    )]
+    socks5: Option<SocketAddr>,
+    #[arg(
+        long,
+        value_name = "ADDR",
+        help = "Route TCP through a numeric HTTP CONNECT proxy"
+    )]
+    http_connect: Option<SocketAddr>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "proxy_password_file",
+        help = "Read the proxy username from a protected file"
+    )]
+    proxy_username_file: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "proxy_username_file",
+        help = "Read the proxy password from a protected file"
+    )]
+    proxy_password_file: Option<PathBuf>,
     #[arg(long)]
     name: Option<String>,
     #[arg(long, value_name = "ROOT")]
@@ -78,18 +114,91 @@ fn main() {
 }
 
 fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
-    if !args.direct {
-        return Err("Phase 0 requires --direct".into());
-    }
+    let credentials = match (&args.proxy_username_file, &args.proxy_password_file) {
+        (Some(username), Some(password)) => Some(Credentials::new(
+            read_credential(username)?,
+            read_credential(password)?,
+        )?),
+        (None, None) => None,
+        _ => return Err("proxy username and password files must be provided together".into()),
+    };
+    let upstream = match (args.direct, args.socks5, args.http_connect) {
+        (true, None, None) => {
+            if credentials.is_some() {
+                return Err("proxy credentials cannot be used with --direct".into());
+            }
+            UpstreamConfig::Direct {
+                host_loopback: args.host_loopback,
+            }
+        }
+        (false, Some(address), None) => {
+            if args.host_loopback {
+                return Err("--host-loopback is only valid with --direct".into());
+            }
+            UpstreamConfig::Proxy {
+                protocol: Protocol::Socks5,
+                address,
+                credentials,
+            }
+        }
+        (false, None, Some(address)) => {
+            if args.host_loopback {
+                return Err("--host-loopback is only valid with --direct".into());
+            }
+            UpstreamConfig::Proxy {
+                protocol: Protocol::HttpConnect,
+                address,
+                credentials,
+            }
+        }
+        _ => return Err("select exactly one of --direct, --socks5, or --http-connect".into()),
+    };
     let config = LaunchConfig {
         command: args.command,
         name: args.name,
         runtime_root: args.runtime_dir,
         network: NetworkConfig::synthetic(!args.no_ipv4, !args.no_ipv6),
-        host_loopback: args.host_loopback,
+        upstream,
         max_tcp_flows: args.max_tcp_flows,
     };
     Ok(Supervisor::run(config)?.code)
+}
+
+fn read_credential(path: &std::path::Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() {
+        return Err(format!("credential is not a regular file: {}", path.display()).into());
+    }
+    if metadata.uid() != rustix::process::getuid().as_raw() {
+        return Err(format!(
+            "credential is not owned by the current user: {}",
+            path.display()
+        )
+        .into());
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(format!(
+            "credential permissions must not allow group or other access: {}",
+            path.display()
+        )
+        .into());
+    }
+    let mut value = Vec::with_capacity(256);
+    Read::by_ref(&mut file).take(257).read_to_end(&mut value)?;
+    if value.ends_with(b"\n") {
+        value.pop();
+        if value.ends_with(b"\r") {
+            value.pop();
+        }
+    }
+    if value.len() > 255 {
+        return Err(format!("credential exceeds 255 bytes: {}", path.display()).into());
+    }
+    Ok(value)
 }
 
 fn status(args: StatusArgs) -> Result<i32, Box<dyn std::error::Error>> {

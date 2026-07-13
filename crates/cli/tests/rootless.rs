@@ -1,6 +1,7 @@
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
+use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::Duration;
@@ -100,6 +101,121 @@ fn echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str) {
     );
 }
 
+fn proxy_client_case(proxy_args: &[String], label: &str, payload: &[u8]) {
+    let name = unique_name(label);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
+    command.arg("run").args(proxy_args).args([
+        "--no-ipv6",
+        "--name",
+        &name,
+        "--",
+        "busybox",
+        "nc",
+        "-w",
+        "3",
+        "198.51.100.77",
+        "443",
+    ]);
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn proxied yayatht");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(payload)
+        .expect("write proxied command input");
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait for proxied yayatht")
+        .unwrap_or_else(|| {
+            child.kill().expect("kill timed out proxied yayatht");
+            panic!("yayatht proxy test timed out")
+        });
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut output)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
+    assert_eq!(output, payload, "unexpected command output: {stderr}");
+}
+
+fn proxy_stream(listener: TcpListener) -> std::net::TcpStream {
+    let (stream, _) = listener.accept().expect("accept proxy connection");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    stream
+}
+
+fn read_socks_target(stream: &mut std::net::TcpStream) -> SocketAddr {
+    let mut header = [0u8; 4];
+    stream.read_exact(&mut header).unwrap();
+    assert_eq!(&header[..3], &[5, 1, 0]);
+    let ip = match header[3] {
+        1 => {
+            let mut address = [0u8; 4];
+            stream.read_exact(&mut address).unwrap();
+            IpAddr::V4(Ipv4Addr::from(address))
+        }
+        4 => {
+            let mut address = [0u8; 16];
+            stream.read_exact(&mut address).unwrap();
+            IpAddr::V6(Ipv6Addr::from(address))
+        }
+        other => panic!("unexpected SOCKS5 address type {other}"),
+    };
+    let mut port = [0u8; 2];
+    stream.read_exact(&mut port).unwrap();
+    SocketAddr::new(ip, u16::from_be_bytes(port))
+}
+
+fn proxy_echo(mut stream: std::net::TcpStream, expected: &[u8]) {
+    let mut received = vec![0u8; expected.len()];
+    stream.read_exact(&mut received).unwrap();
+    assert_eq!(received, expected);
+    stream.write_all(&received).unwrap();
+}
+
+fn credential_files(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
+    let root = std::path::Path::new(&std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(format!(
+        "yayatht-credentials-{label}-{}",
+        std::process::id()
+    ));
+    fs::create_dir(&root).unwrap();
+    let username = root.join("username");
+    let password = root.join("password");
+    for (path, value) in [
+        (&username, b"proxy-user\n".as_slice()),
+        (&password, b"proxy-pass\n".as_slice()),
+    ] {
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        file.write_all(value).unwrap();
+    }
+    (root, username, password)
+}
+
 #[test]
 fn ipv4_busybox_echo() {
     echo_case(
@@ -118,6 +234,203 @@ fn ipv6_busybox_echo() {
         "--no-ipv4",
         "ipv6",
     );
+}
+
+#[test]
+fn socks5_no_auth_busybox_echo() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let payload = b"yayatht-socks5\n";
+    let server = thread::spawn(move || {
+        let mut stream = proxy_stream(listener);
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).unwrap();
+        assert_eq!(
+            read_socks_target(&mut stream),
+            "198.51.100.77:443".parse().unwrap()
+        );
+        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        proxy_echo(stream, payload);
+    });
+    proxy_client_case(
+        &["--socks5".to_owned(), address.to_string()],
+        "socks5",
+        payload,
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn socks5_password_busybox_echo() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let payload = b"yayatht-socks5-auth\n";
+    let server = thread::spawn(move || {
+        let mut stream = proxy_stream(listener);
+        let mut greeting = [0u8; 4];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 2, 0, 2]);
+        stream.write_all(&[5, 2]).unwrap();
+        let mut auth_header = [0u8; 2];
+        stream.read_exact(&mut auth_header).unwrap();
+        assert_eq!(auth_header, [1, 10]);
+        let mut username = [0u8; 10];
+        stream.read_exact(&mut username).unwrap();
+        assert_eq!(&username, b"proxy-user");
+        let mut password_length = [0u8; 1];
+        stream.read_exact(&mut password_length).unwrap();
+        assert_eq!(password_length, [10]);
+        let mut password = [0u8; 10];
+        stream.read_exact(&mut password).unwrap();
+        assert_eq!(&password, b"proxy-pass");
+        stream.write_all(&[1, 0]).unwrap();
+        assert_eq!(
+            read_socks_target(&mut stream),
+            "198.51.100.77:443".parse().unwrap()
+        );
+        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        proxy_echo(stream, payload);
+    });
+    let (root, username, password) = credential_files("socks5");
+    proxy_client_case(
+        &[
+            "--socks5".to_owned(),
+            address.to_string(),
+            "--proxy-username-file".to_owned(),
+            username.display().to_string(),
+            "--proxy-password-file".to_owned(),
+            password.display().to_string(),
+        ],
+        "socks5-auth",
+        payload,
+    );
+    server.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn socks5_failure_only_closes_one_flow() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let payload = b"yayatht-after-proxy-failure\n";
+    let server = thread::spawn(move || {
+        let mut failed = proxy_stream(listener.try_clone().unwrap());
+        let mut greeting = [0u8; 3];
+        failed.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        failed.write_all(&[5, 0]).unwrap();
+        assert_eq!(read_socks_target(&mut failed).port(), 80);
+        failed.write_all(&[5, 5, 0, 1, 0, 0, 0, 0, 0, 0]).unwrap();
+        drop(failed);
+
+        let mut succeeded = proxy_stream(listener);
+        succeeded.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        succeeded.write_all(&[5, 0]).unwrap();
+        assert_eq!(read_socks_target(&mut succeeded).port(), 443);
+        succeeded
+            .write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0])
+            .unwrap();
+        proxy_echo(succeeded, payload);
+    });
+
+    let name = unique_name("socks5-failure");
+    let script = "busybox nc -w 1 198.51.100.77 80 </dev/null >/dev/null 2>&1 || true; printf 'yayatht-after-proxy-failure\\n' | busybox nc -w 3 198.51.100.77 443";
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--socks5",
+            &address.to_string(),
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("proxy failure isolation test timed out")
+        });
+    let mut output = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut output)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
+    assert_eq!(output, payload);
+    server.join().unwrap();
+}
+
+#[test]
+fn http_connect_basic_busybox_echo() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let payload = b"yayatht-http-connect\n";
+    let server = thread::spawn(move || {
+        let mut stream = proxy_stream(listener);
+        let mut request = Vec::new();
+        while !request.ends_with(b"\r\n\r\n") {
+            assert!(request.len() < 8192);
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            request.push(byte[0]);
+        }
+        let request = String::from_utf8(request).unwrap();
+        assert!(request.starts_with("CONNECT 198.51.100.77:443 HTTP/1.1\r\n"));
+        assert!(request.contains("Host: 198.51.100.77:443\r\n"));
+        assert!(request.contains("Proxy-Authorization: Basic cHJveHktdXNlcjpwcm94eS1wYXNz\r\n"));
+        stream
+            .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+            .unwrap();
+        proxy_echo(stream, payload);
+    });
+    let (root, username, password) = credential_files("http");
+    proxy_client_case(
+        &[
+            "--http-connect".to_owned(),
+            address.to_string(),
+            "--proxy-username-file".to_owned(),
+            username.display().to_string(),
+            "--proxy-password-file".to_owned(),
+            password.display().to_string(),
+        ],
+        "http-connect",
+        payload,
+    );
+    server.join().unwrap();
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
