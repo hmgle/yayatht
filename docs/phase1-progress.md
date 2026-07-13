@@ -44,6 +44,9 @@ DNS, or external routing.
 ## Remaining Phase 1 Work
 
 - Broader loss and retransmission injection.
+- Extend the reproducible direct benchmark to multiple flows, latency and a
+  non-local destination; the initial single-flow results are recorded in
+  `docs/phase1-calibration.md`.
 - DNS proxy-tcp and resolver mount isolation.
 - Generated seccomp profiles, pivoted data-plane filesystem, and rlimits.
 - Structured metrics export, failure matrix expansion, and 24-hour soak tests.
