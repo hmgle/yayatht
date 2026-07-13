@@ -273,6 +273,77 @@ fn retransmit_recovers_two_dropped_namespace_segments() {
 }
 
 #[test]
+fn zero_window_probe_runs_while_namespace_reader_is_paused() {
+    if !supported() {
+        return;
+    }
+    const BYTE_COUNT: usize = 16 * 1024 * 1024;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept zero-window connection");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(15)))
+            .unwrap();
+        let buffer = [0xa5; 64 * 1024];
+        for _ in 0..BYTE_COUNT / buffer.len() {
+            stream
+                .write_all(&buffer)
+                .expect("write zero-window payload");
+        }
+    });
+
+    let name = unique_name("zero-window");
+    let script = format!("busybox nc -w 15 192.0.2.1 {port} | {{ sleep 2; busybox wc -c; }}");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .env("RUST_LOG", "yayatht_dataplane=debug,yayatht=info")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = child
+        .wait_timeout(Duration::from_secs(20))
+        .unwrap()
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("zero-window test timed out")
+        });
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
+    assert_eq!(output.trim(), BYTE_COUNT.to_string(), "{stderr}");
+    assert!(
+        stderr.contains("sent TCP zero-window probe"),
+        "zero-window probe was not observed: {stderr}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
 fn socks5_no_auth_busybox_echo() {
     if !supported() {
         return;

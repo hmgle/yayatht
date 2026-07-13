@@ -34,6 +34,9 @@
   sequence commitment. The integration suite drops two consecutive segments
   and verifies timeout retransmission plus cumulative ACK recovery without a
   copied retransmit payload.
+- A live zero-window integration case pauses the namespace reader while the
+  host sends 16 MiB, verifies that a persist probe is emitted, then confirms the
+  full byte count after the reader resumes.
 - Credential files are opened before namespace creation with `O_NOFOLLOW`,
   owner and mode checks. Supervisor and ns-init copies are dropped before the
   target namespace is cloned.
@@ -47,8 +50,8 @@ DNS, or external routing.
 
 ## Remaining Phase 1 Work
 
-- Add repeated retransmission loss, FIN loss and live zero-window integration
-  cases beyond the current consecutive data-segment loss coverage.
+- Add repeated retransmission loss and FIN loss beyond the current consecutive
+  data-segment loss coverage.
 - Extend the reproducible direct benchmark to multiple flows, latency and a
   non-local destination; the initial single-flow results are recorded in
   `docs/phase1-calibration.md`.

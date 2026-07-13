@@ -1241,6 +1241,7 @@ impl Reactor {
             probe.advance(now);
         }
         self.metrics.tcp_zero_window_probes += 1;
+        debug!(flow_slot = id.slot, "sent TCP zero-window probe");
         Ok(())
     }
 
