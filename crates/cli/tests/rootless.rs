@@ -22,13 +22,30 @@ fn unique_name(label: &str) -> String {
 }
 
 fn echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str) {
+    echo_payload_case(
+        bind,
+        gateway,
+        family_flag,
+        label,
+        format!("yayatht-{label}\n").into_bytes(),
+        &[],
+    );
+}
+
+fn echo_payload_case(
+    bind: SocketAddr,
+    gateway: &str,
+    family_flag: &str,
+    label: &str,
+    payload: Vec<u8>,
+    environment: &[(&str, &str)],
+) {
     if !supported() {
         eprintln!("skipping rootless TAP test: user namespaces or /dev/net/tun unavailable");
         return;
     }
     let listener = TcpListener::bind(bind).expect("bind loopback echo server");
     let port = listener.local_addr().unwrap().port();
-    let payload = format!("yayatht-{label}\n").into_bytes();
     let expected = payload.clone();
     let server = thread::spawn(move || {
         let (mut stream, _) = listener.accept().expect("accept proxied connection");
@@ -41,22 +58,26 @@ fn echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str) {
     });
 
     let name = unique_name(label);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
-        .args([
-            "run",
-            "--direct",
-            "--host-loopback",
-            family_flag,
-            "--name",
-            &name,
-            "--",
-            "busybox",
-            "nc",
-            "-w",
-            "3",
-            gateway,
-            &port.to_string(),
-        ])
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
+    command.args([
+        "run",
+        "--direct",
+        "--host-loopback",
+        family_flag,
+        "--name",
+        &name,
+        "--",
+        "busybox",
+        "nc",
+        "-w",
+        "3",
+        gateway,
+        &port.to_string(),
+    ]);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let mut child = command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -233,6 +254,21 @@ fn ipv6_busybox_echo() {
         "fd79:6179:6174:6874::1",
         "--no-ipv4",
         "ipv6",
+    );
+}
+
+#[test]
+fn retransmit_recovers_two_dropped_namespace_segments() {
+    let payload = (0..32 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "retransmit",
+        payload,
+        &[("YAYATHT_TEST_DROP_TCP_DATA", "2")],
     );
 }
 

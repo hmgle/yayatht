@@ -30,6 +30,10 @@
 - TAP output frames now come from a fixed startup pool. Socket payload is peeked
   directly into the final frame, and each readiness event can schedule a bounded
   batch of MSS-sized segments without steady-state frame or payload allocation.
+- Rootless fault injection can discard new namespace-bound TCP data after
+  sequence commitment. The integration suite drops two consecutive segments
+  and verifies timeout retransmission plus cumulative ACK recovery without a
+  copied retransmit payload.
 - Credential files are opened before namespace creation with `O_NOFOLLOW`,
   owner and mode checks. Supervisor and ns-init copies are dropped before the
   target namespace is cloned.
@@ -43,7 +47,8 @@ DNS, or external routing.
 
 ## Remaining Phase 1 Work
 
-- Broader loss and retransmission injection.
+- Add repeated retransmission loss, FIN loss and live zero-window integration
+  cases beyond the current consecutive data-segment loss coverage.
 - Extend the reproducible direct benchmark to multiple flows, latency and a
   non-local destination; the initial single-flow results are recorded in
   `docs/phase1-calibration.md`.

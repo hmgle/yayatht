@@ -29,6 +29,7 @@ const ZERO_WINDOW_PROBE_INITIAL: Duration = Duration::from_secs(1);
 const ZERO_WINDOW_PROBE_MAX: Duration = Duration::from_secs(8);
 const PROXY_RESPONSE_CAPACITY: usize = 8 * 1024;
 const MAX_PENDING_SOCKET_BYTES: usize = 256 * 1024;
+const TEST_DROP_TCP_DATA_ENV: &str = "YAYATHT_TEST_DROP_TCP_DATA";
 
 #[derive(Clone, Debug)]
 pub enum Upstream {
@@ -258,6 +259,7 @@ pub struct Reactor {
     tap_queue: VecDeque<QueuedFrame>,
     metrics: Metrics,
     shutting_down: bool,
+    test_drop_tcp_data: usize,
 }
 
 impl Reactor {
@@ -292,6 +294,7 @@ impl Reactor {
             tap_queue: VecDeque::new(),
             metrics: Metrics::default(),
             shutting_down: false,
+            test_drop_tcp_data: test_drop_tcp_data_count(),
         })
     }
 
@@ -1599,6 +1602,14 @@ impl Reactor {
         frame: PooledFrame,
         plan: Option<SendPlan>,
     ) -> Result<(), Error> {
+        if self.tap_queue.is_empty()
+            && plan.is_some_and(|plan| plan.length > 0)
+            && self.test_drop_tcp_data > 0
+        {
+            self.test_drop_tcp_data -= 1;
+            self.commit_tap_send(flow, frame, plan)?;
+            return Ok(());
+        }
         if self.tap_queue.is_empty() {
             match yayatht_sys::reactor::write(self.tap.as_raw_fd(), frame.buffer.bytes()) {
                 Ok(written) if written == frame.buffer.bytes().len() => {
@@ -1730,6 +1741,21 @@ impl Reactor {
     fn cleanup_closed(&mut self) {
         let removed = self.flows.flush_deferred();
         self.metrics.tcp_closed += removed.len() as u64;
+    }
+}
+
+fn test_drop_tcp_data_count() -> usize {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var(TEST_DROP_TCP_DATA_ENV)
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(0)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = TEST_DROP_TCP_DATA_ENV;
+        0
     }
 }
 
