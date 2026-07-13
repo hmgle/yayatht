@@ -1,0 +1,20 @@
+[package]
+name = "yayatht-dataplane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+arrayvec.workspace = true
+getrandom.workspace = true
+libc.workspace = true
+rustix.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+yayatht-packet = { path = "../packet" }
+yayatht-sys = { path = "../sys" }
+yayatht-tcp-adapter = { path = "../tcp-adapter" }
+
+[lints]
+workspace = true

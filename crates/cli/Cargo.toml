@@ -1,0 +1,24 @@
+[package]
+name = "yayatht"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+yayatht-sys = { path = "../sys" }
+yayatht-namespace = { path = "../namespace" }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+wait-timeout = "0.2.1"
+
+[[bin]]
+name = "yayatht"
+path = "src/main.rs"
