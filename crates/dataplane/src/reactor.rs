@@ -1948,6 +1948,7 @@ impl Reactor {
                 flags,
                 window,
                 mss,
+                window_scale: None,
             },
         )?;
         match (key.target.ip(), key.namespace.ip()) {
