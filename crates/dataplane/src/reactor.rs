@@ -33,6 +33,12 @@ const MAX_PENDING_SOCKET_BYTES: usize = 256 * 1024;
 const FALLBACK_SEND_WINDOW: usize = 16 * 1024;
 const FALLBACK_ACK_WINDOW: usize = 8 * 1024;
 const TEST_DROP_TCP_DATA_ENV: &str = "YAYATHT_TEST_DROP_TCP_DATA";
+const TEST_DROP_TCP_RETRANSMIT_ENV: &str = "YAYATHT_TEST_DROP_TCP_RETRANSMIT";
+const TEST_DROP_TCP_SYN_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_SYN_ACK";
+const TEST_DROP_TCP_FIN_ENV: &str = "YAYATHT_TEST_DROP_TCP_FIN";
+const TEST_DROP_TCP_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_ACK";
+const TEST_DROP_TCP_FIN_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_FIN_ACK";
+const TEST_LOCAL_ISN_ENV: &str = "YAYATHT_TEST_LOCAL_ISN";
 const TEST_DISABLE_PEEK_OFF_ENV: &str = "YAYATHT_TEST_DISABLE_SO_PEEK_OFF";
 const TEST_DISABLE_BYTES_ACKED_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_BYTES_ACKED";
 const TEST_DISABLE_SEND_WINDOW_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND";
@@ -266,6 +272,16 @@ impl SentSegment {
             ..TcpFlags::default()
         }
     }
+
+    fn record_timeout_retransmit(&mut self, now: Instant) {
+        self.last_sent = now;
+        self.retries = self.retries.saturating_add(1);
+        self.retransmit_timeout = (self.retransmit_timeout * 2).min(Duration::from_secs(8));
+    }
+
+    fn retries_exhausted(&self) -> bool {
+        self.retries >= MAX_RETRIES
+    }
 }
 
 struct QueuedFrame {
@@ -309,6 +325,12 @@ pub struct Reactor {
     metrics: Metrics,
     shutting_down: bool,
     test_drop_tcp_data: usize,
+    test_drop_tcp_retransmit: usize,
+    test_drop_tcp_syn_ack: usize,
+    test_drop_tcp_fin: usize,
+    test_drop_tcp_ack: usize,
+    test_drop_tcp_fin_ack: usize,
+    test_local_isn: Option<u32>,
     pending_socket_bytes: usize,
     retained_socket_bytes: usize,
     pending_pressure: bool,
@@ -364,6 +386,12 @@ impl Reactor {
             metrics,
             shutting_down: false,
             test_drop_tcp_data: test_drop_tcp_data_count(),
+            test_drop_tcp_retransmit: test_count(TEST_DROP_TCP_RETRANSMIT_ENV),
+            test_drop_tcp_syn_ack: test_count(TEST_DROP_TCP_SYN_ACK_ENV),
+            test_drop_tcp_fin: test_count(TEST_DROP_TCP_FIN_ENV),
+            test_drop_tcp_ack: test_count(TEST_DROP_TCP_ACK_ENV),
+            test_drop_tcp_fin_ack: test_count(TEST_DROP_TCP_FIN_ACK_ENV),
+            test_local_isn: test_value(TEST_LOCAL_ISN_ENV),
             pending_socket_bytes: 0,
             retained_socket_bytes: 0,
             pending_pressure: false,
@@ -620,7 +648,8 @@ impl Reactor {
         let entry = FlowEntry {
             flow: Flow::new(
                 segment.sequence(),
-                u32::from_ne_bytes(random),
+                self.test_local_isn
+                    .unwrap_or_else(|| u32::from_ne_bytes(random)),
                 negotiated_mss,
             ),
             construction,
@@ -769,7 +798,7 @@ impl Reactor {
                     } else {
                         entry.pending_shutdown = true;
                     }
-                    self.send_ack(id)?;
+                    self.send_fin_ack(id)?;
                 }
             }
             ReceiveDisposition::Duplicate
@@ -1433,6 +1462,14 @@ impl Reactor {
     }
 
     fn send_ack(&mut self, id: FlowId) -> Result<(), Error> {
+        self.send_ack_kind(id, false)
+    }
+
+    fn send_fin_ack(&mut self, id: FlowId) -> Result<(), Error> {
+        self.send_ack_kind(id, true)
+    }
+
+    fn send_ack_kind(&mut self, id: FlowId, fin_ack: bool) -> Result<(), Error> {
         let plan = {
             let flow = &self.flows.get(id).expect("flow exists").flow;
             SendPlan {
@@ -1452,7 +1489,12 @@ impl Reactor {
                 ..TcpFlags::default()
             },
         )?;
-        self.queue_tap(None, frame, None)
+        if fin_ack && self.test_drop_tcp_fin_ack > 0 {
+            self.test_drop_tcp_fin_ack -= 1;
+            self.release_frame(frame);
+            return Ok(());
+        }
+        self.queue_tap(None, frame, Some(plan))
     }
 
     fn handle_timers(&mut self) -> Result<(), Error> {
@@ -1476,7 +1518,7 @@ impl Reactor {
                     .expect("flow exists")
                     .sent_segments
                     .front()
-                    .is_some_and(|segment| segment.retries >= MAX_RETRIES)
+                    .is_some_and(SentSegment::retries_exhausted)
                 {
                     self.send_reset_for_flow(id)?;
                     self.close_flow(id)?;
@@ -1564,7 +1606,12 @@ impl Reactor {
                 ..TcpFlags::default()
             },
         )?;
-        self.queue_tap(Some(id), frame, None)?;
+        if self.test_drop_tcp_retransmit > 0 {
+            self.test_drop_tcp_retransmit -= 1;
+            self.release_frame(frame);
+        } else {
+            self.queue_tap(Some(id), frame, None)?;
+        }
         if let Some(probe) = self
             .flows
             .get_mut(id)
@@ -1627,11 +1674,10 @@ impl Reactor {
             .sent_segments
             .front_mut()
             .ok_or(Error::Invariant("retransmitted segment disappeared"))?;
-        segment.last_sent = Instant::now();
         if backoff {
-            segment.retries += 1;
-            segment.retransmit_timeout =
-                (segment.retransmit_timeout * 2).min(Duration::from_secs(8));
+            segment.record_timeout_retransmit(Instant::now());
+        } else {
+            segment.last_sent = Instant::now();
         }
         self.metrics.tcp_retransmits += 1;
         Ok(())
@@ -1965,11 +2011,28 @@ impl Reactor {
                 "retained TCP reservation exceeded hard limit",
             ));
         }
-        if self.tap_queue.is_empty()
-            && plan.is_some_and(|plan| plan.length > 0)
-            && self.test_drop_tcp_data > 0
-        {
-            self.test_drop_tcp_data -= 1;
+        let injected_drop = if self.tap_queue.is_empty() {
+            plan.is_some_and(|plan| {
+                if plan.syn && self.test_drop_tcp_syn_ack > 0 {
+                    self.test_drop_tcp_syn_ack -= 1;
+                    true
+                } else if plan.fin && self.test_drop_tcp_fin > 0 {
+                    self.test_drop_tcp_fin -= 1;
+                    true
+                } else if plan.length > 0 && self.test_drop_tcp_data > 0 {
+                    self.test_drop_tcp_data -= 1;
+                    true
+                } else if !plan.syn && !plan.fin && plan.length == 0 && self.test_drop_tcp_ack > 0 {
+                    self.test_drop_tcp_ack -= 1;
+                    true
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        };
+        if injected_drop {
             self.commit_tap_send(flow, frame, plan)?;
             return Ok(());
         }
@@ -2173,17 +2236,24 @@ impl Reactor {
 }
 
 fn test_drop_tcp_data_count() -> usize {
+    test_count(TEST_DROP_TCP_DATA_ENV)
+}
+
+fn test_count(name: &str) -> usize {
+    test_value(name).unwrap_or(0)
+}
+
+fn test_value<T: std::str::FromStr>(name: &str) -> Option<T> {
     #[cfg(debug_assertions)]
     {
-        std::env::var(TEST_DROP_TCP_DATA_ENV)
+        std::env::var(name)
             .ok()
             .and_then(|value| value.parse().ok())
-            .unwrap_or(0)
     }
     #[cfg(not(debug_assertions))]
     {
-        let _ = TEST_DROP_TCP_DATA_ENV;
-        0
+        let _ = name;
+        None
     }
 }
 
@@ -2283,5 +2353,17 @@ mod tests {
         assert!(pending_pressure_state(false, 896, limit));
         assert!(pending_pressure_state(true, 769, limit));
         assert!(!pending_pressure_state(true, 768, limit));
+    }
+
+    #[test]
+    fn retransmission_backoff_stops_at_the_retry_limit() {
+        let started = Instant::now();
+        let mut segment = segment(100, 10, false, false);
+        for retry in 1..=MAX_RETRIES {
+            segment.record_timeout_retransmit(started);
+            assert_eq!(segment.retries, retry);
+        }
+        assert!(segment.retries_exhausted());
+        assert_eq!(segment.retransmit_timeout, Duration::from_secs(8));
     }
 }

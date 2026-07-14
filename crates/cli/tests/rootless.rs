@@ -84,7 +84,7 @@ fn echo_payload_case(
         "busybox",
         "nc",
         "-w",
-        "3",
+        "8",
         gateway,
         &port.to_string(),
     ]);
@@ -234,6 +234,17 @@ fn proxy_echo(mut stream: std::net::TcpStream, expected: &[u8]) {
     stream.write_all(&received).unwrap();
 }
 
+fn accept_socks5_no_auth(listener: TcpListener, expected_port: u16) -> std::net::TcpStream {
+    let mut stream = proxy_stream(listener);
+    let mut greeting = [0u8; 3];
+    stream.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 1, 0]);
+    stream.write_all(&[5, 0]).unwrap();
+    assert_eq!(read_socks_target(&mut stream).port(), expected_port);
+    stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+    stream
+}
+
 fn credential_files(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
     let root = std::path::Path::new(&std::env::var_os("XDG_RUNTIME_DIR").unwrap()).join(format!(
         "yayatht-credentials-{label}-{}",
@@ -316,6 +327,114 @@ fn retransmit_recovers_two_dropped_namespace_segments() {
         payload,
         &[("YAYATHT_TEST_DROP_TCP_DATA", "2")],
     );
+}
+
+#[test]
+fn retransmit_recovers_when_the_first_retransmission_is_lost() {
+    let payload = (0..32 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "retransmit-retry",
+        payload,
+        &[
+            ("YAYATHT_TEST_DROP_TCP_DATA", "1"),
+            ("YAYATHT_TEST_DROP_TCP_RETRANSMIT", "1"),
+        ],
+    );
+}
+
+#[test]
+fn lost_syn_ack_is_retransmitted() {
+    echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "syn-ack-loss",
+        b"syn-ack-recovered\n".to_vec(),
+        &[("YAYATHT_TEST_DROP_TCP_SYN_ACK", "1")],
+    );
+}
+
+#[test]
+fn lost_fin_is_retransmitted() {
+    echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "fin-loss",
+        b"fin-recovered\n".to_vec(),
+        &[("YAYATHT_TEST_DROP_TCP_FIN", "1")],
+    );
+}
+
+#[test]
+fn local_sequence_wrap_survives_a_long_transfer() {
+    let payload = (0..32 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "sequence-wrap",
+        payload,
+        &[("YAYATHT_TEST_LOCAL_ISN", "4294963200")],
+    );
+}
+
+fn half_close_case(label: &str, environment: &[(&str, &str)]) {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = Vec::new();
+        stream.read_to_end(&mut request).unwrap();
+        assert_eq!(request, b"namespace-half\n");
+        stream.write_all(b"host-half\n").unwrap();
+    });
+    let name = unique_name(label);
+    let script = format!("printf 'namespace-half\\n' | busybox nc -w 8 192.0.2.1 {port}");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
+    command.args([
+        "run",
+        "--direct",
+        "--host-loopback",
+        "--no-ipv6",
+        "--name",
+        &name,
+        "--",
+        "sh",
+        "-c",
+        &script,
+    ]);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "half-close failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"host-half\n");
+    server.join().unwrap();
+}
+
+#[test]
+fn bidirectional_half_close_completes() {
+    half_close_case("half-close", &[]);
+}
+
+#[test]
+fn lost_fin_ack_is_recovered_by_duplicate_fin() {
+    half_close_case("fin-ack-loss", &[("YAYATHT_TEST_DROP_TCP_FIN_ACK", "1")]);
 }
 
 #[test]
@@ -703,6 +822,100 @@ fn socks5_failure_only_closes_one_flow() {
         .unwrap();
     assert!(status.success(), "yayatht failed: {stderr}");
     assert_eq!(output, payload);
+    server.join().unwrap();
+}
+
+#[test]
+fn proxy_exit_during_handshake_does_not_stall_the_instance() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut stream = proxy_stream(listener);
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+    });
+    let name = unique_name("proxy-handshake-exit");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--socks5",
+            &address.to_string(),
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--",
+            "busybox",
+            "nc",
+            "-w",
+            "3",
+            "198.51.100.77",
+            "443",
+        ])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let status = child
+        .wait_timeout(Duration::from_secs(5))
+        .unwrap()
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("proxy handshake exit test timed out")
+        });
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert_ne!(status.code(), Some(125), "data plane failed: {stderr}");
+    server.join().unwrap();
+}
+
+#[test]
+fn proxy_exit_after_partial_write_only_closes_that_flow() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let payload = b"after-partial-proxy-exit\n";
+    let server = thread::spawn(move || {
+        let mut partial = accept_socks5_no_auth(listener.try_clone().unwrap(), 80);
+        let mut received = [0u8; 1024];
+        partial.read_exact(&mut received).unwrap();
+        drop(partial);
+
+        let succeeded = accept_socks5_no_auth(listener, 443);
+        proxy_echo(succeeded, payload);
+    });
+    let name = unique_name("proxy-partial-exit");
+    let script = "busybox dd if=/dev/zero bs=4096 count=16 2>/dev/null | busybox nc -w 3 198.51.100.77 80 >/dev/null 2>&1 || true; printf 'after-partial-proxy-exit\\n' | busybox nc -w 3 198.51.100.77 443";
+    let output = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--socks5",
+            &address.to_string(),
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            script,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "partial proxy exit failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, payload);
     server.join().unwrap();
 }
 
