@@ -37,6 +37,19 @@
 - A live zero-window integration case pauses the namespace reader while the
   host sends 16 MiB, verifies that a persist probe is emitted, then confirms the
   full byte count after the reader resumes.
+- `FlowSide` is now the endpoint source of truth, with separate local, logical,
+  and transport endpoints for both initiating and target sides.
+- TCP_INFO fields are length-gated and SO_PEEK_OFF is probed at runtime.
+  Missing capabilities use tested iovec, conservative-ACK, and fixed-window
+  fallbacks, with degraded state exported through status metrics.
+- Global pending and socket-retained byte limits, per-flow socket quotas, and a
+  max-flow-derived data-plane RLIMIT_NOFILE provide hard instance boundaries.
+  High pending watermarks publish zero windows across active flows.
+- The rootless fault matrix covers SYN-ACK, retransmission, FIN/FIN-ACK,
+  half-close, proxy termination, partial writes, and sequence wrap.
+- The Phase 1A benchmark covers direct, local SOCKS5/auth/HTTP, and real mihomo
+  paths at 1/8/32/128 flows with throughput, CPU, p50/p99, connect latency, and
+  fairness.
 - Credential files are opened before namespace creation with `O_NOFOLLOW`,
   owner and mode checks. Supervisor and ns-init copies are dropped before the
   target namespace is cloned.
@@ -50,11 +63,12 @@ DNS, or external routing.
 
 ## Remaining Phase 1 Work
 
-- Add repeated retransmission loss and FIN loss beyond the current consecutive
-  data-segment loss coverage.
-- Extend the reproducible direct benchmark to multiple flows, latency and a
-  non-local destination; the initial single-flow results are recorded in
-  `docs/phase1-calibration.md`.
-- DNS proxy-tcp and resolver mount isolation.
-- Generated seccomp profiles, pivoted data-plane filesystem, and rlimits.
-- Structured metrics export, failure matrix expansion, and 24-hour soak tests.
+- Resolve the roughly 100 ms short-flow completion penalty found by the Phase
+  1A local explicit-proxy calibration and repeat the full matrix.
+- Validate the degraded capability paths on an actual Linux 5.11 kernel.
+- Review the 2 GiB default worst-case socket-buffer budget.
+- DNS proxy-tcp and resolver mount isolation remain blocked by the Phase 1A
+  no-go decision in `docs/phase1a-exit-audit.md`.
+- Generated seccomp profiles, pivoted data-plane filesystem, and remaining
+  role-specific rlimits.
+- Final seccomp/rlimit locking and 24-hour soak tests.

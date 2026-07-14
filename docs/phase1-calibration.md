@@ -48,3 +48,38 @@ splice, multiple flows, remote routes, UDP, or vhost-user. The next performance
 gate should add 1/8/32/128 flows, latency sampling, default-MTU pasta, and a
 non-local destination while continuing to report exact versions and host
 routing state.
+
+## Phase 1A explicit-proxy harness
+
+`scripts/bench_tcp_phase1a.py` now supplies the broader gate. It uses the
+`tcp-bench-io` multi-flow client/server and a numeric-target `tcp-bench-proxy`
+for local SOCKS5 no-auth, RFC 1929 username/password, and HTTP CONNECT runs.
+The same runner can compare:
+
+- yayatht direct with official pasta;
+- yayatht proxy mode with proxy-dev pasta and nsproxy;
+- yayatht SOCKS5/HTTP with the real mihomo endpoint at `127.0.0.1:7890`;
+- proxy-ns when its external installation/capability requirements are met.
+
+Each CSV row includes aggregate throughput, child and proxy CPU, connect and
+completion p50/p99, Jain fairness, per-flow throughput range, numeric target,
+revisions, kernel, and mihomo TUN state. The current results and no-go decision
+are recorded in `docs/phase1a-exit-audit.md`.
+
+Example full calibration command:
+
+```sh
+uv run scripts/bench_tcp_phase1a.py \
+  --pasta /tmp/passt-upstream-review/pasta.avx2 \
+  --proxy-dev ../passt-github/pasta \
+  --nsproxy ../nsproxy/build3/nsproxy \
+  --proxy-ns ../proxy-ns/proxy-ns \
+  --target 172.16.10.5 \
+  --flows 1,8,32,128 \
+  --mib-per-flow 4 --runs 3 --warmups 1 --cpu 0
+```
+
+proxy-dev results must retain the explicit limitation label: its proxy
+handshake is blocking, its TCP core is old, and authenticated credentials are
+passed in argv. It is a historical implementation-cost comparison, not a
+protocol oracle.
