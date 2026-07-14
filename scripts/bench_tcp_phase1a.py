@@ -161,16 +161,33 @@ def jain_fairness(values: list[float]) -> float:
 
 
 @contextmanager
-def credentials() -> Iterator[tuple[Path, Path]]:
+def credentials() -> Iterator[tuple[Path, Path, Path]]:
     with tempfile.TemporaryDirectory(prefix="yayatht-phase1a-") as directory:
         root = Path(directory)
         username = root / "username"
         password = root / "password"
+        proxy_ns_config = root / "proxy-ns.json"
         username.write_text(PROXY_USER)
         password.write_text(PROXY_PASSWORD)
         username.chmod(0o600)
         password.chmod(0o600)
-        yield username, password
+        proxy_ns_config.write_text(
+            json.dumps(
+                {
+                    "tun_name": "yaybench0",
+                    "tun_ip": "10.79.0.1/24",
+                    "socks5_address": "127.0.0.1:7890",
+                    "username": "",
+                    "password": "",
+                    "fake_dns": False,
+                    "fake_network": "240.0.0.0/4",
+                    "dns_server": "9.9.9.9",
+                    "udp_session_timeout": "1m0s",
+                }
+            )
+        )
+        proxy_ns_config.chmod(0o600)
+        yield username, password, proxy_ns_config
 
 
 @contextmanager
@@ -236,6 +253,7 @@ def backend_command(
     pasta_target: str,
     username_file: Path,
     password_file: Path,
+    proxy_ns_config: Path,
 ) -> list[str] | None:
     if backend.kind == "yayatht-direct":
         transfer[2] = "192.0.2.1"
@@ -287,7 +305,8 @@ def backend_command(
         proxy_type = "http" if protocol == "http" else "socks5"
         command = [
             str(backend.executable),
-            "-q",
+            "-c",
+            str(proxy_ns_config),
             "-f",
             "-4",
             "-m",
@@ -346,6 +365,7 @@ def run_case(
     args: argparse.Namespace,
     username_file: Path,
     password_file: Path,
+    proxy_ns_config: Path,
 ) -> dict[str, object]:
     port = unused_port("0.0.0.0")
     server = subprocess.Popen(
@@ -378,6 +398,7 @@ def run_case(
         args.pasta_target,
         username_file,
         password_file,
+        proxy_ns_config,
     )
     if command is None:
         server.terminate()
@@ -404,8 +425,10 @@ def run_case(
     if client.returncode != 0:
         server.terminate()
         server.wait(timeout=5)
+        stdout = client.stdout.decode(errors="replace")
+        stderr = client.stderr.decode(errors="replace")
         raise RuntimeError(
-            f"client exited {client.returncode}:\n{client.stderr.decode(errors='replace')}"
+            f"client exited {client.returncode}:\nstdout:\n{stdout}\nstderr:\n{stderr}"
         )
     try:
         server.wait(timeout=30)
@@ -617,7 +640,7 @@ def main() -> int:
 
     records: list[dict[str, object]] = []
     byte_count = args.mib_per_flow * 1024 * 1024
-    with credentials() as (username_file, password_file):
+    with credentials() as (username_file, password_file, proxy_ns_config):
         for scenario in args.scenarios:
             protocols = ["direct"] if scenario == "direct" else args.protocols
             backends = direct_backends if scenario == "direct" else proxy_backends
@@ -655,6 +678,7 @@ def main() -> int:
                                         args,
                                         username_file,
                                         password_file,
+                                        proxy_ns_config,
                                     )
                                 except Exception as error:
                                     if args.fail_fast:
@@ -684,6 +708,7 @@ def main() -> int:
                                         args,
                                         username_file,
                                         password_file,
+                                        proxy_ns_config,
                                     )
                                 except Exception as error:
                                     if args.fail_fast:
