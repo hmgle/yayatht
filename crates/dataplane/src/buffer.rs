@@ -1,20 +1,22 @@
-pub const FRAME_CAPACITY: usize = 2048;
-
 pub struct FrameBuffer {
-    bytes: Box<[u8; FRAME_CAPACITY]>,
+    bytes: Box<[u8]>,
     len: usize,
 }
 
-impl Default for FrameBuffer {
-    fn default() -> Self {
+impl FrameBuffer {
+    #[must_use]
+    pub fn new(capacity: usize) -> Self {
         Self {
-            bytes: Box::new([0; FRAME_CAPACITY]),
+            bytes: vec![0; capacity].into_boxed_slice(),
             len: 0,
         }
     }
-}
 
-impl FrameBuffer {
+    #[must_use]
+    pub fn capacity(&self) -> usize {
+        self.bytes.len()
+    }
+
     #[must_use]
     pub fn writable(&mut self) -> &mut [u8] {
         self.len = 0;
@@ -22,7 +24,7 @@ impl FrameBuffer {
     }
 
     pub fn set_len(&mut self, len: usize) {
-        assert!(len <= FRAME_CAPACITY);
+        assert!(len <= self.capacity());
         self.len = len;
     }
 
@@ -39,9 +41,11 @@ pub struct BufferPool {
 
 impl BufferPool {
     #[must_use]
-    pub fn new(count: usize) -> Self {
+    pub fn new(count: usize, frame_capacity: usize) -> Self {
         Self {
-            buffers: (0..count).map(|_| Some(FrameBuffer::default())).collect(),
+            buffers: (0..count)
+                .map(|_| Some(FrameBuffer::new(frame_capacity)))
+                .collect(),
             free: (0..count).rev().collect(),
         }
     }
@@ -69,8 +73,9 @@ mod tests {
 
     #[test]
     fn released_frame_returns_to_fixed_pool() {
-        let mut pool = BufferPool::new(1);
+        let mut pool = BufferPool::new(1, 2048);
         let (index, mut frame) = pool.acquire().unwrap();
+        assert_eq!(frame.capacity(), 2048);
         frame.writable()[..3].copy_from_slice(b"tap");
         frame.set_len(3);
         assert_eq!(pool.available(), 0);

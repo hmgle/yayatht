@@ -251,6 +251,7 @@ def backend_command(
     proxy: str,
     transfer: list[str],
     pasta_target: str,
+    tap_mtu: int,
     username_file: Path,
     password_file: Path,
     proxy_ns_config: Path,
@@ -263,6 +264,8 @@ def backend_command(
             "--direct",
             "--host-loopback",
             "--no-ipv6",
+            "--tap-mtu",
+            str(tap_mtu),
             "--",
             *transfer,
         ]
@@ -274,7 +277,7 @@ def backend_command(
             "-f",
             "-4",
             "-m",
-            "1500",
+            str(tap_mtu),
             "--config-net",
             "--no-splice",
             "-t",
@@ -290,7 +293,15 @@ def backend_command(
         ]
     if backend.kind == "yayatht":
         option = "--http-connect" if protocol == "http" else "--socks5"
-        command = [str(backend.executable), "run", option, proxy, "--no-ipv6"]
+        command = [
+            str(backend.executable),
+            "run",
+            option,
+            proxy,
+            "--no-ipv6",
+            "--tap-mtu",
+            str(tap_mtu),
+        ]
         if protocol == "socks5-auth":
             command.extend(
                 [
@@ -310,7 +321,7 @@ def backend_command(
             "-f",
             "-4",
             "-m",
-            "1500",
+            str(tap_mtu),
             "--config-net",
             "-t",
             "none",
@@ -396,6 +407,7 @@ def run_case(
         proxy.address,
         transfer,
         args.pasta_target,
+        args.tap_mtu,
         username_file,
         password_file,
         proxy_ns_config,
@@ -491,6 +503,7 @@ def run_case(
         "flow_throughput_max_mib_s": max(throughputs) / 8 / (1024**2),
         "target": transfer[2],
         "cpu": args.cpu,
+        "requested_tap_mtu": args.tap_mtu,
         "kernel": run_text(["uname", "-srmo"]),
         "mihomo_version": run_text([str(args.mihomo), "-v"]).replace("\n", "; "),
         "mihomo_tun_state": mihomo_tun_state(),
@@ -525,6 +538,7 @@ def error_record(
         "total_bytes": flow_count * byte_count,
         "target": args.target,
         "cpu": args.cpu,
+        "requested_tap_mtu": args.tap_mtu,
         "kernel": run_text(["uname", "-srmo"]),
         "mihomo_version": run_text([str(args.mihomo), "-v"]).replace("\n", "; "),
         "mihomo_tun_state": mihomo_tun_state(),
@@ -571,6 +585,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--protocols", default="socks5,socks5-auth,http")
     parser.add_argument("--flows", default="1,8,32,128")
     parser.add_argument("--mib-per-flow", type=int, default=4)
+    parser.add_argument("--tap-mtu", type=int, default=32000)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--cpu", type=int, default=0)
@@ -603,10 +618,11 @@ def main() -> int:
         args.mib_per_flow <= 0
         or args.runs <= 0
         or args.warmups < 0
+        or not 1280 <= args.tap_mtu <= 65520
         or not args.flows
         or any(flow <= 0 for flow in args.flows)
     ):
-        raise SystemExit("flow, size, and run counts must be positive")
+        raise SystemExit("flow, size, run counts, or TAP MTU are invalid")
     args.yayatht = validate_executable(args.yayatht, "yayatht", required=True)
     args.io_binary = validate_executable(args.io_binary, "tcp-bench-io", required=True)
     args.proxy_binary = validate_executable(

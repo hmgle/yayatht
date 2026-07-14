@@ -288,6 +288,7 @@ fn namespace_child_inner(
     yayatht_sys::netlink::configure_namespace(
         &config.network.interface_name,
         config.network.target_mac.octets(),
+        config.network.tap_mtu,
         config
             .network
             .target_ipv4

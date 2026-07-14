@@ -1022,6 +1022,9 @@ fn status_socket_reports_running_instance() {
         64 * 1024 * 1024
     );
     assert_eq!(value["dataplane"]["flow_fd_limit"], 4096 + 32);
+    assert_eq!(value["dataplane"]["tap_mtu"], 32_000);
+    assert_eq!(value["dataplane"]["tap_frame_capacity"], 32_014);
+    assert_eq!(value["dataplane"]["tap_frame_pool_frames"], 524);
     let dataplane_pid = value["dataplane_pid"].as_i64().unwrap();
     let limits = fs::read_to_string(format!("/proc/{dataplane_pid}/limits")).unwrap();
     let open_files = limits

@@ -20,6 +20,7 @@ pub enum UpstreamConfig {
 #[derive(Clone, Debug)]
 pub struct NetworkConfig {
     pub interface_name: String,
+    pub tap_mtu: u32,
     pub target_mac: MacAddress,
     pub gateway_mac: MacAddress,
     pub target_ipv4: Option<(Ipv4Addr, u8)>,
@@ -30,9 +31,10 @@ pub struct NetworkConfig {
 
 impl NetworkConfig {
     #[must_use]
-    pub fn synthetic(ipv4: bool, ipv6: bool) -> Self {
+    pub fn synthetic(ipv4: bool, ipv6: bool, tap_mtu: u32) -> Self {
         Self {
             interface_name: "eth0".to_owned(),
+            tap_mtu,
             target_mac: MacAddress([0x02, 0x79, 0x61, 0x79, 0x61, 0x02]),
             gateway_mac: MacAddress([0x02, 0x79, 0x61, 0x79, 0x61, 0x01]),
             target_ipv4: ipv4.then_some((Ipv4Addr::new(192, 0, 2, 2), 24)),
@@ -68,6 +70,7 @@ impl NetworkConfig {
             gateway_ipv4: self.gateway_ipv4,
             target_ipv6: self.target_ipv6.map(|(address, _)| address),
             gateway_ipv6: self.gateway_ipv6,
+            tap_mtu: self.tap_mtu,
             upstream: match upstream {
                 UpstreamConfig::Direct { host_loopback } => {
                     yayatht_dataplane::reactor::Upstream::Direct {
@@ -119,6 +122,8 @@ pub enum ConfigError {
     InvalidGlobalByteLimit,
     #[error("per-flow TCP socket buffers must be between 16384 and 16 MiB")]
     InvalidSocketBufferLimit,
+    #[error("tap_mtu must be between 1280 and 65520")]
+    InvalidTapMtu,
     #[error("instance name must match [A-Za-z0-9_.-]+")]
     InvalidName,
 }
@@ -130,6 +135,11 @@ impl LaunchConfig {
         }
         if self.network.target_ipv4.is_none() && self.network.target_ipv6.is_none() {
             return Err(ConfigError::NoIpFamily);
+        }
+        if !(yayatht_sys::tun::MIN_TAP_MTU..=yayatht_sys::tun::MAX_TAP_MTU)
+            .contains(&self.network.tap_mtu)
+        {
+            return Err(ConfigError::InvalidTapMtu);
         }
         if !(1..=1_048_576).contains(&self.max_tcp_flows) {
             return Err(ConfigError::InvalidFlowLimit);

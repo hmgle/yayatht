@@ -4,6 +4,10 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 const TUNSETIFF: libc::Ioctl = 0x4004_54ca as libc::Ioctl;
 
+pub const DEFAULT_TAP_MTU: u32 = 32_000;
+pub const MIN_TAP_MTU: u32 = 1_280;
+pub const MAX_TAP_MTU: u32 = 65_520;
+
 #[repr(C)]
 struct IfReq {
     name: [libc::c_char; libc::IFNAMSIZ],

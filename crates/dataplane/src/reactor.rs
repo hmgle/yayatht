@@ -1,4 +1,4 @@
-use crate::buffer::{BufferPool, FRAME_CAPACITY, FrameBuffer};
+use crate::buffer::{BufferPool, FrameBuffer};
 use crate::flow_table::{EpollToken, FlowId, FlowTable, Resource};
 use getrandom::fill as random_fill;
 use serde::Serialize;
@@ -22,7 +22,8 @@ use yayatht_tcp_adapter::sequence;
 
 const TAP_BUDGET: usize = 32;
 const TAP_TX_BUDGET: usize = 32;
-const TAP_FRAME_POOL_SIZE: usize = 4096;
+const TAP_FRAME_POOL_BYTES: usize = 16 * 1024 * 1024;
+const TAP_FRAME_POOL_MAX_FRAMES: usize = 4096;
 const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 /// Window-scale shift offered on the SYN-ACK when the namespace SYN offers
@@ -68,6 +69,7 @@ pub struct Config {
     pub gateway_ipv4: Option<Ipv4Addr>,
     pub target_ipv6: Option<Ipv6Addr>,
     pub gateway_ipv6: Option<Ipv6Addr>,
+    pub tap_mtu: u32,
     pub upstream: Upstream,
     pub max_tcp_flows: usize,
     pub max_pending_tcp_bytes: usize,
@@ -107,6 +109,10 @@ pub struct Metrics {
     pub retained_limit_hits: u64,
     pub pending_high_water_events: u64,
     pub frame_pool_exhaustions: u64,
+    pub tap_mtu: u64,
+    pub tap_frame_capacity: u64,
+    pub tap_frame_pool_frames: u64,
+    pub tap_frame_pool_bytes: u64,
     pub zero_window_events: u64,
     pub zero_window_flows: u64,
     pub peak_zero_window_flows: u64,
@@ -327,6 +333,7 @@ pub struct Reactor {
     flows: FlowTable<FlowEntry>,
     by_key: HashMap<FlowKey, FlowId>,
     frame_pool: BufferPool,
+    tap_rx_buffer: Vec<u8>,
     tap_queue: VecDeque<QueuedFrame>,
     metrics: Metrics,
     shutting_down: bool,
@@ -366,10 +373,20 @@ impl Reactor {
             EpollToken::global(Resource::Control).raw(),
         )?;
         let max_tcp_flows = config.max_tcp_flows;
+        let frame_capacity = usize::try_from(config.tap_mtu)
+            .map_err(|_| Error::Invariant("TAP MTU exceeds usize"))?
+            .checked_add(ethernet::ETHERNET_HEADER_LEN)
+            .ok_or(Error::Invariant("TAP frame capacity overflow"))?;
+        let frame_pool_frames =
+            (TAP_FRAME_POOL_BYTES / frame_capacity).clamp(1, TAP_FRAME_POOL_MAX_FRAMES);
         let metrics = Metrics {
             max_pending_tcp_bytes: config.max_pending_tcp_bytes as u64,
             max_retained_tcp_bytes: config.max_retained_tcp_bytes as u64,
             flow_fd_limit: yayatht_sys::resource::dataplane_nofile_limit(max_tcp_flows)?,
+            tap_mtu: u64::from(config.tap_mtu),
+            tap_frame_capacity: frame_capacity as u64,
+            tap_frame_pool_frames: frame_pool_frames as u64,
+            tap_frame_pool_bytes: frame_pool_frames.saturating_mul(frame_capacity) as u64,
             max_socket_buffer_bytes: u64::try_from(max_tcp_flows)
                 .unwrap_or(u64::MAX)
                 .saturating_mul(
@@ -390,7 +407,8 @@ impl Reactor {
             timer,
             flows: FlowTable::with_capacity(max_tcp_flows),
             by_key: HashMap::with_capacity(max_tcp_flows),
-            frame_pool: BufferPool::new(TAP_FRAME_POOL_SIZE),
+            frame_pool: BufferPool::new(frame_pool_frames, frame_capacity),
+            tap_rx_buffer: vec![0; frame_capacity],
             tap_queue: VecDeque::new(),
             metrics,
             shutting_down: false,
@@ -476,27 +494,30 @@ impl Reactor {
     }
 
     fn handle_tap(&mut self) -> Result<(), Error> {
-        for _ in 0..TAP_BUDGET {
-            if self.frame_pool.available() == 0 {
-                self.note_frame_pool_exhaustion();
-                self.update_tap_interest()?;
-                break;
+        let mut bytes = std::mem::take(&mut self.tap_rx_buffer);
+        let result = (|| {
+            for _ in 0..TAP_BUDGET {
+                if self.frame_pool.available() == 0 {
+                    self.note_frame_pool_exhaustion();
+                    self.update_tap_interest()?;
+                    break;
+                }
+                let length = match yayatht_sys::reactor::read(self.tap.as_raw_fd(), &mut bytes) {
+                    Ok(0) => return Err(Error::Invariant("TAP returned EOF")),
+                    Ok(length) => length,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => return Err(error.into()),
+                };
+                self.metrics.tap_rx_packets += 1;
+                if let Err(error) = self.handle_frame(&bytes[..length]) {
+                    debug!(%error, "dropping TAP frame");
+                    self.metrics.parse_drops += 1;
+                }
             }
-            let mut bytes = [0u8; 2048];
-            let length = match yayatht_sys::reactor::read(self.tap.as_raw_fd(), &mut bytes) {
-                Ok(0) => return Err(Error::Invariant("TAP returned EOF")),
-                Ok(length) => length,
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) => return Err(error.into()),
-            };
-            self.metrics.tap_rx_packets += 1;
-            if let Err(error) = self.handle_frame(&bytes[..length]) {
-                debug!(%error, "dropping TAP frame");
-                self.metrics.parse_drops += 1;
-            }
-        }
-        self.flush_ack_refresh()?;
-        Ok(())
+            self.flush_ack_refresh()
+        })();
+        self.tap_rx_buffer = bytes;
+        result
     }
 
     fn handle_frame(&mut self, bytes: &[u8]) -> Result<(), Error> {
@@ -635,7 +656,9 @@ impl Reactor {
         let mut random = [0u8; 4];
         random_fill(&mut random)
             .map_err(|error| io::Error::other(format!("getrandom failed: {error:?}")))?;
-        let default_mss = if key.target.is_ipv4() { 1460 } else { 1440 };
+        let ip_overhead: u32 = if key.target.is_ipv4() { 40 } else { 60 };
+        let default_mss = u16::try_from(self.config.tap_mtu.saturating_sub(ip_overhead))
+            .expect("validated TAP MTU produces a u16 MSS");
         let negotiated_mss = segment
             .mss()
             .filter(|mss| *mss >= 536)
@@ -1778,10 +1801,10 @@ impl Reactor {
             )
         };
         let payload_offset = Self::tcp_payload_offset(key, None, None);
-        let capacity = capacity.min(FRAME_CAPACITY - payload_offset);
         let offset = i32::try_from(offset)
             .map_err(|_| Error::Invariant("socket peek offset exceeds i32"))?;
         let mut frame = self.acquire_frame()?;
+        let capacity = capacity.min(frame.buffer.capacity().saturating_sub(payload_offset));
         let out = &mut frame.buffer.writable()[payload_offset..payload_offset + capacity];
         let result = if peek_offset_supported {
             yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
@@ -1923,7 +1946,7 @@ impl Reactor {
         let mut frame = self.acquire_frame()?;
         let payload_offset = Self::tcp_payload_offset(key, mss, window_scale);
         let frame_len = payload_offset + payload.len();
-        if frame_len > FRAME_CAPACITY {
+        if frame_len > frame.buffer.capacity() {
             self.release_frame(frame);
             return Err(Error::Invariant("TCP frame exceeds buffer capacity"));
         }

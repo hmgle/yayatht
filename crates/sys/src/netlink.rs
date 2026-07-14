@@ -15,6 +15,7 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_NEWADDR: u16 = 20;
 const RTM_NEWROUTE: u16 = 24;
 const IFLA_ADDRESS: u16 = 1;
+const IFLA_MTU: u16 = 4;
 const IFA_ADDRESS: u16 = 1;
 const IFA_LOCAL: u16 = 2;
 const RTA_OIF: u16 = 4;
@@ -249,7 +250,12 @@ pub fn interface_index(name: &str) -> io::Result<u32> {
     Ok(index)
 }
 
-fn set_link_up(socket: &mut RouteSocket, index: u32, mac: Option<[u8; 6]>) -> io::Result<()> {
+fn set_link_up(
+    socket: &mut RouteSocket,
+    index: u32,
+    mac: Option<[u8; 6]>,
+    mtu: Option<u32>,
+) -> io::Result<()> {
     let body = IfInfo {
         family: libc::AF_UNSPEC as u8,
         pad: 0,
@@ -259,11 +265,14 @@ fn set_link_up(socket: &mut RouteSocket, index: u32, mac: Option<[u8; 6]>) -> io
         change: libc::IFF_UP as u32,
     };
     let mac_bytes = mac.unwrap_or_default();
-    let attributes: Vec<(u16, &[u8])> = if mac.is_some() {
-        vec![(IFLA_ADDRESS, &mac_bytes)]
-    } else {
-        Vec::new()
-    };
+    let mtu_bytes = mtu.unwrap_or_default().to_ne_bytes();
+    let mut attributes: Vec<(u16, &[u8])> = Vec::new();
+    if mac.is_some() {
+        attributes.push((IFLA_ADDRESS, &mac_bytes));
+    }
+    if mtu.is_some() {
+        attributes.push((IFLA_MTU, &mtu_bytes));
+    }
     socket.request(RTM_NEWLINK, 0, &body, &attributes)
 }
 
@@ -321,14 +330,15 @@ fn add_default_route(
 pub fn configure_namespace(
     tap_name: &str,
     tap_mac: [u8; 6],
+    tap_mtu: u32,
     ipv4: Option<(Ipv4Addr, u8, Ipv4Addr)>,
     ipv6: Option<(Ipv6Addr, u8, Ipv6Addr)>,
 ) -> io::Result<()> {
     let mut socket = RouteSocket::open()?;
     let loopback = interface_index("lo")?;
-    set_link_up(&mut socket, loopback, None)?;
+    set_link_up(&mut socket, loopback, None, None)?;
     let tap = interface_index(tap_name)?;
-    set_link_up(&mut socket, tap, Some(tap_mac))?;
+    set_link_up(&mut socket, tap, Some(tap_mac), Some(tap_mtu))?;
     if let Some((address, prefix, gateway)) = ipv4 {
         add_address(
             &mut socket,

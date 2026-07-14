@@ -77,6 +77,12 @@ struct RunArgs {
     tcp_receive_buffer_bytes: usize,
     #[arg(long, default_value_t = 256 * 1024)]
     tcp_send_buffer_bytes: usize,
+    #[arg(
+        long,
+        default_value_t = yayatht_sys::tun::DEFAULT_TAP_MTU,
+        value_name = "BYTES"
+    )]
+    tap_mtu: u32,
     #[arg(long)]
     no_ipv4: bool,
     #[arg(long)]
@@ -165,7 +171,7 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         command: args.command,
         name: args.name,
         runtime_root: args.runtime_dir,
-        network: NetworkConfig::synthetic(!args.no_ipv4, !args.no_ipv6),
+        network: NetworkConfig::synthetic(!args.no_ipv4, !args.no_ipv6, args.tap_mtu),
         upstream,
         max_tcp_flows: args.max_tcp_flows,
         max_pending_tcp_bytes: args.max_pending_tcp_bytes,
