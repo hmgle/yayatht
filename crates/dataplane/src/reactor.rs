@@ -341,6 +341,9 @@ pub struct Reactor {
     retained_socket_bytes: usize,
     pending_pressure: bool,
     pending_pressure_dirty: bool,
+    /// Flows whose upstream ACK state needs one refresh after the current
+    /// TAP batch, instead of one refresh per received segment.
+    ack_refresh_queue: Vec<FlowId>,
 }
 
 impl Reactor {
@@ -402,6 +405,7 @@ impl Reactor {
             retained_socket_bytes: 0,
             pending_pressure: false,
             pending_pressure_dirty: false,
+            ack_refresh_queue: Vec::new(),
         })
     }
 
@@ -491,6 +495,7 @@ impl Reactor {
                 self.metrics.parse_drops += 1;
             }
         }
+        self.flush_ack_refresh()?;
         Ok(())
     }
 
@@ -820,13 +825,32 @@ impl Reactor {
             ReceiveDisposition::Invalid => self.close_flow(id)?,
             ReceiveDisposition::Reset => {}
         }
-        self.refresh_upstream_ack(id)?;
+        self.queue_ack_refresh(id);
         if self
             .flows
             .get(id)
             .is_some_and(|entry| entry.flow.state() == State::TimeWait)
         {
             self.close_flow(id)?;
+        }
+        Ok(())
+    }
+
+    /// Defers the upstream ACK refresh for `id` until the end of the current
+    /// TAP batch, so a burst of segments costs one TCP_INFO query and one ACK
+    /// instead of one per segment.
+    fn queue_ack_refresh(&mut self, id: FlowId) {
+        if !self.ack_refresh_queue.contains(&id) {
+            self.ack_refresh_queue.push(id);
+        }
+    }
+
+    fn flush_ack_refresh(&mut self) -> Result<(), Error> {
+        while let Some(id) = self.ack_refresh_queue.pop() {
+            if self.flow_is_closed(id) {
+                continue;
+            }
+            self.refresh_upstream_ack(id)?;
         }
         Ok(())
     }
