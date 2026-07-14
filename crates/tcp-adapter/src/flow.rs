@@ -172,7 +172,9 @@ pub struct Flow {
     local_next: u32,
     peer_window: u32,
     peer_window_shift: u8,
-    advertised_window: u32,
+    /// Absolute right edge of the receive window promised to the namespace.
+    /// RFC 7323 forbids moving this edge backwards once advertised.
+    receive_edge: u32,
     local_window_shift: u8,
     mss: u16,
     upstream_ack_baseline: u64,
@@ -202,7 +204,9 @@ impl Flow {
             local_next: local_initial,
             peer_window: u32::from(u16::MAX),
             peer_window_shift,
-            advertised_window: u32::from(u16::MAX),
+            receive_edge: namespace_initial
+                .wrapping_add(1)
+                .wrapping_add(u32::from(u16::MAX)),
             local_window_shift,
             mss,
             upstream_ack_baseline: 0,
@@ -244,9 +248,15 @@ impl Flow {
         self.peer_window
     }
 
+    /// Bytes the namespace may still send beyond `namespace_next` without
+    /// crossing the promised receive edge.
     #[must_use]
-    pub const fn advertised_window(&self) -> u32 {
-        self.advertised_window
+    pub fn advertised_window(&self) -> u32 {
+        if sequence::after(self.receive_edge, self.namespace_next) {
+            sequence::distance(self.namespace_next, self.receive_edge)
+        } else {
+            0
+        }
     }
 
     #[must_use]
@@ -260,24 +270,33 @@ impl Flow {
         (u16::MAX as u32) << self.local_window_shift
     }
 
-    /// On-wire window field. SYN segments carry an unscaled window.
+    /// On-wire window field, measured from the acknowledgment point as RFC
+    /// 793 requires. SYN segments carry an unscaled window.
     #[must_use]
     pub fn window_field(&self, syn: bool) -> u16 {
-        let scaled = if syn {
-            self.advertised_window
+        let from_ack = if sequence::after(self.receive_edge, self.namespace_acked) {
+            sequence::distance(self.namespace_acked, self.receive_edge)
         } else {
-            self.advertised_window >> self.local_window_shift
+            0
+        };
+        let scaled = if syn {
+            from_ack
+        } else {
+            from_ack >> self.local_window_shift
         };
         u16::try_from(scaled).unwrap_or(u16::MAX)
     }
 
-    pub fn set_advertised_window(&mut self, window: u32) -> bool {
-        let window = window.min(self.max_advertised_window());
-        if self.advertised_window == window {
+    /// Extends the promised receive edge so the namespace may send `budget`
+    /// bytes beyond `namespace_next`. The edge never moves backwards.
+    pub fn set_advertised_window(&mut self, budget: u32) -> bool {
+        let budget = budget.min(self.max_advertised_window());
+        let candidate = self.namespace_next.wrapping_add(budget);
+        if !sequence::after(candidate, self.receive_edge) {
             return false;
         }
         let previous_field = self.window_field(false);
-        self.advertised_window = window;
+        self.receive_edge = candidate;
         self.window_field(false) != previous_field
     }
 
@@ -333,7 +352,7 @@ impl Flow {
                 ReceiveDisposition::OutOfOrder
             };
         }
-        if payload_len > self.advertised_window as usize {
+        if payload_len > self.advertised_window() as usize {
             return ReceiveDisposition::OutsideWindow;
         }
         if payload_len == 0 && !fin {
@@ -346,7 +365,6 @@ impl Flow {
             return ReceiveDisposition::Invalid;
         };
         self.namespace_next = self.namespace_next.wrapping_add(length);
-        self.advertised_window = self.advertised_window.saturating_sub(length);
         if fin {
             self.namespace_next = self.namespace_next.wrapping_add(1);
             self.namespace_fin = true;
@@ -556,13 +574,12 @@ mod tests {
     fn receive_window_rejects_unreserved_payload() {
         let mut flow = flow();
         flow.socket_connected(0);
-        flow.set_advertised_window(4);
         assert_eq!(
-            flow.receive(u32::MAX - 3, Some(101), 65535, 5, false, false),
+            flow.receive(u32::MAX - 3, Some(101), 65535, 70_000, false, false),
             ReceiveDisposition::OutsideWindow
         );
         assert_eq!(flow.namespace_ack(), u32::MAX - 3);
-        assert_eq!(flow.advertised_window(), 4);
+        assert_eq!(flow.advertised_window(), u32::from(u16::MAX));
 
         assert_eq!(
             flow.receive(u32::MAX - 3, Some(101), 65535, 4, false, false),
@@ -571,7 +588,21 @@ mod tests {
                 fin: false
             }
         );
-        assert_eq!(flow.advertised_window(), 0);
+        assert_eq!(flow.advertised_window(), u32::from(u16::MAX) - 4);
+    }
+
+    #[test]
+    fn receive_edge_never_retreats() {
+        let mut flow = flow();
+        flow.socket_connected(0);
+        // A smaller recomputed budget must not shrink the promised window.
+        assert!(!flow.set_advertised_window(4));
+        assert_eq!(flow.advertised_window(), u32::from(u16::MAX));
+        // The on-wire field keeps covering data that is received but not yet
+        // acknowledged upstream.
+        flow.receive(u32::MAX - 3, Some(101), 65535, 100, false, false);
+        assert_eq!(flow.window_field(false), u16::MAX);
+        assert_eq!(flow.advertised_window(), u32::from(u16::MAX) - 100);
     }
 
     #[test]

@@ -25,6 +25,11 @@ const TAP_TX_BUDGET: usize = 32;
 const TAP_FRAME_POOL_SIZE: usize = 4096;
 const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
+/// Window-scale shift offered on the SYN-ACK when the namespace SYN offers
+/// the option. Shift 7 allows advertising up to ~8 MiB.
+const WINDOW_SCALE_SHIFT: u8 = 7;
+/// RFC 7323 caps the usable window-scale shift at 14.
+const MAX_PEER_WINDOW_SHIFT: u8 = 14;
 const MAX_RETRIES: u8 = 5;
 const ZERO_WINDOW_PROBE_INITIAL: Duration = Duration::from_secs(1);
 const ZERO_WINDOW_PROBE_MAX: Duration = Duration::from_secs(8);
@@ -308,6 +313,7 @@ struct TcpFrameSpec {
     plan: SendPlan,
     flags: TcpFlags,
     mss: Option<u16>,
+    window_scale: Option<u8>,
     window: u16,
     payload_len: usize,
 }
@@ -630,6 +636,11 @@ impl Reactor {
             .filter(|mss| *mss >= 536)
             .unwrap_or(default_mss)
             .min(default_mss);
+        // RFC 7323: scaling applies only when both SYNs carry the option.
+        let (peer_window_shift, local_window_shift) = match segment.window_scale() {
+            Some(shift) => (shift.min(MAX_PEER_WINDOW_SHIFT), WINDOW_SCALE_SHIFT),
+            None => (0, 0),
+        };
         let mut construction = FlowConstruction::new();
         construction
             .set_initiating(FlowSide {
@@ -651,8 +662,8 @@ impl Reactor {
                 self.test_local_isn
                     .unwrap_or_else(|| u32::from_ne_bytes(random)),
                 negotiated_mss,
-                0,
-                0,
+                peer_window_shift,
+                local_window_shift,
             ),
             construction,
             socket,
@@ -1437,8 +1448,8 @@ impl Reactor {
                         .active_sides()
                         .ok_or(Error::Invariant("inactive flow reached socket reader"))?
                         .namespace_key();
-                    let last_byte =
-                        frame.buffer.writable()[Self::tcp_payload_offset(key, None) + length - 1];
+                    let last_byte = frame.buffer.writable()
+                        [Self::tcp_payload_offset(key, None, None) + length - 1];
                     self.flows
                         .get_mut(id)
                         .expect("flow exists")
@@ -1742,7 +1753,7 @@ impl Reactor {
                 entry.peek_offset_supported,
             )
         };
-        let payload_offset = Self::tcp_payload_offset(key, None);
+        let payload_offset = Self::tcp_payload_offset(key, None, None);
         let capacity = capacity.min(FRAME_CAPACITY - payload_offset);
         let offset = i32::try_from(offset)
             .map_err(|_| Error::Invariant("socket peek offset exceeds i32"))?;
@@ -1775,7 +1786,11 @@ impl Reactor {
         }
     }
 
-    fn flow_frame_parameters(&self, id: FlowId, syn: bool) -> Result<(FlowKey, u16, u16), Error> {
+    fn flow_frame_parameters(
+        &self,
+        id: FlowId,
+        syn: bool,
+    ) -> Result<(FlowKey, u16, u16, u8), Error> {
         let entry = self
             .flows
             .get(id)
@@ -1793,6 +1808,7 @@ impl Reactor {
                 .namespace_key(),
             entry.flow.mss(),
             entry.flow.window_field(syn),
+            entry.flow.local_window_shift(),
         ))
     }
 
@@ -1804,7 +1820,7 @@ impl Reactor {
         flags: TcpFlags,
         payload_len: usize,
     ) -> Result<PooledFrame, Error> {
-        let (key, _, window) = match self.flow_frame_parameters(id, false) {
+        let (key, _, window, _) = match self.flow_frame_parameters(id, false) {
             Ok(parameters) => parameters,
             Err(error) => {
                 self.release_frame(frame);
@@ -1816,6 +1832,7 @@ impl Reactor {
             plan,
             flags,
             mss: None,
+            window_scale: None,
             window,
             payload_len,
         };
@@ -1833,8 +1850,17 @@ impl Reactor {
         payload: &[u8],
         flags: TcpFlags,
     ) -> Result<PooledFrame, Error> {
-        let (key, mss, window) = self.flow_frame_parameters(id, flags.syn)?;
-        self.build_tcp_frame(key, plan, payload, flags, flags.syn.then_some(mss), window)
+        let (key, mss, window, window_shift) = self.flow_frame_parameters(id, flags.syn)?;
+        let window_scale = (flags.syn && window_shift > 0).then_some(window_shift);
+        self.build_tcp_frame(
+            key,
+            plan,
+            payload,
+            flags,
+            flags.syn.then_some(mss),
+            window_scale,
+            window,
+        )
     }
 
     fn build_reset(&mut self, key: FlowKey, acknowledgment: u32) -> Result<PooledFrame, Error> {
@@ -1854,10 +1880,12 @@ impl Reactor {
                 ..TcpFlags::default()
             },
             None,
+            None,
             0,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_tcp_frame(
         &mut self,
         key: FlowKey,
@@ -1865,10 +1893,11 @@ impl Reactor {
         payload: &[u8],
         flags: TcpFlags,
         mss: Option<u16>,
+        window_scale: Option<u8>,
         window: u16,
     ) -> Result<PooledFrame, Error> {
         let mut frame = self.acquire_frame()?;
-        let payload_offset = Self::tcp_payload_offset(key, mss);
+        let payload_offset = Self::tcp_payload_offset(key, mss, window_scale);
         let frame_len = payload_offset + payload.len();
         if frame_len > FRAME_CAPACITY {
             self.release_frame(frame);
@@ -1880,6 +1909,7 @@ impl Reactor {
             plan,
             flags,
             mss,
+            window_scale,
             window,
             payload_len: payload.len(),
         };
@@ -1908,9 +1938,11 @@ impl Reactor {
         self.frame_pool.release(frame.pool_index, frame.buffer);
     }
 
-    fn tcp_payload_offset(key: FlowKey, mss: Option<u16>) -> usize {
+    fn tcp_payload_offset(key: FlowKey, mss: Option<u16>, window_scale: Option<u8>) -> usize {
         let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
-        let tcp_header_len = if mss.is_some() { 24 } else { 20 };
+        let tcp_header_len = tcp::TCP_MIN_HEADER_LEN
+            + if mss.is_some() { 4 } else { 0 }
+            + if window_scale.is_some() { 4 } else { 0 };
         ethernet::ETHERNET_HEADER_LEN + ip_header_len + tcp_header_len
     }
 
@@ -1920,11 +1952,12 @@ impl Reactor {
             plan,
             flags,
             mss,
+            window_scale,
             window,
             payload_len,
         } = spec;
         let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
-        let payload_offset = Self::tcp_payload_offset(key, mss);
+        let payload_offset = Self::tcp_payload_offset(key, mss, window_scale);
         let frame_len = payload_offset + payload_len;
         let bytes = frame.buffer.writable();
         ethernet::write_header(
@@ -1949,7 +1982,7 @@ impl Reactor {
                 flags,
                 window,
                 mss,
-                window_scale: None,
+                window_scale,
             },
         )?;
         match (key.target.ip(), key.namespace.ip()) {
