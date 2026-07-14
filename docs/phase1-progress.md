@@ -50,6 +50,12 @@
 - The Phase 1A benchmark covers direct, local SOCKS5/auth/HTTP, and real mihomo
   paths at 1/8/32/128 flows with throughput, CPU, p50/p99, connect latency, and
   fairness.
+- TCP Window Scale, a monotonic advertised receive edge, TAP-batch ACK refresh,
+  and `TCP_NODELAY` remove the cumulative short-flow slowdown without a 1 ms
+  polling path.
+- The TAP MTU is configurable from 1280 through 65520 and defaults to 32000.
+  Its dynamically sized frame pool stays within a 16 MiB payload budget and
+  exports its effective dimensions through status metrics.
 - Credential files are opened before namespace creation with `O_NOFOLLOW`,
   owner and mode checks. Supervisor and ns-init copies are dropped before the
   target namespace is cloned.
@@ -63,8 +69,7 @@ DNS, or external routing.
 
 ## Remaining Phase 1 Work
 
-- Resolve the roughly 100 ms short-flow completion penalty found by the Phase
-  1A local explicit-proxy calibration and repeat the full matrix.
+- Isolate real-mihomo 128-flow fairness variance from the shared host TUN path.
 - Validate the degraded capability paths on an actual Linux 5.11 kernel.
 - Review the 2 GiB default worst-case socket-buffer budget.
 - DNS proxy-tcp and resolver mount isolation remain blocked by the Phase 1A
