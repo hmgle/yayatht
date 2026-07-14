@@ -39,10 +39,10 @@ fn echo_payload_case(
     label: &str,
     payload: Vec<u8>,
     environment: &[(&str, &str)],
-) {
+) -> String {
     if !supported() {
         eprintln!("skipping rootless TAP test: user namespaces or /dev/net/tun unavailable");
-        return;
+        return String::new();
     }
     let listener = TcpListener::bind(bind).expect("bind loopback echo server");
     let port = listener.local_addr().unwrap().port();
@@ -91,11 +91,15 @@ fn echo_payload_case(
         .expect("write command input");
     let status = child
         .wait_timeout(Duration::from_secs(10))
-        .expect("wait for yayatht")
-        .unwrap_or_else(|| {
+        .expect("wait for yayatht");
+    let timed_out = status.is_none();
+    let status = match status {
+        Some(status) => status,
+        None => {
             child.kill().expect("kill timed out yayatht");
-            panic!("yayatht echo test timed out")
-        });
+            child.wait().expect("reap timed out yayatht")
+        }
+    };
     let mut output = Vec::new();
     child
         .stdout
@@ -110,6 +114,7 @@ fn echo_payload_case(
         .unwrap()
         .read_to_string(&mut stderr)
         .unwrap();
+    assert!(!timed_out, "yayatht echo test timed out: {stderr}");
     assert!(status.success(), "yayatht failed: {stderr}");
     assert_eq!(output, payload, "unexpected command output: {stderr}");
     server.join().unwrap();
@@ -120,6 +125,7 @@ fn echo_payload_case(
             .join(name)
             .exists()
     );
+    stderr
 }
 
 fn proxy_client_case(proxy_args: &[String], label: &str, payload: &[u8]) {
@@ -255,6 +261,32 @@ fn ipv6_busybox_echo() {
         "--no-ipv4",
         "ipv6",
     );
+}
+
+#[test]
+fn degraded_kernel_capabilities_preserve_tcp_echo() {
+    let payload = (0..32 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    let stderr = echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "degraded-capabilities",
+        payload,
+        &[
+            ("YAYATHT_TEST_DISABLE_SO_PEEK_OFF", "1"),
+            ("YAYATHT_TEST_DISABLE_TCP_INFO_BYTES_ACKED", "1"),
+            ("YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND", "1"),
+            ("RUST_LOG", "yayatht_dataplane=warn,yayatht=info"),
+        ],
+    );
+    if !stderr.is_empty() {
+        assert!(
+            stderr.contains("degraded kernel capability paths"),
+            "degraded capability state was not exposed: {stderr}"
+        );
+    }
 }
 
 #[test]

@@ -29,7 +29,12 @@ const ZERO_WINDOW_PROBE_INITIAL: Duration = Duration::from_secs(1);
 const ZERO_WINDOW_PROBE_MAX: Duration = Duration::from_secs(8);
 const PROXY_RESPONSE_CAPACITY: usize = 8 * 1024;
 const MAX_PENDING_SOCKET_BYTES: usize = 256 * 1024;
+const FALLBACK_SEND_WINDOW: usize = 16 * 1024;
+const FALLBACK_ACK_WINDOW: usize = 8 * 1024;
 const TEST_DROP_TCP_DATA_ENV: &str = "YAYATHT_TEST_DROP_TCP_DATA";
+const TEST_DISABLE_PEEK_OFF_ENV: &str = "YAYATHT_TEST_DISABLE_SO_PEEK_OFF";
+const TEST_DISABLE_BYTES_ACKED_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_BYTES_ACKED";
+const TEST_DISABLE_SEND_WINDOW_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND";
 
 #[derive(Clone, Debug)]
 pub enum Upstream {
@@ -67,6 +72,13 @@ pub struct Metrics {
     pub tcp_resets: u64,
     pub proxy_handshakes: u64,
     pub proxy_failures: u64,
+    pub degraded_tcp_flows: u64,
+    pub peek_offset_flows: u64,
+    pub peek_iovec_fallback_flows: u64,
+    pub bytes_acked_flows: u64,
+    pub conservative_ack_flows: u64,
+    pub send_window_flows: u64,
+    pub fixed_send_window_flows: u64,
 }
 
 #[derive(Debug, Error)]
@@ -91,6 +103,9 @@ struct FlowEntry {
     upstream_window_clamp: Option<u16>,
     zero_window_probe: Option<ZeroWindowProbe>,
     last_namespace_byte: Option<u8>,
+    peek_offset_supported: bool,
+    bytes_acked_supported: bool,
+    send_window_supported: bool,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -541,6 +556,9 @@ impl Reactor {
             upstream_window_clamp: None,
             zero_window_probe: None,
             last_namespace_byte: None,
+            peek_offset_supported: false,
+            bytes_acked_supported: false,
+            send_window_supported: false,
         };
         let id = match self.flows.insert(entry) {
             Ok(id) => id,
@@ -781,15 +799,38 @@ impl Reactor {
     }
 
     fn activate_flow(&mut self, id: FlowId) -> Result<(), Error> {
-        self.refresh_namespace_window(id)?;
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         let info = yayatht_sys::tcp_info::get(fd)?;
+        let probed_peek_offset = yayatht_sys::tcp_info::probe_peek_offset(fd)?;
+        let peek_offset_supported =
+            probed_peek_offset && !test_capability_disabled(TEST_DISABLE_PEEK_OFF_ENV);
+        if probed_peek_offset && !peek_offset_supported {
+            yayatht_sys::tcp_info::set_peek_offset(fd, -1)?;
+        }
+        let bytes_acked_supported =
+            info.bytes_acked.is_some() && !test_capability_disabled(TEST_DISABLE_BYTES_ACKED_ENV);
+        let send_window_supported =
+            info.send_window.is_some() && !test_capability_disabled(TEST_DISABLE_SEND_WINDOW_ENV);
+        {
+            let entry = self.flows.get_mut(id).expect("flow exists");
+            entry.peek_offset_supported = peek_offset_supported;
+            entry.bytes_acked_supported = bytes_acked_supported;
+            entry.send_window_supported = send_window_supported;
+        }
+        self.record_capabilities(
+            id,
+            info.returned_len,
+            peek_offset_supported,
+            bytes_acked_supported,
+            send_window_supported,
+        );
+        self.update_namespace_window(id, info.send_window)?;
         let plan = self
             .flows
             .get_mut(id)
             .expect("flow exists")
             .flow
-            .socket_connected(info.bytes_acked);
+            .socket_connected(info.bytes_acked.unwrap_or(0));
         let frame = self.build_flow_frame(
             id,
             plan,
@@ -801,6 +842,48 @@ impl Reactor {
             },
         )?;
         self.queue_tap(Some(id), frame, Some(plan))
+    }
+
+    fn record_capabilities(
+        &mut self,
+        id: FlowId,
+        tcp_info_len: usize,
+        peek_offset_supported: bool,
+        bytes_acked_supported: bool,
+        send_window_supported: bool,
+    ) {
+        if peek_offset_supported {
+            self.metrics.peek_offset_flows += 1;
+        } else {
+            self.metrics.peek_iovec_fallback_flows += 1;
+        }
+        if bytes_acked_supported {
+            self.metrics.bytes_acked_flows += 1;
+        } else {
+            self.metrics.conservative_ack_flows += 1;
+        }
+        if send_window_supported {
+            self.metrics.send_window_flows += 1;
+        } else {
+            self.metrics.fixed_send_window_flows += 1;
+        }
+        if !peek_offset_supported || !bytes_acked_supported || !send_window_supported {
+            self.metrics.degraded_tcp_flows += 1;
+            let target = self
+                .flows
+                .get(id)
+                .and_then(|entry| entry.construction.active_sides())
+                .map(|sides| sides.target.logical_peer);
+            warn!(
+                flow_slot = id.slot,
+                ?target,
+                tcp_info_len,
+                so_peek_off = peek_offset_supported,
+                tcpi_bytes_acked = bytes_acked_supported,
+                tcpi_snd_wnd = send_window_supported,
+                "TCP flow is using degraded kernel capability paths"
+            );
+        }
     }
 
     fn flush_proxy_output(&mut self, id: FlowId) -> Result<(), Error> {
@@ -956,12 +1039,27 @@ impl Reactor {
     fn refresh_upstream_ack(&mut self, id: FlowId) -> Result<(), Error> {
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         let info = yayatht_sys::tcp_info::get(fd)?;
-        let advanced = self
+        let bytes_acked_supported = self
             .flows
-            .get_mut(id)
+            .get(id)
             .expect("flow exists")
-            .flow
-            .record_upstream_ack(info.bytes_acked);
+            .bytes_acked_supported;
+        let acknowledged = if bytes_acked_supported {
+            info.bytes_acked
+        } else {
+            let entry = self.flows.get(id).expect("flow exists");
+            (entry.pending_socket.is_empty()
+                && info.unacked_segments == Some(0)
+                && yayatht_sys::socket::send_queue_bytes(fd)? == 0)
+                .then_some(entry.flow.upstream_submitted())
+        };
+        let advanced = acknowledged.is_some_and(|acknowledged| {
+            self.flows
+                .get_mut(id)
+                .expect("flow exists")
+                .flow
+                .record_upstream_ack(acknowledged)
+        });
         let window_changed = self.update_namespace_window(id, info.send_window)?;
         if advanced || window_changed {
             self.send_ack(id)?;
@@ -969,25 +1067,29 @@ impl Reactor {
         Ok(())
     }
 
-    fn refresh_namespace_window(&mut self, id: FlowId) -> Result<(), Error> {
-        let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
-        let info = yayatht_sys::tcp_info::get(fd)?;
-        self.update_namespace_window(id, info.send_window)?;
-        Ok(())
-    }
-
-    fn update_namespace_window(&mut self, id: FlowId, send_window: u32) -> Result<bool, Error> {
+    fn update_namespace_window(
+        &mut self,
+        id: FlowId,
+        send_window: Option<u32>,
+    ) -> Result<bool, Error> {
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         let socket_available = yayatht_sys::socket::send_buffer_available(fd)?;
-        let queue_available = self
-            .flows
-            .get(id)
-            .expect("flow exists")
-            .pending_socket
-            .remaining();
+        let entry = self.flows.get(id).expect("flow exists");
+        let queue_available = entry.pending_socket.remaining();
+        let kernel_window = if entry.send_window_supported {
+            send_window.map_or(0, |window| window as usize)
+        } else {
+            FALLBACK_SEND_WINDOW
+        };
+        let ack_window = if entry.bytes_acked_supported {
+            usize::from(u16::MAX)
+        } else {
+            FALLBACK_ACK_WINDOW
+        };
         let available = socket_available
             .min(queue_available)
-            .min(send_window as usize)
+            .min(kernel_window)
+            .min(ack_window)
             .min(usize::from(u16::MAX));
         let window = u16::try_from(available).expect("window clamped to u16");
         Ok(self
@@ -1201,9 +1303,18 @@ impl Reactor {
                 retained.is_some(),
             )
         };
-        yayatht_sys::tcp_info::set_peek_offset(fd, 0)?;
+        let peek_offset_supported = self
+            .flows
+            .get(id)
+            .expect("flow exists")
+            .peek_offset_supported;
         let mut socket_byte = [0u8; 1];
-        let length = match yayatht_sys::socket::peek(fd, &mut socket_byte) {
+        let length = match if peek_offset_supported {
+            yayatht_sys::tcp_info::set_peek_offset(fd, 0)?;
+            yayatht_sys::socket::peek(fd, &mut socket_byte)
+        } else {
+            yayatht_sys::socket::peek_with_offset(fd, 0, &mut socket_byte)
+        } {
             Ok(length) => length,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
             Err(error) => return Err(error.into()),
@@ -1361,7 +1472,7 @@ impl Reactor {
         offset: usize,
         capacity: usize,
     ) -> Result<PeekedFrame, Error> {
-        let (key, fd) = {
+        let (key, fd, peek_offset_supported) = {
             let entry = self.flows.get(id).expect("flow exists");
             (
                 entry
@@ -1370,22 +1481,29 @@ impl Reactor {
                     .ok_or(Error::Invariant("inactive flow reached socket reader"))?
                     .namespace_key(),
                 entry.socket.as_raw_fd(),
+                entry.peek_offset_supported,
             )
         };
         let payload_offset = Self::tcp_payload_offset(key, None);
         let capacity = capacity.min(FRAME_CAPACITY - payload_offset);
         let offset = i32::try_from(offset)
             .map_err(|_| Error::Invariant("socket peek offset exceeds i32"))?;
-        yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
         let mut frame = self.acquire_frame()?;
-        let result = yayatht_sys::socket::peek(
-            fd,
-            &mut frame.buffer.writable()[payload_offset..payload_offset + capacity],
-        );
+        let out = &mut frame.buffer.writable()[payload_offset..payload_offset + capacity];
+        let result = if peek_offset_supported {
+            yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
+            yayatht_sys::socket::peek(fd, out)
+        } else {
+            yayatht_sys::socket::peek_with_offset(fd, offset as usize, out)
+        };
         match result {
             Ok(0) => {
                 self.release_frame(frame);
-                Ok(PeekedFrame::Eof)
+                if offset == 0 {
+                    Ok(PeekedFrame::Eof)
+                } else {
+                    Ok(PeekedFrame::WouldBlock)
+                }
             }
             Ok(length) => Ok(PeekedFrame::Data { frame, length }),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -1780,6 +1898,18 @@ fn test_drop_tcp_data_count() -> usize {
     {
         let _ = TEST_DROP_TCP_DATA_ENV;
         0
+    }
+}
+
+fn test_capability_disabled(name: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var_os(name).is_some_and(|value| value == "1")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = name;
+        false
     }
 }
 

@@ -334,6 +334,11 @@ impl Flow {
         self.upstream_submitted = self.upstream_submitted.saturating_add(length as u64);
     }
 
+    #[must_use]
+    pub const fn upstream_submitted(&self) -> u64 {
+        self.upstream_submitted
+    }
+
     pub fn record_upstream_ack(&mut self, bytes_acked: u64) -> bool {
         let acknowledged = bytes_acked
             .saturating_sub(self.upstream_ack_baseline)
