@@ -486,16 +486,21 @@ impl Reactor {
         if !flags.syn || flags.ack || flags.rst {
             return Ok(());
         }
-        let target_side = self.target_side(key.target);
-        let (socket, connected) =
-            match yayatht_sys::socket::connect_nonblocking(target_side.transport_endpoint) {
-                Ok(result) => result,
-                Err(_) => {
-                    let frame = self.build_reset(key, segment.sequence().wrapping_add(1))?;
-                    self.metrics.tcp_resets += 1;
-                    return self.queue_tap(None, frame, None);
-                }
-            };
+        let (target_interface, transport_peer) = self.route_target(key.target);
+        let (socket, connected) = match yayatht_sys::socket::connect_nonblocking(transport_peer) {
+            Ok(result) => result,
+            Err(_) => {
+                let frame = self.build_reset(key, segment.sequence().wrapping_add(1))?;
+                self.metrics.tcp_resets += 1;
+                return self.queue_tap(None, frame, None);
+            }
+        };
+        let target_side = FlowSide {
+            interface: target_interface,
+            local_endpoint: yayatht_sys::socket::local_address(socket.as_raw_fd())?,
+            logical_peer: key.target,
+            transport_peer,
+        };
         let mut random = [0u8; 4];
         random_fill(&mut random)
             .map_err(|error| io::Error::other(format!("getrandom failed: {error:?}")))?;
@@ -508,9 +513,10 @@ impl Reactor {
         let mut construction = FlowConstruction::new();
         construction
             .set_initiating(FlowSide {
-                endpoint: key.namespace,
-                transport_endpoint: key.namespace,
                 interface: FlowInterface::NamespaceTap,
+                local_endpoint: key.target,
+                logical_peer: key.namespace,
+                transport_peer: key.namespace,
             })
             .map_err(|_| Error::Invariant("unable to set initiating flow side"))?;
         construction
@@ -521,7 +527,6 @@ impl Reactor {
             .map_err(|_| Error::Invariant("unable to type TCP flow"))?;
         let entry = FlowEntry {
             flow: Flow::new(
-                key,
                 segment.sequence(),
                 u32::from_ne_bytes(random),
                 negotiated_mss,
@@ -529,7 +534,7 @@ impl Reactor {
             construction,
             socket,
             transport_connected: false,
-            handshake: self.proxy_handshake(key.target),
+            handshake: self.proxy_handshake(target_side.logical_peer),
             pending_socket: PendingSocketQueue::new(MAX_PENDING_SOCKET_BYTES),
             pending_shutdown: false,
             sent_segments: VecDeque::new(),
@@ -1082,7 +1087,14 @@ impl Reactor {
                         .flow
                         .plan_send(length, false)
                         .ok_or(Error::Invariant("unable to plan TCP payload"))?;
-                    let key = self.flows.get(id).expect("flow exists").flow.key();
+                    let key = self
+                        .flows
+                        .get(id)
+                        .expect("flow exists")
+                        .construction
+                        .active_sides()
+                        .ok_or(Error::Invariant("inactive flow reached socket reader"))?
+                        .namespace_key();
                     let last_byte =
                         frame.buffer.writable()[Self::tcp_payload_offset(key, None) + length - 1];
                     self.flows
@@ -1309,25 +1321,17 @@ impl Reactor {
         self.close_flow(id)
     }
 
-    fn target_side(&self, logical: SocketAddr) -> FlowSide {
+    fn route_target(&self, logical: SocketAddr) -> (FlowInterface, SocketAddr) {
         match &self.config.upstream {
-            Upstream::Proxy { address, .. } => FlowSide {
-                endpoint: logical,
-                transport_endpoint: *address,
-                interface: FlowInterface::ProxyTunnel,
-            },
+            Upstream::Proxy { address, .. } => (FlowInterface::ProxyTunnel, *address),
             Upstream::Direct {
                 host_loopback: false,
-            } => FlowSide {
-                endpoint: logical,
-                transport_endpoint: logical,
-                interface: FlowInterface::HostSocket,
-            },
+            } => (FlowInterface::HostSocket, logical),
             Upstream::Direct {
                 host_loopback: true,
-            } => FlowSide {
-                endpoint: logical,
-                transport_endpoint: match logical {
+            } => (
+                FlowInterface::HostSocket,
+                match logical {
                     SocketAddr::V4(address) if Some(*address.ip()) == self.config.gateway_ipv4 => {
                         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), address.port())
                     }
@@ -1336,8 +1340,7 @@ impl Reactor {
                     }
                     _ => logical,
                 },
-                interface: FlowInterface::HostSocket,
-            },
+            ),
         }
     }
 
@@ -1360,7 +1363,14 @@ impl Reactor {
     ) -> Result<PeekedFrame, Error> {
         let (key, fd) = {
             let entry = self.flows.get(id).expect("flow exists");
-            (entry.flow.key(), entry.socket.as_raw_fd())
+            (
+                entry
+                    .construction
+                    .active_sides()
+                    .ok_or(Error::Invariant("inactive flow reached socket reader"))?
+                    .namespace_key(),
+                entry.socket.as_raw_fd(),
+            )
         };
         let payload_offset = Self::tcp_payload_offset(key, None);
         let capacity = capacity.min(FRAME_CAPACITY - payload_offset);
@@ -1400,7 +1410,11 @@ impl Reactor {
             return Err(Error::Invariant("inactive flow reached packet builder"));
         }
         Ok((
-            entry.flow.key(),
+            entry
+                .construction
+                .active_sides()
+                .expect("active construction checked")
+                .namespace_key(),
             entry.flow.mss(),
             entry.flow.advertised_window(),
         ))
@@ -1592,7 +1606,12 @@ impl Reactor {
 
     fn send_reset_for_flow(&mut self, id: FlowId) -> Result<(), Error> {
         let entry = self.flows.get(id).expect("flow exists");
-        let frame = self.build_reset(entry.flow.key(), entry.flow.namespace_ack())?;
+        let key = entry
+            .construction
+            .active_sides()
+            .ok_or(Error::Invariant("inactive flow reached reset builder"))?
+            .namespace_key();
+        let frame = self.build_reset(key, entry.flow.namespace_ack())?;
         self.metrics.tcp_resets += 1;
         self.queue_tap(None, frame, None)
     }
@@ -1721,7 +1740,11 @@ impl Reactor {
             return Ok(());
         };
         let fd = entry.socket.as_raw_fd();
-        let key = entry.flow.key();
+        let key = entry
+            .construction
+            .active_sides()
+            .ok_or(Error::Invariant("inactive flow reached cleanup"))?
+            .namespace_key();
         self.epoll.delete(fd)?;
         self.by_key.remove(&key);
         let mut retained = VecDeque::with_capacity(self.tap_queue.len());

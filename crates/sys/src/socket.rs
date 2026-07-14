@@ -1,6 +1,6 @@
 use std::io;
 use std::mem::size_of;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
 fn socket_address(address: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
@@ -89,6 +89,55 @@ pub fn pending_error(fd: RawFd) -> io::Result<Option<i32>> {
     Ok((error != 0).then_some(error))
 }
 
+pub fn local_address(fd: RawFd) -> io::Result<SocketAddr> {
+    // SAFETY: zeroed sockaddr_storage is valid writable getsockname storage.
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut len = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: storage and len are valid getsockname output pointers.
+    if unsafe {
+        libc::getsockname(
+            fd,
+            std::ptr::from_mut(&mut storage).cast(),
+            std::ptr::from_mut(&mut len),
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    match i32::from(storage.ss_family) {
+        libc::AF_INET if usize::try_from(len).unwrap_or(0) >= size_of::<libc::sockaddr_in>() => {
+            // SAFETY: getsockname reported AF_INET with enough initialized bytes.
+            let address = unsafe {
+                std::ptr::from_ref(&storage)
+                    .cast::<libc::sockaddr_in>()
+                    .read()
+            };
+            Ok(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(address.sin_addr.s_addr.to_ne_bytes())),
+                u16::from_be(address.sin_port),
+            ))
+        }
+        libc::AF_INET6 if usize::try_from(len).unwrap_or(0) >= size_of::<libc::sockaddr_in6>() => {
+            // SAFETY: getsockname reported AF_INET6 with enough initialized bytes.
+            let address = unsafe {
+                std::ptr::from_ref(&storage)
+                    .cast::<libc::sockaddr_in6>()
+                    .read()
+            };
+            Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+                Ipv6Addr::from(address.sin6_addr.s6_addr),
+                u16::from_be(address.sin6_port),
+                address.sin6_flowinfo,
+                address.sin6_scope_id,
+            )))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "getsockname returned an unsupported address",
+        )),
+    }
+}
+
 pub fn send_buffer_available(fd: RawFd) -> io::Result<usize> {
     let mut send_buffer = 0i32;
     let mut len = size_of::<i32>() as libc::socklen_t;
@@ -172,4 +221,20 @@ pub fn shutdown_write(fd: RawFd) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+
+    #[test]
+    fn local_address_matches_connected_socket() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        assert_eq!(
+            local_address(stream.as_raw_fd()).unwrap(),
+            stream.local_addr().unwrap()
+        );
+    }
 }

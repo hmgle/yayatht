@@ -1,5 +1,5 @@
 use crate::sequence;
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum FlowInterface {
@@ -10,15 +10,26 @@ pub enum FlowInterface {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlowSide {
-    pub endpoint: SocketAddr,
-    pub transport_endpoint: SocketAddr,
     pub interface: FlowInterface,
+    pub local_endpoint: SocketAddr,
+    pub logical_peer: SocketAddr,
+    pub transport_peer: SocketAddr,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FlowSides {
     pub initiating: FlowSide,
     pub target: FlowSide,
+}
+
+impl FlowSides {
+    #[must_use]
+    pub const fn namespace_key(self) -> FlowKey {
+        FlowKey {
+            namespace: self.initiating.logical_peer,
+            target: self.initiating.local_endpoint,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,7 +163,6 @@ pub struct SendPlan {
 
 #[derive(Debug)]
 pub struct Flow {
-    key: FlowKey,
     state: State,
     namespace_initial: u32,
     namespace_next: u32,
@@ -173,9 +183,8 @@ pub struct Flow {
 
 impl Flow {
     #[must_use]
-    pub fn new(key: FlowKey, namespace_initial: u32, local_initial: u32, mss: u16) -> Self {
+    pub fn new(namespace_initial: u32, local_initial: u32, mss: u16) -> Self {
         Self {
-            key,
             state: State::Connecting,
             namespace_initial,
             namespace_next: namespace_initial.wrapping_add(1),
@@ -193,11 +202,6 @@ impl Flow {
             socket_fin: false,
             local_fin_sequence: None,
         }
-    }
-
-    #[must_use]
-    pub const fn key(&self) -> FlowKey {
-        self.key
     }
 
     #[must_use]
@@ -417,22 +421,6 @@ impl Flow {
             self.state = State::TimeWait;
         }
     }
-
-    #[must_use]
-    pub const fn family(&self) -> libc_family::Family {
-        match self.key.target.ip() {
-            IpAddr::V4(_) => libc_family::Family::Inet,
-            IpAddr::V6(_) => libc_family::Family::Inet6,
-        }
-    }
-}
-
-pub mod libc_family {
-    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub enum Family {
-        Inet,
-        Inet6,
-    }
 }
 
 #[cfg(test)]
@@ -440,15 +428,7 @@ mod tests {
     use super::*;
 
     fn flow() -> Flow {
-        Flow::new(
-            FlowKey {
-                namespace: "192.0.2.2:40000".parse().unwrap(),
-                target: "192.0.2.1:7".parse().unwrap(),
-            },
-            u32::MAX - 4,
-            100,
-            1460,
-        )
+        Flow::new(u32::MAX - 4, 100, 1460)
     }
 
     #[test]
@@ -534,14 +514,16 @@ mod tests {
     #[test]
     fn flow_construction_separates_logical_and_transport_targets() {
         let namespace = FlowSide {
-            endpoint: "192.0.2.2:40000".parse().unwrap(),
-            transport_endpoint: "192.0.2.2:40000".parse().unwrap(),
             interface: FlowInterface::NamespaceTap,
+            local_endpoint: "192.0.2.1:443".parse().unwrap(),
+            logical_peer: "192.0.2.2:40000".parse().unwrap(),
+            transport_peer: "192.0.2.2:40000".parse().unwrap(),
         };
         let target = FlowSide {
-            endpoint: "198.51.100.7:443".parse().unwrap(),
-            transport_endpoint: "127.0.0.1:7890".parse().unwrap(),
             interface: FlowInterface::ProxyTunnel,
+            local_endpoint: "127.0.0.1:50000".parse().unwrap(),
+            logical_peer: "198.51.100.7:443".parse().unwrap(),
+            transport_peer: "127.0.0.1:7890".parse().unwrap(),
         };
         let mut construction = FlowConstruction::new();
         construction.set_initiating(namespace).unwrap();
@@ -551,9 +533,17 @@ mod tests {
 
         let sides = construction.activate().unwrap();
         assert_eq!(construction.state(), ConstructionState::Active);
-        assert_eq!(sides.target.endpoint, target.endpoint);
-        assert_eq!(sides.target.transport_endpoint, target.transport_endpoint);
-        assert_ne!(sides.target.endpoint, sides.target.transport_endpoint);
+        assert_eq!(sides.target.local_endpoint, target.local_endpoint);
+        assert_eq!(sides.target.logical_peer, target.logical_peer);
+        assert_eq!(sides.target.transport_peer, target.transport_peer);
+        assert_ne!(sides.target.logical_peer, sides.target.transport_peer);
+        assert_eq!(
+            sides.namespace_key(),
+            FlowKey {
+                namespace: namespace.logical_peer,
+                target: namespace.local_endpoint,
+            }
+        );
     }
 
     #[test]
