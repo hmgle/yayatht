@@ -3,6 +3,7 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
 use std::os::unix::fs::OpenOptionsExt;
 use std::process::{Command, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use wait_timeout::ChildExt;
@@ -19,6 +20,19 @@ fn supported() -> bool {
 
 fn unique_name(label: &str) -> String {
     format!("test-{label}-{}", std::process::id())
+}
+
+fn status_json(name: &str) -> serde_json::Value {
+    let output = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args(["status", "--name", name, "--json"])
+        .output()
+        .expect("query status");
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).unwrap()
 }
 
 fn echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str) {
@@ -376,6 +390,166 @@ fn zero_window_probe_runs_while_namespace_reader_is_paused() {
 }
 
 #[test]
+fn global_pending_limit_applies_instance_backpressure() {
+    if !supported() {
+        return;
+    }
+    const BYTE_COUNT: usize = 256 * 1024;
+    const GLOBAL_LIMIT: usize = 16 * 1024;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accepted_tx, accepted_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        accepted_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let mut buffer = [0u8; 16 * 1024];
+        let mut received = 0usize;
+        loop {
+            let length = stream.read(&mut buffer).unwrap();
+            if length == 0 {
+                break;
+            }
+            received += length;
+        }
+        assert_eq!(received, BYTE_COUNT);
+    });
+
+    let name = unique_name("global-pending");
+    let script = format!(
+        "busybox dd if=/dev/zero bs=4096 count=64 2>/dev/null | busybox nc -w 5 192.0.2.1 {port}"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--max-pending-tcp-bytes",
+            &GLOBAL_LIMIT.to_string(),
+            "--tcp-send-buffer-bytes",
+            &(16 * 1024).to_string(),
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    accepted_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    thread::sleep(Duration::from_millis(250));
+    let value = status_json(&name);
+    assert_eq!(value["dataplane"]["max_pending_tcp_bytes"], GLOBAL_LIMIT);
+    assert!(value["dataplane"]["pending_tcp_bytes"].as_u64().unwrap() <= GLOBAL_LIMIT as u64);
+    assert!(
+        value["dataplane"]["peak_pending_tcp_bytes"]
+            .as_u64()
+            .unwrap()
+            <= GLOBAL_LIMIT as u64
+    );
+    release_tx.send(()).unwrap();
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("pending-limit test timed out")
+        });
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
+    server.join().unwrap();
+}
+
+#[test]
+fn global_retained_limit_caps_socket_backed_retransmit_bytes() {
+    if !supported() {
+        return;
+    }
+    const BYTE_COUNT: usize = 256 * 1024;
+    const GLOBAL_LIMIT: usize = 16 * 1024;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (written_tx, written_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let bytes = [0xa5; 16 * 1024];
+        for _ in 0..BYTE_COUNT / bytes.len() {
+            stream.write_all(&bytes).unwrap();
+        }
+        written_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    });
+
+    let name = unique_name("global-retained");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--max-retained-tcp-bytes",
+            &GLOBAL_LIMIT.to_string(),
+            "--tcp-receive-buffer-bytes",
+            &(64 * 1024).to_string(),
+            "--",
+            "sh",
+            "-c",
+            &format!("busybox nc -w 5 192.0.2.1 {port} >/dev/null"),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    written_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let value = status_json(&name);
+    assert_eq!(value["dataplane"]["max_retained_tcp_bytes"], GLOBAL_LIMIT);
+    let peak = value["dataplane"]["peak_retained_tcp_bytes"]
+        .as_u64()
+        .unwrap();
+    assert!(
+        peak > 0 && peak <= GLOBAL_LIMIT as u64,
+        "peak retained bytes: {peak}"
+    );
+    assert!(
+        value["dataplane"]["socket_receive_buffer_bytes"]
+            .as_u64()
+            .unwrap()
+            <= 64 * 1024
+    );
+    release_tx.send(()).unwrap();
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("retained-limit test timed out")
+        });
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
+    server.join().unwrap();
+}
+
+#[test]
 fn socks5_no_auth_busybox_echo() {
     if !supported() {
         return;
@@ -626,6 +800,25 @@ fn status_socket_reports_running_instance() {
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["state"], "running");
     assert_eq!(value["instance_id"], name);
+    assert_eq!(
+        value["dataplane"]["max_pending_tcp_bytes"],
+        64 * 1024 * 1024
+    );
+    assert_eq!(
+        value["dataplane"]["max_retained_tcp_bytes"],
+        64 * 1024 * 1024
+    );
+    assert_eq!(value["dataplane"]["flow_fd_limit"], 4096 + 32);
+    let dataplane_pid = value["dataplane_pid"].as_i64().unwrap();
+    let limits = fs::read_to_string(format!("/proc/{dataplane_pid}/limits")).unwrap();
+    let open_files = limits
+        .lines()
+        .find(|line| line.starts_with("Max open files"))
+        .expect("data-plane RLIMIT_NOFILE entry");
+    assert!(
+        open_files.split_whitespace().any(|field| field == "4128"),
+        "unexpected data-plane fd limit: {open_files}"
+    );
     assert!(child.wait().unwrap().success());
     assert!(!socket.parent().unwrap().exists());
 }

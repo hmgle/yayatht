@@ -537,6 +537,8 @@ dependencies = [
  "getrandom",
  "libc",
  "rustix",
+ "serde",
+ "serde_json",
  "thiserror",
  "tracing",
  "yayatht-packet",

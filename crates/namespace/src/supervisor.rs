@@ -9,7 +9,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use yayatht_sys::clone::{CloneResult, clone_namespaced};
 use yayatht_sys::control::Kind;
 use yayatht_sys::process::WaitStatus;
@@ -42,6 +42,9 @@ pub struct Supervisor;
 impl Supervisor {
     pub fn run(mut config: LaunchConfig) -> Result<ExitStatus, Error> {
         config.validate()?;
+        let dataplane_fd_limit =
+            yayatht_sys::resource::dataplane_nofile_limit(config.max_tcp_flows)?;
+        yayatht_sys::resource::ensure_nofile_capacity(dataplane_fd_limit)?;
         yayatht_sys::caps::set_child_subreaper()?;
         let signal_fd = yayatht_sys::signal::SignalFd::block(&[
             libc::SIGINT,
@@ -58,9 +61,14 @@ impl Supervisor {
         let (ns_parent, ns_child) = yayatht_sys::fdpass::seqpacket_pair()?;
         let (tap_dp, tap_ns) = yayatht_sys::fdpass::seqpacket_pair()?;
 
-        let dataplane_config = config
-            .network
-            .dataplane(&config.upstream, config.max_tcp_flows);
+        let dataplane_config = config.network.dataplane(
+            &config.upstream,
+            config.max_tcp_flows,
+            config.max_pending_tcp_bytes,
+            config.max_retained_tcp_bytes,
+            config.tcp_receive_buffer_bytes,
+            config.tcp_send_buffer_bytes,
+        );
         let (dataplane_pid, dataplane_pidfd) = match clone_namespaced(COMMON_NAMESPACES)? {
             CloneResult::Child => {
                 drop(signal_fd);
@@ -219,12 +227,15 @@ fn data_plane_child(
             ));
         }
         drop(tap_channel);
+        let nofile_limit = yayatht_sys::resource::dataplane_nofile_limit(config.max_tcp_flows)?;
+        yayatht_sys::resource::set_nofile_limit(nofile_limit)?;
         yayatht_sys::caps::drop_all_capabilities()?;
         yayatht_sys::caps::set_no_new_privs()?;
         control::send(control_fd.as_raw_fd(), Kind::Ready, 1, &[])?;
         yayatht_sys::set_nonblocking(control_fd.as_raw_fd(), true)?;
-        yayatht_dataplane::reactor::run(config, tap, control_fd)
+        let metrics = yayatht_dataplane::reactor::run(config, tap, control_fd)
             .map_err(|error| io::Error::other(error.to_string()))?;
+        debug!(?metrics, "data plane stopped");
         Ok(())
     })();
     match result {
@@ -383,7 +394,7 @@ fn supervise_running(
                 yayatht_sys::clone::pidfd_send_signal(namespace_pidfd.as_raw_fd(), signal)?;
             }
         }
-        serve_status(instance)?;
+        serve_status(instance, dp_control)?;
         let mut buffer = vec![0u8; yayatht_sys::control::MAX_PAYLOAD + 20];
         match control::receive(ns_control.as_raw_fd(), &mut buffer) {
             Ok(message) if message.kind == Kind::Exit => {
@@ -439,7 +450,7 @@ fn supervise_running(
     }
 }
 
-fn serve_status(instance: &Instance) -> io::Result<()> {
+fn serve_status(instance: &Instance, dataplane_control: &OwnedFd) -> io::Result<()> {
     loop {
         let (mut stream, _) = match instance.listener.accept() {
             Ok(value) => value,
@@ -453,11 +464,48 @@ fn serve_status(instance: &Instance) -> io::Result<()> {
         if message.kind != Kind::Status {
             continue;
         }
-        let payload = instance.metadata_json()?;
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&instance.metadata_json()?).map_err(io::Error::other)?;
+        let metrics = query_dataplane_metrics(dataplane_control)?;
+        payload
+            .as_object_mut()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid instance JSON"))?
+            .insert("dataplane".to_owned(), metrics);
+        let payload = serde_json::to_vec_pretty(&payload).map_err(io::Error::other)?;
         let response = yayatht_sys::control::encode(Kind::Status, message.request_id, &payload)?;
         stream.write_all(&response)?;
     }
     Ok(())
+}
+
+fn query_dataplane_metrics(control_fd: &OwnedFd) -> io::Result<serde_json::Value> {
+    const REQUEST_ID: u64 = 0x6d65_7472_6963_7301;
+    control::send(control_fd.as_raw_fd(), Kind::Status, REQUEST_ID, &[])?;
+    let deadline = std::time::Instant::now() + Duration::from_millis(200);
+    let mut buffer = vec![0u8; yayatht_sys::control::MAX_PAYLOAD + 20];
+    loop {
+        match control::receive(control_fd.as_raw_fd(), &mut buffer) {
+            Ok(message) if message.kind == Kind::Status && message.request_id == REQUEST_ID => {
+                return serde_json::from_slice(message.payload).map_err(io::Error::other);
+            }
+            Ok(message) if message.kind == Kind::Error => {
+                return Err(io::Error::other(
+                    String::from_utf8_lossy(message.payload).into_owned(),
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "timed out querying data-plane metrics",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn write_identity_maps(pid: i32) -> io::Result<()> {

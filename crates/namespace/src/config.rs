@@ -56,6 +56,10 @@ impl NetworkConfig {
         &self,
         upstream: &UpstreamConfig,
         max_tcp_flows: usize,
+        max_pending_tcp_bytes: usize,
+        max_retained_tcp_bytes: usize,
+        tcp_receive_buffer_bytes: usize,
+        tcp_send_buffer_bytes: usize,
     ) -> yayatht_dataplane::reactor::Config {
         yayatht_dataplane::reactor::Config {
             target_mac: self.target_mac,
@@ -81,6 +85,10 @@ impl NetworkConfig {
                 },
             },
             max_tcp_flows,
+            max_pending_tcp_bytes,
+            max_retained_tcp_bytes,
+            tcp_receive_buffer_bytes,
+            tcp_send_buffer_bytes,
         }
     }
 }
@@ -93,6 +101,10 @@ pub struct LaunchConfig {
     pub network: NetworkConfig,
     pub upstream: UpstreamConfig,
     pub max_tcp_flows: usize,
+    pub max_pending_tcp_bytes: usize,
+    pub max_retained_tcp_bytes: usize,
+    pub tcp_receive_buffer_bytes: usize,
+    pub tcp_send_buffer_bytes: usize,
 }
 
 #[derive(Debug, Error)]
@@ -103,6 +115,10 @@ pub enum ConfigError {
     NoIpFamily,
     #[error("max_tcp_flows must be between 1 and 1048576")]
     InvalidFlowLimit,
+    #[error("global TCP byte limits must be between 16384 and 1 TiB")]
+    InvalidGlobalByteLimit,
+    #[error("per-flow TCP socket buffers must be between 16384 and 16 MiB")]
+    InvalidSocketBufferLimit,
     #[error("instance name must match [A-Za-z0-9_.-]+")]
     InvalidName,
 }
@@ -117,6 +133,16 @@ impl LaunchConfig {
         }
         if !(1..=1_048_576).contains(&self.max_tcp_flows) {
             return Err(ConfigError::InvalidFlowLimit);
+        }
+        if !(16 * 1024..=1024usize.pow(4)).contains(&self.max_pending_tcp_bytes)
+            || !(16 * 1024..=1024usize.pow(4)).contains(&self.max_retained_tcp_bytes)
+        {
+            return Err(ConfigError::InvalidGlobalByteLimit);
+        }
+        if !(16 * 1024..=16 * 1024 * 1024).contains(&self.tcp_receive_buffer_bytes)
+            || !(16 * 1024..=16 * 1024 * 1024).contains(&self.tcp_send_buffer_bytes)
+        {
+            return Err(ConfigError::InvalidSocketBufferLimit);
         }
         if let Some(name) = &self.name
             && (name.is_empty()

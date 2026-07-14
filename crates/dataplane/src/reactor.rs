@@ -1,6 +1,7 @@
 use crate::buffer::{BufferPool, FRAME_CAPACITY, FrameBuffer};
 use crate::flow_table::{EpollToken, FlowId, FlowTable, Resource};
 use getrandom::fill as random_fill;
+use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -58,9 +59,13 @@ pub struct Config {
     pub gateway_ipv6: Option<Ipv6Addr>,
     pub upstream: Upstream,
     pub max_tcp_flows: usize,
+    pub max_pending_tcp_bytes: usize,
+    pub max_retained_tcp_bytes: usize,
+    pub tcp_receive_buffer_bytes: usize,
+    pub tcp_send_buffer_bytes: usize,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Serialize)]
 pub struct Metrics {
     pub tap_rx_packets: u64,
     pub tap_tx_packets: u64,
@@ -79,6 +84,27 @@ pub struct Metrics {
     pub conservative_ack_flows: u64,
     pub send_window_flows: u64,
     pub fixed_send_window_flows: u64,
+    pub active_tcp_flows: u64,
+    pub peak_tcp_flows: u64,
+    pub pending_tcp_bytes: u64,
+    pub peak_pending_tcp_bytes: u64,
+    pub max_pending_tcp_bytes: u64,
+    pub retained_tcp_bytes: u64,
+    pub peak_retained_tcp_bytes: u64,
+    pub max_retained_tcp_bytes: u64,
+    pub pending_limit_hits: u64,
+    pub retained_limit_hits: u64,
+    pub pending_high_water_events: u64,
+    pub frame_pool_exhaustions: u64,
+    pub zero_window_events: u64,
+    pub zero_window_flows: u64,
+    pub peak_zero_window_flows: u64,
+    pub socket_receive_buffer_bytes: u64,
+    pub peak_socket_receive_buffer_bytes: u64,
+    pub socket_send_buffer_bytes: u64,
+    pub peak_socket_send_buffer_bytes: u64,
+    pub max_socket_buffer_bytes: u64,
+    pub flow_fd_limit: u64,
 }
 
 #[derive(Debug, Error)]
@@ -106,6 +132,8 @@ struct FlowEntry {
     peek_offset_supported: bool,
     bytes_acked_supported: bool,
     send_window_supported: bool,
+    socket_receive_buffer_bytes: usize,
+    socket_send_buffer_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -159,9 +187,9 @@ impl PendingSocketQueue {
         self.chunks.front().map(Vec::as_slice)
     }
 
-    fn consume(&mut self, length: usize) {
+    fn consume(&mut self, length: usize) -> usize {
         let Some(front) = self.chunks.front_mut() else {
-            return;
+            return 0;
         };
         let length = length.min(front.len());
         front.drain(..length);
@@ -169,6 +197,7 @@ impl PendingSocketQueue {
         if front.is_empty() {
             self.chunks.pop_front();
         }
+        length
     }
 
     fn is_empty(&self) -> bool {
@@ -177,6 +206,10 @@ impl PendingSocketQueue {
 
     fn remaining(&self) -> usize {
         self.limit.saturating_sub(self.bytes)
+    }
+
+    fn len(&self) -> usize {
+        self.bytes
     }
 }
 
@@ -239,6 +272,7 @@ struct QueuedFrame {
     flow: Option<FlowId>,
     frame: PooledFrame,
     plan: Option<SendPlan>,
+    reserved_retained: usize,
 }
 
 struct PooledFrame {
@@ -275,6 +309,10 @@ pub struct Reactor {
     metrics: Metrics,
     shutting_down: bool,
     test_drop_tcp_data: usize,
+    pending_socket_bytes: usize,
+    retained_socket_bytes: usize,
+    pending_pressure: bool,
+    pending_pressure_dirty: bool,
 }
 
 impl Reactor {
@@ -297,6 +335,22 @@ impl Reactor {
             EpollToken::global(Resource::Control).raw(),
         )?;
         let max_tcp_flows = config.max_tcp_flows;
+        let metrics = Metrics {
+            max_pending_tcp_bytes: config.max_pending_tcp_bytes as u64,
+            max_retained_tcp_bytes: config.max_retained_tcp_bytes as u64,
+            flow_fd_limit: yayatht_sys::resource::dataplane_nofile_limit(max_tcp_flows)?,
+            max_socket_buffer_bytes: u64::try_from(max_tcp_flows)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(
+                    u64::try_from(
+                        config
+                            .tcp_receive_buffer_bytes
+                            .saturating_add(config.tcp_send_buffer_bytes),
+                    )
+                    .unwrap_or(u64::MAX),
+                ),
+            ..Metrics::default()
+        };
         Ok(Self {
             config,
             tap,
@@ -307,9 +361,13 @@ impl Reactor {
             by_key: HashMap::with_capacity(max_tcp_flows),
             frame_pool: BufferPool::new(TAP_FRAME_POOL_SIZE),
             tap_queue: VecDeque::new(),
-            metrics: Metrics::default(),
+            metrics,
             shutting_down: false,
             test_drop_tcp_data: test_drop_tcp_data_count(),
+            pending_socket_bytes: 0,
+            retained_socket_bytes: 0,
+            pending_pressure: false,
+            pending_pressure_dirty: false,
         })
     }
 
@@ -341,6 +399,7 @@ impl Reactor {
                     _ => {}
                 }
             }
+            self.apply_pending_pressure()?;
             self.cleanup_closed();
             if self.shutting_down {
                 for id in self.flows.active_ids() {
@@ -352,12 +411,23 @@ impl Reactor {
     }
 
     fn handle_control(&mut self) -> Result<(), Error> {
-        let mut message = [0u8; 64];
+        let mut message = [0u8; yayatht_sys::control::MAX_PAYLOAD + 20];
         match yayatht_sys::fdpass::recv_packet(self.control.as_raw_fd(), &mut message) {
             Ok(length) => {
                 let message = yayatht_sys::control::decode(&message[..length])?;
-                if message.kind == yayatht_sys::control::Kind::Shutdown {
-                    self.shutting_down = true;
+                match message.kind {
+                    yayatht_sys::control::Kind::Shutdown => self.shutting_down = true,
+                    yayatht_sys::control::Kind::Status => {
+                        let payload = serde_json::to_vec(&self.metrics)
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                        let response = yayatht_sys::control::encode(
+                            yayatht_sys::control::Kind::Status,
+                            message.request_id,
+                            &payload,
+                        )?;
+                        yayatht_sys::fdpass::send_packet(self.control.as_raw_fd(), &response)?;
+                    }
+                    _ => {}
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
@@ -370,6 +440,7 @@ impl Reactor {
     fn handle_tap(&mut self) -> Result<(), Error> {
         for _ in 0..TAP_BUDGET {
             if self.frame_pool.available() == 0 {
+                self.note_frame_pool_exhaustion();
                 self.update_tap_interest()?;
                 break;
             }
@@ -502,7 +573,11 @@ impl Reactor {
             return Ok(());
         }
         let (target_interface, transport_peer) = self.route_target(key.target);
-        let (socket, connected) = match yayatht_sys::socket::connect_nonblocking(transport_peer) {
+        let (socket, connected) = match yayatht_sys::socket::connect_nonblocking(
+            transport_peer,
+            self.config.tcp_receive_buffer_bytes,
+            self.config.tcp_send_buffer_bytes,
+        ) {
             Ok(result) => result,
             Err(_) => {
                 let frame = self.build_reset(key, segment.sequence().wrapping_add(1))?;
@@ -516,6 +591,8 @@ impl Reactor {
             logical_peer: key.target,
             transport_peer,
         };
+        let (socket_receive_buffer_bytes, socket_send_buffer_bytes) =
+            yayatht_sys::socket::socket_buffer_sizes(socket.as_raw_fd())?;
         let mut random = [0u8; 4];
         random_fill(&mut random)
             .map_err(|error| io::Error::other(format!("getrandom failed: {error:?}")))?;
@@ -559,6 +636,8 @@ impl Reactor {
             peek_offset_supported: false,
             bytes_acked_supported: false,
             send_window_supported: false,
+            socket_receive_buffer_bytes,
+            socket_send_buffer_bytes,
         };
         let id = match self.flows.insert(entry) {
             Ok(id) => id,
@@ -569,6 +648,21 @@ impl Reactor {
             }
         };
         self.by_key.insert(key, id);
+        self.metrics.active_tcp_flows += 1;
+        self.metrics.peak_tcp_flows = self
+            .metrics
+            .peak_tcp_flows
+            .max(self.metrics.active_tcp_flows);
+        self.metrics.socket_receive_buffer_bytes += socket_receive_buffer_bytes as u64;
+        self.metrics.peak_socket_receive_buffer_bytes = self
+            .metrics
+            .peak_socket_receive_buffer_bytes
+            .max(self.metrics.socket_receive_buffer_bytes);
+        self.metrics.socket_send_buffer_bytes += socket_send_buffer_bytes as u64;
+        self.metrics.peak_socket_send_buffer_bytes = self
+            .metrics
+            .peak_socket_send_buffer_bytes
+            .max(self.metrics.socket_send_buffer_bytes);
         let token = EpollToken::flow(id, Resource::UpstreamSocket, true)
             .ok_or(Error::Invariant("unable to encode flow token"))?;
         let fd = self
@@ -653,6 +747,7 @@ impl Reactor {
                 if discarded != acked {
                     return Err(Error::Invariant("socket ACK consume length mismatch"));
                 }
+                self.release_retained_bytes(acked);
             }
             let segments = &mut self.flows.get_mut(id).expect("flow exists").sent_segments;
             while segments
@@ -664,8 +759,8 @@ impl Reactor {
         }
         match disposition {
             ReceiveDisposition::InOrder { payload_len, fin } => {
-                if payload_len > 0 {
-                    self.submit_namespace_payload(id, segment.payload())?;
+                if payload_len > 0 && !self.submit_namespace_payload(id, segment.payload())? {
+                    return Ok(());
                 }
                 if fin {
                     let entry = self.flows.get_mut(id).expect("flow exists");
@@ -694,7 +789,7 @@ impl Reactor {
         Ok(())
     }
 
-    fn submit_namespace_payload(&mut self, id: FlowId, payload: &[u8]) -> Result<(), Error> {
+    fn submit_namespace_payload(&mut self, id: FlowId, payload: &[u8]) -> Result<bool, Error> {
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         match yayatht_sys::socket::send(fd, payload) {
             Ok(sent) => {
@@ -703,26 +798,78 @@ impl Reactor {
                     .expect("flow exists")
                     .flow
                     .record_upstream_submitted(sent);
-                if sent < payload.len() {
-                    self.flows
-                        .get_mut(id)
-                        .expect("flow exists")
-                        .pending_socket
-                        .push(&payload[sent..])
-                        .map_err(|()| Error::Invariant("pending socket queue exceeded limit"))?;
+                if sent < payload.len() && !self.enqueue_pending_payload(id, &payload[sent..])? {
+                    return Ok(false);
                 }
             }
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                self.flows
-                    .get_mut(id)
-                    .expect("flow exists")
-                    .pending_socket
-                    .push(payload)
-                    .map_err(|()| Error::Invariant("pending socket queue exceeded limit"))?;
+                if !self.enqueue_pending_payload(id, payload)? {
+                    return Ok(false);
+                }
             }
             Err(error) => return Err(error.into()),
         }
-        Ok(())
+        Ok(true)
+    }
+
+    fn enqueue_pending_payload(&mut self, id: FlowId, payload: &[u8]) -> Result<bool, Error> {
+        let flow_remaining = self
+            .flows
+            .get(id)
+            .expect("flow exists")
+            .pending_socket
+            .remaining();
+        let global_remaining = self
+            .config
+            .max_pending_tcp_bytes
+            .saturating_sub(self.pending_socket_bytes);
+        if payload.len() > flow_remaining || payload.len() > global_remaining {
+            self.metrics.pending_limit_hits += 1;
+            self.fail_tcp_flow(id, "TCP pending payload limit reached")?;
+            return Ok(false);
+        }
+        self.flows
+            .get_mut(id)
+            .expect("flow exists")
+            .pending_socket
+            .push(payload)
+            .map_err(|()| Error::Invariant("pending socket accounting mismatch"))?;
+        self.pending_socket_bytes += payload.len();
+        self.metrics.pending_tcp_bytes = self.pending_socket_bytes as u64;
+        self.metrics.peak_pending_tcp_bytes = self
+            .metrics
+            .peak_pending_tcp_bytes
+            .max(self.metrics.pending_tcp_bytes);
+        self.update_pending_pressure_state();
+        Ok(true)
+    }
+
+    fn consume_pending_payload(&mut self, id: FlowId, length: usize) -> usize {
+        let consumed = self
+            .flows
+            .get_mut(id)
+            .expect("flow exists")
+            .pending_socket
+            .consume(length);
+        self.pending_socket_bytes = self.pending_socket_bytes.saturating_sub(consumed);
+        self.metrics.pending_tcp_bytes = self.pending_socket_bytes as u64;
+        self.update_pending_pressure_state();
+        consumed
+    }
+
+    fn update_pending_pressure_state(&mut self) {
+        let pressured = pending_pressure_state(
+            self.pending_pressure,
+            self.pending_socket_bytes,
+            self.config.max_pending_tcp_bytes,
+        );
+        if pressured != self.pending_pressure {
+            self.pending_pressure = pressured;
+            self.pending_pressure_dirty = true;
+            if pressured {
+                self.metrics.pending_high_water_events += 1;
+            }
+        }
     }
 
     fn handle_socket(&mut self, id: FlowId, events: u32) -> Result<(), Error> {
@@ -1011,9 +1158,12 @@ impl Reactor {
                     return Err(Error::Invariant("socket queue send returned zero"));
                 }
                 Ok(sent) => {
-                    let entry = self.flows.get_mut(id).expect("flow exists");
-                    entry.pending_socket.consume(sent);
-                    entry.flow.record_upstream_submitted(sent);
+                    self.consume_pending_payload(id, sent);
+                    self.flows
+                        .get_mut(id)
+                        .expect("flow exists")
+                        .flow
+                        .record_upstream_submitted(sent);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.into()),
@@ -1076,6 +1226,13 @@ impl Reactor {
         let socket_available = yayatht_sys::socket::send_buffer_available(fd)?;
         let entry = self.flows.get(id).expect("flow exists");
         let queue_available = entry.pending_socket.remaining();
+        let global_available = if self.pending_pressure {
+            0
+        } else {
+            self.config
+                .max_pending_tcp_bytes
+                .saturating_sub(self.pending_socket_bytes)
+        };
         let kernel_window = if entry.send_window_supported {
             send_window.map_or(0, |window| window as usize)
         } else {
@@ -1088,6 +1245,7 @@ impl Reactor {
         };
         let available = socket_available
             .min(queue_available)
+            .min(global_available)
             .min(kernel_window)
             .min(ack_window)
             .min(usize::from(u16::MAX));
@@ -1098,6 +1256,29 @@ impl Reactor {
             .expect("flow exists")
             .flow
             .set_advertised_window(window))
+    }
+
+    fn apply_pending_pressure(&mut self) -> Result<(), Error> {
+        if !self.pending_pressure_dirty {
+            return Ok(());
+        }
+        self.pending_pressure_dirty = false;
+        for id in self.flows.active_ids() {
+            if self.flow_is_closed(id) {
+                continue;
+            }
+            if self.frame_pool.available() == 0 {
+                self.note_frame_pool_exhaustion();
+                self.pending_pressure_dirty = true;
+                break;
+            }
+            let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
+            let info = yayatht_sys::tcp_info::get(fd)?;
+            if self.update_namespace_window(id, info.send_window)? {
+                self.send_ack(id)?;
+            }
+        }
+        Ok(())
     }
 
     fn refresh_window_clamp(&mut self, id: FlowId) -> Result<(), Error> {
@@ -1121,24 +1302,41 @@ impl Reactor {
     }
 
     fn refresh_zero_window_probe(&mut self, id: FlowId, now: Instant) {
-        let entry = self.flows.get_mut(id).expect("flow exists");
-        let should_probe = entry.flow.peer_window() == 0
-            && matches!(
-                entry.flow.state(),
-                State::Established | State::NamespaceFinReceived
-            );
-        if should_probe {
-            entry
-                .zero_window_probe
-                .get_or_insert_with(|| ZeroWindowProbe::new(now));
-        } else {
-            entry.zero_window_probe = None;
+        let transition = {
+            let entry = self.flows.get_mut(id).expect("flow exists");
+            let should_probe = entry.flow.peer_window() == 0
+                && matches!(
+                    entry.flow.state(),
+                    State::Established | State::NamespaceFinReceived
+                );
+            match (entry.zero_window_probe.is_some(), should_probe) {
+                (false, true) => {
+                    entry.zero_window_probe = Some(ZeroWindowProbe::new(now));
+                    1i8
+                }
+                (true, false) => {
+                    entry.zero_window_probe = None;
+                    -1
+                }
+                _ => 0,
+            }
+        };
+        if transition > 0 {
+            self.metrics.zero_window_events += 1;
+            self.metrics.zero_window_flows += 1;
+            self.metrics.peak_zero_window_flows = self
+                .metrics
+                .peak_zero_window_flows
+                .max(self.metrics.zero_window_flows);
+        } else if transition < 0 {
+            self.metrics.zero_window_flows = self.metrics.zero_window_flows.saturating_sub(1);
         }
     }
 
     fn send_socket_data(&mut self, id: FlowId) -> Result<(), Error> {
         for _ in 0..TAP_TX_BUDGET {
             if self.frame_pool.available() == 0 {
+                self.note_frame_pool_exhaustion();
                 break;
             }
             if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
@@ -1160,7 +1358,19 @@ impl Reactor {
             if !matches!(state, State::Established | State::NamespaceFinReceived) || window == 0 {
                 break;
             }
-            match self.peek_socket_frame(id, payload_offset, mss.min(window))? {
+            let retained_available = self
+                .config
+                .max_retained_tcp_bytes
+                .saturating_sub(self.retained_socket_bytes);
+            if retained_available == 0 {
+                self.metrics.retained_limit_hits += 1;
+                break;
+            }
+            match self.peek_socket_frame(
+                id,
+                payload_offset,
+                mss.min(window).min(retained_available),
+            )? {
                 PeekedFrame::Eof => {
                     let plan = self
                         .flows
@@ -1249,6 +1459,7 @@ impl Reactor {
         let now = Instant::now();
         for id in self.flows.active_ids() {
             if self.frame_pool.available() == 0 {
+                self.note_frame_pool_exhaustion();
                 break;
             }
             let retransmit = {
@@ -1633,10 +1844,17 @@ impl Reactor {
     }
 
     fn acquire_frame(&mut self) -> Result<PooledFrame, Error> {
-        self.frame_pool
-            .acquire()
-            .map(|(pool_index, buffer)| PooledFrame { pool_index, buffer })
-            .ok_or(Error::Invariant("TAP frame pool exhausted"))
+        match self.frame_pool.acquire() {
+            Some((pool_index, buffer)) => Ok(PooledFrame { pool_index, buffer }),
+            None => {
+                self.note_frame_pool_exhaustion();
+                Err(Error::Invariant("TAP frame pool exhausted"))
+            }
+        }
+    }
+
+    fn note_frame_pool_exhaustion(&mut self) {
+        self.metrics.frame_pool_exhaustions += 1;
     }
 
     fn release_frame(&mut self, frame: PooledFrame) {
@@ -1740,6 +1958,13 @@ impl Reactor {
         frame: PooledFrame,
         plan: Option<SendPlan>,
     ) -> Result<(), Error> {
+        let reserved_retained = plan.map_or(0, |plan| plan.length);
+        if !self.reserve_retained_bytes(reserved_retained) {
+            self.release_frame(frame);
+            return Err(Error::Invariant(
+                "retained TCP reservation exceeded hard limit",
+            ));
+        }
         if self.tap_queue.is_empty()
             && plan.is_some_and(|plan| plan.length > 0)
             && self.test_drop_tcp_data > 0
@@ -1756,17 +1981,24 @@ impl Reactor {
                     return Ok(());
                 }
                 Ok(_) => {
+                    self.release_retained_bytes(reserved_retained);
                     self.release_frame(frame);
                     return Err(Error::Invariant("short TAP frame write"));
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => {
+                    self.release_retained_bytes(reserved_retained);
                     self.release_frame(frame);
                     return Err(error.into());
                 }
             }
         }
-        self.tap_queue.push_back(QueuedFrame { flow, frame, plan });
+        self.tap_queue.push_back(QueuedFrame {
+            flow,
+            frame,
+            plan,
+            reserved_retained,
+        });
         self.update_tap_interest()?;
         Ok(())
     }
@@ -1782,6 +2014,7 @@ impl Reactor {
                     self.commit_tap_send(frame.flow, frame.frame, frame.plan)?;
                 }
                 Ok(_) => {
+                    self.release_retained_bytes(frame.reserved_retained);
                     self.release_frame(frame.frame);
                     return Err(Error::Invariant("short TAP frame write"));
                 }
@@ -1790,6 +2023,7 @@ impl Reactor {
                     break;
                 }
                 Err(error) => {
+                    self.release_retained_bytes(frame.reserved_retained);
                     self.release_frame(frame.frame);
                     return Err(error.into());
                 }
@@ -1853,11 +2087,44 @@ impl Reactor {
         Ok(())
     }
 
+    fn reserve_retained_bytes(&mut self, length: usize) -> bool {
+        if length
+            > self
+                .config
+                .max_retained_tcp_bytes
+                .saturating_sub(self.retained_socket_bytes)
+        {
+            self.metrics.retained_limit_hits += 1;
+            return false;
+        }
+        self.retained_socket_bytes += length;
+        self.metrics.retained_tcp_bytes = self.retained_socket_bytes as u64;
+        self.metrics.peak_retained_tcp_bytes = self
+            .metrics
+            .peak_retained_tcp_bytes
+            .max(self.metrics.retained_tcp_bytes);
+        true
+    }
+
+    fn release_retained_bytes(&mut self, length: usize) {
+        self.retained_socket_bytes = self.retained_socket_bytes.saturating_sub(length);
+        self.metrics.retained_tcp_bytes = self.retained_socket_bytes as u64;
+    }
+
     fn close_flow(&mut self, id: FlowId) -> Result<(), Error> {
         let Some(entry) = self.flows.get(id) else {
             return Ok(());
         };
         let fd = entry.socket.as_raw_fd();
+        let pending_socket_bytes = entry.pending_socket.len();
+        let retained_socket_bytes = entry
+            .sent_segments
+            .iter()
+            .map(|segment| segment.payload_len)
+            .sum::<usize>();
+        let socket_receive_buffer_bytes = entry.socket_receive_buffer_bytes;
+        let socket_send_buffer_bytes = entry.socket_send_buffer_bytes;
+        let had_zero_window = entry.zero_window_probe.is_some();
         let key = entry
             .construction
             .active_sides()
@@ -1868,12 +2135,31 @@ impl Reactor {
         let mut retained = VecDeque::with_capacity(self.tap_queue.len());
         while let Some(frame) = self.tap_queue.pop_front() {
             if frame.flow == Some(id) {
+                self.release_retained_bytes(frame.reserved_retained);
                 self.release_frame(frame.frame);
             } else {
                 retained.push_back(frame);
             }
         }
         self.tap_queue = retained;
+        self.pending_socket_bytes = self
+            .pending_socket_bytes
+            .saturating_sub(pending_socket_bytes);
+        self.metrics.pending_tcp_bytes = self.pending_socket_bytes as u64;
+        self.update_pending_pressure_state();
+        self.release_retained_bytes(retained_socket_bytes);
+        self.metrics.active_tcp_flows = self.metrics.active_tcp_flows.saturating_sub(1);
+        self.metrics.socket_receive_buffer_bytes = self
+            .metrics
+            .socket_receive_buffer_bytes
+            .saturating_sub(socket_receive_buffer_bytes as u64);
+        self.metrics.socket_send_buffer_bytes = self
+            .metrics
+            .socket_send_buffer_bytes
+            .saturating_sub(socket_send_buffer_bytes as u64);
+        if had_zero_window {
+            self.metrics.zero_window_flows = self.metrics.zero_window_flows.saturating_sub(1);
+        }
         self.update_tap_interest()?;
         self.flows.get_mut(id).expect("flow exists").flow.close();
         self.flows.defer_remove(id);
@@ -1911,6 +2197,12 @@ fn test_capability_disabled(name: &str) -> bool {
         let _ = name;
         false
     }
+}
+
+fn pending_pressure_state(current: bool, bytes: usize, limit: usize) -> bool {
+    let high = limit.saturating_mul(7) / 8;
+    let low = limit.saturating_mul(3) / 4;
+    if current { bytes > low } else { bytes >= high }
 }
 
 pub fn run(config: Config, tap: OwnedFd, control: OwnedFd) -> Result<Metrics, Error> {
@@ -1982,5 +2274,14 @@ mod tests {
         probe.advance(now);
         assert_eq!(probe.interval, ZERO_WINDOW_PROBE_MAX);
         assert_eq!(probe.deadline, now + ZERO_WINDOW_PROBE_MAX);
+    }
+
+    #[test]
+    fn pending_pressure_uses_high_and_low_watermarks() {
+        let limit = 1024;
+        assert!(!pending_pressure_state(false, 895, limit));
+        assert!(pending_pressure_state(false, 896, limit));
+        assert!(pending_pressure_state(true, 769, limit));
+        assert!(!pending_pressure_state(true, 768, limit));
     }
 }

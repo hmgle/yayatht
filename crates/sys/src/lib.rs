@@ -8,6 +8,7 @@ pub mod mount;
 pub mod netlink;
 pub mod process;
 pub mod reactor;
+pub mod resource;
 pub mod signal;
 pub mod socket;
 pub mod tcp_info;

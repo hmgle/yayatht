@@ -69,6 +69,14 @@ struct RunArgs {
     runtime_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 4096)]
     max_tcp_flows: usize,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_pending_tcp_bytes: usize,
+    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    max_retained_tcp_bytes: usize,
+    #[arg(long, default_value_t = 256 * 1024)]
+    tcp_receive_buffer_bytes: usize,
+    #[arg(long, default_value_t = 256 * 1024)]
+    tcp_send_buffer_bytes: usize,
     #[arg(long)]
     no_ipv4: bool,
     #[arg(long)]
@@ -160,6 +168,10 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         network: NetworkConfig::synthetic(!args.no_ipv4, !args.no_ipv6),
         upstream,
         max_tcp_flows: args.max_tcp_flows,
+        max_pending_tcp_bytes: args.max_pending_tcp_bytes,
+        max_retained_tcp_bytes: args.max_retained_tcp_bytes,
+        tcp_receive_buffer_bytes: args.tcp_receive_buffer_bytes,
+        tcp_send_buffer_bytes: args.tcp_send_buffer_bytes,
     };
     Ok(Supervisor::run(config)?.code)
 }

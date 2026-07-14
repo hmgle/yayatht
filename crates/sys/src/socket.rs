@@ -41,7 +41,11 @@ fn socket_address(address: SocketAddr) -> (libc::sockaddr_storage, libc::socklen
     }
 }
 
-pub fn connect_nonblocking(address: SocketAddr) -> io::Result<(OwnedFd, bool)> {
+pub fn connect_nonblocking(
+    address: SocketAddr,
+    receive_buffer_bytes: usize,
+    send_buffer_bytes: usize,
+) -> io::Result<(OwnedFd, bool)> {
     let family = if address.is_ipv4() {
         libc::AF_INET
     } else {
@@ -60,6 +64,8 @@ pub fn connect_nonblocking(address: SocketAddr) -> io::Result<(OwnedFd, bool)> {
     }
     // SAFETY: raw is a newly owned descriptor.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    set_buffer_quota(fd.as_raw_fd(), libc::SO_RCVBUF, receive_buffer_bytes)?;
+    set_buffer_quota(fd.as_raw_fd(), libc::SO_SNDBUF, send_buffer_bytes)?;
     let (storage, len) = socket_address(address);
     // SAFETY: storage contains the matching sockaddr variant.
     let result = unsafe { libc::connect(fd.as_raw_fd(), std::ptr::from_ref(&storage).cast(), len) };
@@ -72,6 +78,61 @@ pub fn connect_nonblocking(address: SocketAddr) -> io::Result<(OwnedFd, bool)> {
     } else {
         Err(error)
     }
+}
+
+fn set_buffer_quota(fd: RawFd, option: i32, quota: usize) -> io::Result<()> {
+    let requested = i32::try_from(quota / 2).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "socket buffer quota exceeds i32",
+        )
+    })?;
+    // SAFETY: requested points to a valid c_int socket option value.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::from_ref(&requested).cast(),
+            size_of::<i32>() as libc::socklen_t,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let actual = socket_buffer_size(fd, option)?;
+    if actual > quota {
+        return Err(io::Error::other(format!(
+            "kernel socket buffer {actual} exceeds configured quota {quota}"
+        )));
+    }
+    Ok(())
+}
+
+fn socket_buffer_size(fd: RawFd, option: i32) -> io::Result<usize> {
+    let mut value = 0i32;
+    let mut len = size_of::<i32>() as libc::socklen_t;
+    // SAFETY: value and len are valid getsockopt output storage.
+    if unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::from_mut(&mut value).cast(),
+            std::ptr::from_mut(&mut len),
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(usize::try_from(value.max(0)).unwrap_or(usize::MAX))
+}
+
+pub fn socket_buffer_sizes(fd: RawFd) -> io::Result<(usize, usize)> {
+    Ok((
+        socket_buffer_size(fd, libc::SO_RCVBUF)?,
+        socket_buffer_size(fd, libc::SO_SNDBUF)?,
+    ))
 }
 
 pub fn pending_error(fd: RawFd) -> io::Result<Option<i32>> {
