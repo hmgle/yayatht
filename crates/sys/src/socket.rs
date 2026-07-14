@@ -66,6 +66,7 @@ pub fn connect_nonblocking(
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     set_buffer_quota(fd.as_raw_fd(), libc::SO_RCVBUF, receive_buffer_bytes)?;
     set_buffer_quota(fd.as_raw_fd(), libc::SO_SNDBUF, send_buffer_bytes)?;
+    set_nodelay(fd.as_raw_fd())?;
     let (storage, len) = socket_address(address);
     // SAFETY: storage contains the matching sockaddr variant.
     let result = unsafe { libc::connect(fd.as_raw_fd(), std::ptr::from_ref(&storage).cast(), len) };
@@ -78,6 +79,24 @@ pub fn connect_nonblocking(
     } else {
         Err(error)
     }
+}
+
+fn set_nodelay(fd: RawFd) -> io::Result<()> {
+    let enabled = 1i32;
+    // SAFETY: enabled points to a valid c_int TCP_NODELAY option value.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY,
+            std::ptr::from_ref(&enabled).cast(),
+            size_of::<i32>() as libc::socklen_t,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn set_buffer_quota(fd: RawFd, option: i32, quota: usize) -> io::Result<()> {
@@ -355,6 +374,29 @@ mod tests {
             local_address(stream.as_raw_fd()).unwrap(),
             stream.local_addr().unwrap()
         );
+    }
+
+    #[test]
+    fn forwarding_socket_disables_nagle() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (socket, _) =
+            connect_nonblocking(listener.local_addr().unwrap(), 256 << 10, 256 << 10).unwrap();
+        let mut enabled = 0i32;
+        let mut length = size_of::<i32>() as libc::socklen_t;
+        // SAFETY: enabled and length are valid getsockopt output storage.
+        assert_eq!(
+            unsafe {
+                libc::getsockopt(
+                    socket.as_raw_fd(),
+                    libc::IPPROTO_TCP,
+                    libc::TCP_NODELAY,
+                    std::ptr::from_mut(&mut enabled).cast(),
+                    std::ptr::from_mut(&mut length),
+                )
+            },
+            0
+        );
+        assert_eq!(enabled, 1);
     }
 
     #[test]
