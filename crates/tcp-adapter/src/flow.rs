@@ -170,8 +170,10 @@ pub struct Flow {
     local_initial: u32,
     local_unacked: u32,
     local_next: u32,
-    peer_window: u16,
-    advertised_window: u16,
+    peer_window: u32,
+    peer_window_shift: u8,
+    advertised_window: u32,
+    local_window_shift: u8,
     mss: u16,
     upstream_ack_baseline: u64,
     upstream_submitted: u64,
@@ -183,7 +185,13 @@ pub struct Flow {
 
 impl Flow {
     #[must_use]
-    pub fn new(namespace_initial: u32, local_initial: u32, mss: u16) -> Self {
+    pub fn new(
+        namespace_initial: u32,
+        local_initial: u32,
+        mss: u16,
+        peer_window_shift: u8,
+        local_window_shift: u8,
+    ) -> Self {
         Self {
             state: State::Connecting,
             namespace_initial,
@@ -192,8 +200,10 @@ impl Flow {
             local_initial,
             local_unacked: local_initial,
             local_next: local_initial,
-            peer_window: u16::MAX,
-            advertised_window: u16::MAX,
+            peer_window: u32::from(u16::MAX),
+            peer_window_shift,
+            advertised_window: u32::from(u16::MAX),
+            local_window_shift,
             mss,
             upstream_ack_baseline: 0,
             upstream_submitted: 0,
@@ -230,21 +240,45 @@ impl Flow {
     }
 
     #[must_use]
-    pub const fn peer_window(&self) -> u16 {
+    pub const fn peer_window(&self) -> u32 {
         self.peer_window
     }
 
     #[must_use]
-    pub const fn advertised_window(&self) -> u16 {
+    pub const fn advertised_window(&self) -> u32 {
         self.advertised_window
     }
 
-    pub fn set_advertised_window(&mut self, window: u16) -> bool {
+    #[must_use]
+    pub const fn local_window_shift(&self) -> u8 {
+        self.local_window_shift
+    }
+
+    /// Largest window value expressible on the wire with the local shift.
+    #[must_use]
+    pub const fn max_advertised_window(&self) -> u32 {
+        (u16::MAX as u32) << self.local_window_shift
+    }
+
+    /// On-wire window field. SYN segments carry an unscaled window.
+    #[must_use]
+    pub fn window_field(&self, syn: bool) -> u16 {
+        let scaled = if syn {
+            self.advertised_window
+        } else {
+            self.advertised_window >> self.local_window_shift
+        };
+        u16::try_from(scaled).unwrap_or(u16::MAX)
+    }
+
+    pub fn set_advertised_window(&mut self, window: u32) -> bool {
+        let window = window.min(self.max_advertised_window());
         if self.advertised_window == window {
             return false;
         }
+        let previous_field = self.window_field(false);
         self.advertised_window = window;
-        true
+        self.window_field(false) != previous_field
     }
 
     #[must_use]
@@ -285,7 +319,7 @@ impl Flow {
             self.state = State::Closed;
             return ReceiveDisposition::Reset;
         }
-        self.peer_window = window;
+        self.peer_window = u32::from(window) << self.peer_window_shift;
         if let Some(ack) = acknowledgment {
             self.acknowledge_local(ack);
             if self.state == State::SynReceived && ack == self.local_initial.wrapping_add(1) {
@@ -299,7 +333,7 @@ impl Flow {
                 ReceiveDisposition::OutOfOrder
             };
         }
-        if payload_len > usize::from(self.advertised_window) {
+        if payload_len > self.advertised_window as usize {
             return ReceiveDisposition::OutsideWindow;
         }
         if payload_len == 0 && !fin {
@@ -312,7 +346,7 @@ impl Flow {
             return ReceiveDisposition::Invalid;
         };
         self.namespace_next = self.namespace_next.wrapping_add(length);
-        self.advertised_window = self.advertised_window.saturating_sub(length as u16);
+        self.advertised_window = self.advertised_window.saturating_sub(length);
         if fin {
             self.namespace_next = self.namespace_next.wrapping_add(1);
             self.namespace_fin = true;
@@ -433,7 +467,31 @@ mod tests {
     use super::*;
 
     fn flow() -> Flow {
-        Flow::new(u32::MAX - 4, 100, 1460)
+        Flow::new(u32::MAX - 4, 100, 1460, 0, 0)
+    }
+
+    #[test]
+    fn scaled_peer_window_widens_send_budget() {
+        let mut flow = Flow::new(1000, 100, 1460, 7, 0);
+        flow.socket_connected(0);
+        // Peer advertises 1000 with shift 7 -> 128000 bytes of send budget.
+        flow.receive(1001, Some(101), 1000, 0, false, false);
+        assert_eq!(flow.peer_window(), 128_000);
+        assert_eq!(flow.available_namespace_window(), 128_000);
+    }
+
+    #[test]
+    fn advertised_window_scales_onto_wire_field() {
+        let mut flow = Flow::new(1000, 100, 1460, 0, 7);
+        // Advertise a window larger than u16::MAX; on-wire field is shifted down.
+        assert!(flow.set_advertised_window(256 * 1024));
+        assert_eq!(flow.advertised_window(), 256 * 1024);
+        assert_eq!(
+            flow.window_field(false),
+            u16::try_from((256 * 1024) >> 7).unwrap()
+        );
+        // SYN segments carry the unscaled window, clamped to u16.
+        assert_eq!(flow.window_field(true), u16::MAX);
     }
 
     #[test]

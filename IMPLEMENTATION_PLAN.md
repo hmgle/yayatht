@@ -20,7 +20,7 @@ advertised window past u16.
 **Success Criteria**: `available_namespace_window` uses scaled peer window;
 on-wire window field derived via local shift.
 **Tests**: flow unit tests for scaled receive/advertise paths.
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 3: Negotiate window scaling in the reactor
 

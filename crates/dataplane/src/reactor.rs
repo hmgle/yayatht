@@ -132,7 +132,7 @@ struct FlowEntry {
     pending_socket: PendingSocketQueue,
     pending_shutdown: bool,
     sent_segments: VecDeque<SentSegment>,
-    upstream_window_clamp: Option<u16>,
+    upstream_window_clamp: Option<u32>,
     zero_window_probe: Option<ZeroWindowProbe>,
     last_namespace_byte: Option<u8>,
     peek_offset_supported: bool,
@@ -651,6 +651,8 @@ impl Reactor {
                 self.test_local_isn
                     .unwrap_or_else(|| u32::from_ne_bytes(random)),
                 negotiated_mss,
+                0,
+                0,
             ),
             construction,
             socket,
@@ -1268,7 +1270,7 @@ impl Reactor {
             FALLBACK_SEND_WINDOW
         };
         let ack_window = if entry.bytes_acked_supported {
-            usize::from(u16::MAX)
+            entry.flow.max_advertised_window() as usize
         } else {
             FALLBACK_ACK_WINDOW
         };
@@ -1276,9 +1278,8 @@ impl Reactor {
             .min(queue_available)
             .min(global_available)
             .min(kernel_window)
-            .min(ack_window)
-            .min(usize::from(u16::MAX));
-        let window = u16::try_from(available).expect("window clamped to u16");
+            .min(ack_window);
+        let window = u32::try_from(available).unwrap_or(u32::MAX);
         Ok(self
             .flows
             .get_mut(id)
@@ -1322,7 +1323,7 @@ impl Reactor {
         if previous == Some(window) {
             return Ok(());
         }
-        yayatht_sys::tcp_info::set_window_clamp(fd, u32::from(window).max(1))?;
+        yayatht_sys::tcp_info::set_window_clamp(fd, window.max(1))?;
         self.flows
             .get_mut(id)
             .expect("flow exists")
@@ -1774,7 +1775,7 @@ impl Reactor {
         }
     }
 
-    fn flow_frame_parameters(&self, id: FlowId) -> Result<(FlowKey, u16, u16), Error> {
+    fn flow_frame_parameters(&self, id: FlowId, syn: bool) -> Result<(FlowKey, u16, u16), Error> {
         let entry = self
             .flows
             .get(id)
@@ -1791,7 +1792,7 @@ impl Reactor {
                 .expect("active construction checked")
                 .namespace_key(),
             entry.flow.mss(),
-            entry.flow.advertised_window(),
+            entry.flow.window_field(syn),
         ))
     }
 
@@ -1803,7 +1804,7 @@ impl Reactor {
         flags: TcpFlags,
         payload_len: usize,
     ) -> Result<PooledFrame, Error> {
-        let (key, _, window) = match self.flow_frame_parameters(id) {
+        let (key, _, window) = match self.flow_frame_parameters(id, false) {
             Ok(parameters) => parameters,
             Err(error) => {
                 self.release_frame(frame);
@@ -1832,7 +1833,7 @@ impl Reactor {
         payload: &[u8],
         flags: TcpFlags,
     ) -> Result<PooledFrame, Error> {
-        let (key, mss, window) = self.flow_frame_parameters(id)?;
+        let (key, mss, window) = self.flow_frame_parameters(id, flags.syn)?;
         self.build_tcp_frame(key, plan, payload, flags, flags.syn.then_some(mss), window)
     }
 
