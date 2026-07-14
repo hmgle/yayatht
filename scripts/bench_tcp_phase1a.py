@@ -321,8 +321,7 @@ def backend_command(
         proxy_type = "http" if protocol == "http" else "socks5"
         command = [
             str(backend.executable),
-            "-c",
-            str(proxy_ns_config),
+            "-q",
             "-f",
             "-4",
             "-m",
@@ -358,6 +357,8 @@ def backend_command(
         command = [
             str(backend.executable),
             "-q",
+            "-c",
+            str(proxy_ns_config),
             "--tun-name=yaybench0",
             "--tun-ip=10.79.0.1/24",
             f"--socks5-address={proxy}",
