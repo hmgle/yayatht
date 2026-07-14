@@ -82,6 +82,10 @@ post-fix matrices used one warmup followed by three measured passes; the
 single-flow short-transfer check used one warmup and five measured passes.
 These are calibration results, not publication-quality statistics.
 
+The fresh same-host comparison against official pasta, proxy-dev pasta,
+nsproxy, and proxy-ns is recorded in
+`docs/phase1a-performance-comparison-2026-07-14.md`.
+
 ## Direct adapter gate
 
 The existing 128 MiB single-flow test was repeated twice after resource limits
