@@ -96,7 +96,7 @@ pub struct Metrics {
     pub bytes_acked_flows: u64,
     pub conservative_ack_flows: u64,
     pub send_window_flows: u64,
-    pub fixed_send_window_flows: u64,
+    pub send_window_unavailable_flows: u64,
     pub tx_ack_timestamp_flows: u64,
     pub tx_ack_poll_flows: u64,
     pub active_tcp_flows: u64,
@@ -1165,12 +1165,15 @@ impl Reactor {
         } else {
             self.metrics.conservative_ack_flows += 1;
         }
+        // tcpi_snd_wnd no longer feeds the namespace window computation, so
+        // its absence is recorded for observability but is not a degraded
+        // data path and must not raise the degraded warning.
         if send_window_supported {
             self.metrics.send_window_flows += 1;
         } else {
-            self.metrics.fixed_send_window_flows += 1;
+            self.metrics.send_window_unavailable_flows += 1;
         }
-        if !peek_offset_supported || !bytes_acked_supported || !send_window_supported {
+        if !peek_offset_supported || !bytes_acked_supported {
             self.metrics.degraded_tcp_flows += 1;
             let target = self
                 .flows
@@ -1183,7 +1186,6 @@ impl Reactor {
                 tcp_info_len,
                 so_peek_off = peek_offset_supported,
                 tcpi_bytes_acked = bytes_acked_supported,
-                tcpi_snd_wnd = send_window_supported,
                 "TCP flow is using degraded kernel capability paths"
             );
         }

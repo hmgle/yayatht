@@ -316,6 +316,25 @@ fn degraded_kernel_capabilities_preserve_tcp_echo() {
 }
 
 #[test]
+fn missing_send_window_alone_is_not_reported_as_degraded() {
+    let stderr = echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "send-window-capability",
+        b"yayatht-send-window\n".to_vec(),
+        &[
+            ("YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND", "1"),
+            ("RUST_LOG", "yayatht_dataplane=warn,yayatht=info"),
+        ],
+    );
+    assert!(
+        !stderr.contains("degraded kernel capability paths"),
+        "tcpi_snd_wnd absence alone must not be reported as degraded: {stderr}"
+    );
+}
+
+#[test]
 fn retransmit_recovers_two_dropped_namespace_segments() {
     let payload = (0..32 * 1024)
         .map(|index| (index % 251) as u8)
