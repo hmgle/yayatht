@@ -401,10 +401,13 @@ fn watchdog_advances_upstream_ack_without_event_refreshes() {
         .unwrap();
     read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     // The upstream kernel has acknowledged the full payload once the server
-    // read it; give the 100 ms watchdog a few ticks to observe that.
+    // read it. The fallback tick runs at 10 ms while those bytes are
+    // outstanding, so 400 ms covers dozens of watchdog passes plus the
+    // downshift back to the 100 ms tick once nothing is unacknowledged.
     thread::sleep(Duration::from_millis(400));
     let value = status_json(&name);
     assert_eq!(value["dataplane"]["tx_ack_watchdog_flows"], 1, "{value}");
+    assert_eq!(value["dataplane"]["timer_interval_ms"], 100, "{value}");
     assert!(
         value["dataplane"]["tx_ack_watchdog_advances"]
             .as_u64()
@@ -436,6 +439,92 @@ fn watchdog_advances_upstream_ack_without_event_refreshes() {
         .unwrap();
     assert!(status.success(), "yayatht failed: {stderr}");
     assert_eq!(output.trim(), BYTE_COUNT.to_string(), "{stderr}");
+    server.join().unwrap();
+}
+
+#[test]
+fn fallback_fast_tick_tracks_unacknowledged_bytes() {
+    if !supported() {
+        return;
+    }
+    // 4 MiB overflows the upstream socket buffers while the server refuses
+    // to read (receive autotuning only grows for a consuming reader), so
+    // upstream_unacked stays positive for as long as the server holds.
+    const BYTE_COUNT: usize = 4 * 1024 * 1024;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accept_tx, accept_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (drained_tx, drained_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        accept_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut received = vec![0u8; BYTE_COUNT];
+        stream.read_exact(&mut received).unwrap();
+        drained_tx.send(()).unwrap();
+        // Hold the socket open so the namespace-side sleep below, not a
+        // reset, decides when the child exits.
+        thread::sleep(Duration::from_millis(1500));
+    });
+
+    // The trailing sleep keeps the namespace alive after nc exits so the
+    // post-close timer interval can still be queried over the control
+    // socket.
+    let name = unique_name("fallback-tick");
+    let script = format!(
+        "busybox dd if=/dev/zero bs=65536 count=64 2>/dev/null \
+         | busybox nc -w 8 192.0.2.1 {port}; busybox sleep 2"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .env("YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS", "1")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    accept_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Let the transfer fill the upstream buffers and stall: acknowledged
+    // bytes freeze at what the peer buffered while the send buffer stays
+    // full, so the fast tick must be armed whenever status is sampled.
+    thread::sleep(Duration::from_millis(300));
+    let value = status_json(&name);
+    assert_eq!(value["dataplane"]["tx_ack_watchdog_flows"], 1, "{value}");
+    assert_eq!(value["dataplane"]["timer_interval_ms"], 10, "{value}");
+    release_tx.send(()).unwrap();
+    drained_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // The server consumed everything, nc saw EOF in both directions, and
+    // the flow closed; the watchdog observes the final acknowledgment and
+    // the timer must return to the normal tick.
+    thread::sleep(Duration::from_millis(300));
+    let value = status_json(&name);
+    assert_eq!(value["dataplane"]["timer_interval_ms"], 100, "{value}");
+    let status = child
+        .wait_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("fallback tick test timed out")
+        });
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
     server.join().unwrap();
 }
 

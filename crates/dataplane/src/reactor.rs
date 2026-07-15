@@ -29,7 +29,8 @@ const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 // Fallback flows have no ACK event source, so the watchdog tick is their
 // primary ACK path; 100 ms quantizes a single-flow upload to roughly one
 // send-window per tick (measured ~8x throughput loss), while 10 ms is
-// negligible reactor load and only armed while such a flow is active.
+// negligible reactor load and only armed while such a flow has
+// unacknowledged upstream bytes.
 const TIMER_INTERVAL: Duration = Duration::from_millis(100);
 const TIMER_INTERVAL_ACK_FALLBACK: Duration = Duration::from_millis(10);
 /// Window-scale shift offered on the SYN-ACK when the namespace SYN offers
@@ -108,6 +109,9 @@ pub struct Metrics {
     pub tx_ack_watchdog_flows: u64,
     pub tx_ack_watchdog_advances: u64,
     pub tx_ack_watchdog_tail_recoveries: u64,
+    /// Current periodic tick in milliseconds; the fast fallback interval
+    /// shows up here while some fallback flow has unacknowledged bytes.
+    pub timer_interval_ms: u64,
     pub active_tcp_flows: u64,
     pub peak_tcp_flows: u64,
     pub pending_tcp_bytes: u64,
@@ -152,9 +156,13 @@ struct FlowEntry {
     transport_connected: bool,
     armed_socket_interest: u32,
     tx_ack_timestamps: bool,
-    // Set at activation when the flow was counted into ack_fallback_flows,
-    // so removal decrements exactly the flows that were counted.
-    ack_fallback_counted: bool,
+    // Set at activation when the kernel rejected TX ACK timestamps; only
+    // these flows may arm the fast fallback tick.
+    ack_fallback: bool,
+    // Mirrors this flow's membership in the reactor's count of fallback
+    // flows with unacknowledged bytes, so transitions and removal adjust
+    // exactly the flows that were counted.
+    ack_fallback_unacked: bool,
     handshake: Option<Handshake>,
     pending_socket: PendingSocketQueue,
     pending_shutdown: bool,
@@ -368,7 +376,7 @@ pub struct Reactor {
     /// TAP batch, instead of one refresh per received segment.
     ack_refresh_queue: Vec<FlowId>,
     timer_cursor_slot: u32,
-    ack_fallback_flows: usize,
+    ack_fallback_unacked_flows: usize,
     timer_interval_fast: bool,
 }
 
@@ -406,6 +414,7 @@ impl Reactor {
             tap_frame_capacity: frame_capacity as u64,
             tap_frame_pool_frames: frame_pool_frames as u64,
             tap_frame_pool_bytes: frame_pool_frames.saturating_mul(frame_capacity) as u64,
+            timer_interval_ms: u64::try_from(TIMER_INTERVAL.as_millis()).unwrap_or(u64::MAX),
             max_socket_buffer_bytes: u64::try_from(max_tcp_flows)
                 .unwrap_or(u64::MAX)
                 .saturating_mul(
@@ -445,7 +454,7 @@ impl Reactor {
             pending_pressure_dirty: false,
             ack_refresh_queue: Vec::new(),
             timer_cursor_slot: 0,
-            ack_fallback_flows: 0,
+            ack_fallback_unacked_flows: 0,
             timer_interval_fast: false,
         })
     }
@@ -723,7 +732,8 @@ impl Reactor {
             // below always starts with writable interest armed.
             armed_socket_interest: socket_interest(true, false, false),
             tx_ack_timestamps: false,
-            ack_fallback_counted: false,
+            ack_fallback: false,
+            ack_fallback_unacked: false,
             handshake: self.proxy_handshake(target_side.logical_peer),
             pending_socket: PendingSocketQueue::new(MAX_PENDING_SOCKET_BYTES),
             pending_shutdown: false,
@@ -928,6 +938,7 @@ impl Reactor {
                     .expect("flow exists")
                     .flow
                     .record_upstream_submitted(sent);
+                self.sync_ack_fallback_unacked(id)?;
                 if sent < payload.len() && !self.enqueue_pending_payload(id, &payload[sent..])? {
                     return Ok(false);
                 }
@@ -1147,15 +1158,13 @@ impl Reactor {
             self.metrics.tx_ack_timestamp_flows += 1;
         } else {
             self.metrics.tx_ack_watchdog_flows += 1;
-            self.ack_fallback_flows += 1;
-            self.update_timer_interval()?;
         }
         {
             let entry = self.flows.get_mut(id).expect("flow exists");
             entry.peek_offset_supported = peek_offset_supported;
             entry.bytes_acked_supported = bytes_acked_supported;
             entry.tx_ack_timestamps = tx_ack_timestamps;
-            entry.ack_fallback_counted = !tx_ack_timestamps;
+            entry.ack_fallback = !tx_ack_timestamps;
         }
         self.record_capabilities(
             id,
@@ -1359,6 +1368,7 @@ impl Reactor {
                         .expect("flow exists")
                         .flow
                         .record_upstream_submitted(sent);
+                    self.sync_ack_fallback_unacked(id)?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.into()),
@@ -1411,6 +1421,7 @@ impl Reactor {
         if advanced || window_changed {
             self.send_ack(id)?;
         }
+        self.sync_ack_fallback_unacked(id)?;
         Ok(advanced)
     }
 
@@ -2514,30 +2525,62 @@ impl Reactor {
     fn cleanup_closed(&mut self) -> Result<(), Error> {
         let removed = self.flows.flush_deferred();
         self.metrics.tcp_closed += removed.len() as u64;
-        let fallback_removed = removed
+        let fallback_unacked_removed = removed
             .iter()
-            .filter(|entry| entry.ack_fallback_counted)
+            .filter(|entry| entry.ack_fallback_unacked)
             .count();
-        if fallback_removed > 0 {
-            self.ack_fallback_flows = self.ack_fallback_flows.saturating_sub(fallback_removed);
+        if fallback_unacked_removed > 0 {
+            self.ack_fallback_unacked_flows = self
+                .ack_fallback_unacked_flows
+                .saturating_sub(fallback_unacked_removed);
             self.update_timer_interval()?;
         }
         Ok(())
     }
 
+    /// Tracks this flow's contribution to the count of fallback flows with
+    /// unacknowledged upstream bytes; each 0 <-> positive transition rearms
+    /// the timer interval. A transition costs one timerfd_settime, which an
+    /// upload burst pays twice -- negligible next to the per-segment
+    /// TCP_INFO reads this compatibility path already performs.
+    fn sync_ack_fallback_unacked(&mut self, id: FlowId) -> Result<(), Error> {
+        let Some(entry) = self.flows.get_mut(id) else {
+            return Ok(());
+        };
+        if !entry.ack_fallback {
+            return Ok(());
+        }
+        let unacked = entry.flow.upstream_unacked() > 0;
+        if unacked == entry.ack_fallback_unacked {
+            return Ok(());
+        }
+        entry.ack_fallback_unacked = unacked;
+        if unacked {
+            self.ack_fallback_unacked_flows += 1;
+        } else {
+            self.ack_fallback_unacked_flows = self.ack_fallback_unacked_flows.saturating_sub(1);
+        }
+        self.update_timer_interval()
+    }
+
     /// Runs the timer at the fallback interval only while a flow without TX
-    /// ACK timestamps is active; the watchdog is that flow's primary ACK
-    /// path and the normal tick quantizes its uploads to one window per
-    /// tick.
+    /// ACK timestamps has unacknowledged upstream bytes; the watchdog is
+    /// that flow's only ACK path, and the normal tick would quantize its
+    /// uploads to one send window per tick. Idle fallback flows keep the
+    /// normal tick, so a long-lived quiet connection never holds the
+    /// reactor at the fast rate.
     fn update_timer_interval(&mut self) -> Result<(), Error> {
-        let fast = self.ack_fallback_flows > 0;
+        let fast = self.ack_fallback_unacked_flows > 0;
         if fast != self.timer_interval_fast {
-            self.timer.set_interval(if fast {
+            let interval = if fast {
                 TIMER_INTERVAL_ACK_FALLBACK
             } else {
                 TIMER_INTERVAL
-            })?;
+            };
+            self.timer.set_interval(interval)?;
             self.timer_interval_fast = fast;
+            self.metrics.timer_interval_ms =
+                u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
         }
         Ok(())
     }
