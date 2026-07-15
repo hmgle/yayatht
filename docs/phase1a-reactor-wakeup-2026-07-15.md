@@ -9,8 +9,10 @@ changes that implement items 1 and 2 of the remaining-work list in
 1. Writable socket interest is armed only while a writable event can make
    progress (`38b1a82`).
 2. Upstream ACK progress is event-driven through `SOF_TIMESTAMPING_TX_ACK`
-   error-queue messages, with writable-interest polling as the fallback for
-   kernels that reject the option (`e89b595`).
+   error-queue messages (`e89b595`). The writable-interest polling that
+   commit shipped as the fallback was later replaced by the periodic timer
+   watchdog (`af55fc6`), which also bounds the delay when a timestamp
+   notification is dropped.
 3. The advertised namespace window is no longer bounded by the upstream peer
    window (`8d3bbe1`); see the stall analysis below.
 
@@ -96,12 +98,20 @@ A post-review pass hardened the watchdog added after the table above.
   so the watchdog path is pinned deterministically.
 - The watchdog counter was split: `tx_ack_watchdog_advances` records any
   timer-observed progress (including the timer racing a queued error-queue
-  event), while `tx_ack_watchdog_recoveries` counts only advances found
-  with an empty error queue -- the calibration signal for genuine
-  notification gaps.
-- The timer scan resumes from where a frame-pool break stopped instead of
-  restarting at slot zero, so retransmits, probes, and watchdog refreshes
-  cannot starve high slots under sustained TAP backpressure.
+  event), while `tx_ack_watchdog_tail_recoveries` counts only advances the
+  reactor can confirm as genuine notification loss. A `TX_ACK` timestamp
+  fires only once the last byte of its send call is cumulatively
+  acknowledged, so partial acknowledgment of a large send is legitimately
+  silent; a recovery therefore requires an empty queue before the refresh,
+  a refresh that leaves nothing unacknowledged (the final send's timestamp
+  must exist by then), and a second drain that still finds no
+  acknowledgment. Mid-stream losses stay uncounted -- a later
+  acknowledgment or tick re-notifies them.
+- The timer scan resumes at the slot of the first flow a frame-pool break
+  left unprocessed -- or that slot's successor once the flow is gone --
+  instead of restarting at slot zero, so retransmits, probes, and watchdog
+  refreshes cannot starve high slots under sustained TAP backpressure and
+  flow churn between ticks cannot skip survivors.
 
 Debug-build A/B of the SOCKS5 local-proxy matrix (4 MiB per flow, three
 runs; debug numbers are not comparable to the release tables above):
@@ -115,12 +125,59 @@ runs; debug numbers are not comparable to the release tables above):
 
 The 100 ms tick quantized a single fallback flow to roughly one send
 window per tick; the reactor therefore rearms the timer to 10 ms while an
-activated flow lacks TX ACK timestamps. The residual single-flow gap is
-the inherent 10 ms quantization and is accepted for this compatibility
-path; multi-flow throughput, fairness, and CPU are unaffected in every
-configuration. `YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS` only takes effect
-in debug builds, so fallback measurements must use a debug binary for
-both sides of the comparison.
+activated flow lacks TX ACK timestamps and has unacknowledged upstream
+bytes. The residual single-flow gap is the inherent 10 ms quantization and
+is accepted for this compatibility path; multi-flow throughput, fairness,
+and CPU are unaffected in every configuration. The current tick is
+exported as `timer_interval_ms` in the status metrics.
+`YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS` only takes effect in debug
+builds, so fallback measurements must use a debug binary for both sides
+of the comparison.
+
+## Refinement pass: tick gating and recovery confirmation (2026-07-15)
+
+A second review pass tightened three behaviors from the follow-up above;
+the rootless suite pins each one.
+
+- The 10 ms fallback tick is armed only while some fallback flow has
+  unacknowledged upstream bytes, tracked across the 0 <-> positive
+  transitions at the two submit sites, in the ACK refresh, and at flow
+  removal -- previously the mere existence of a fallback flow held the
+  fast tick. An idle fallback connection no longer keeps the reactor at
+  100 Hz: over a 15 s window with one open, quiet fallback flow (debug
+  builds), reactor-subtree CPU fell from 1.67 s to 0.31 s and context
+  switches from about 200/s to about 110/s. Active fallback transfers are
+  unchanged (single-flow 0.297 -> 0.284 Gibit/s, 32-flow 0.751 -> 0.750
+  Gibit/s, fairness 1.000 on both sides, debug builds). Each 0 <->
+  positive transition costs one `timerfd_settime`, paid twice per upload
+  burst.
+- `tx_ack_watchdog_recoveries` became `tx_ack_watchdog_tail_recoveries`
+  with the tail-confirmation semantics described above, because an empty
+  pre-refresh queue alone also matches partial acknowledgment of a large
+  send and the drain/TCP_INFO race, both of which inflate the counter
+  precisely on real-MTU paths where sends span many wire segments.
+- The timer scan origin is anchored to a flow slot instead of an index
+  into that tick's active list.
+
+Release A/B on the same host (4 MiB per flow, median of three runs after
+one warmup, baseline `2518972`; two adjacent baseline passes differed by
+up to about 4% on these cases, which bounds the session noise):
+
+| Case | Baseline | New | Baseline | New |
+| --- | ---: | ---: | ---: | ---: |
+|  | Gibit/s | Gibit/s | completion p99 | completion p99 |
+| direct / 1 | 2.126 | 2.630 | 14.5 ms | 11.8 ms |
+| direct / 32 | 6.175 | 6.332 | 156.3 ms | 152.3 ms |
+| SOCKS5 / 1 | 1.290 | 1.442 | 24.2 ms | 21.6 ms |
+| SOCKS5 / 32 | 3.770 | 3.906 | 259.5 ms | 250.9 ms |
+| HTTP / 1 | 1.302 | 1.398 | 23.9 ms | 22.3 ms |
+| HTTP / 32 | 3.838 | 3.686 | 252.3 ms | 265.9 ms |
+
+Jain fairness stayed at 0.999--1.000 in every case. The HTTP/32 delta is
+within the baseline's own pass-to-pass spread (3.675--3.838 Gibit/s), and
+no mechanism in this pass touches the timestamp fast path beyond a
+per-refresh boolean check. The mihomo scenario was not rerun for this
+pass.
 
 ## Remaining performance work
 
