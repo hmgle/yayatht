@@ -99,6 +99,7 @@ pub struct Metrics {
     pub send_window_unavailable_flows: u64,
     pub tx_ack_timestamp_flows: u64,
     pub tx_ack_watchdog_flows: u64,
+    pub tx_ack_watchdog_advances: u64,
     pub tx_ack_watchdog_recoveries: u64,
     pub active_tcp_flows: u64,
     pub peak_tcp_flows: u64,
@@ -355,6 +356,7 @@ pub struct Reactor {
     /// Flows whose upstream ACK state needs one refresh after the current
     /// TAP batch, instead of one refresh per received segment.
     ack_refresh_queue: Vec<FlowId>,
+    timer_cursor: usize,
 }
 
 impl Reactor {
@@ -428,6 +430,7 @@ impl Reactor {
             pending_pressure: false,
             pending_pressure_dirty: false,
             ack_refresh_queue: Vec::new(),
+            timer_cursor: 0,
         })
     }
 
@@ -1626,9 +1629,21 @@ impl Reactor {
 
     fn handle_timers(&mut self) -> Result<(), Error> {
         let now = Instant::now();
-        for id in self.flows.active_ids() {
+        let ids = self.flows.active_ids();
+        if ids.is_empty() {
+            return Ok(());
+        }
+        // A frame-pool break abandons the rest of the scan, and active_ids
+        // always returns ascending slots, so a fixed origin would starve
+        // high slots under sustained exhaustion. Resume where the previous
+        // tick stopped instead.
+        let start = self.timer_cursor % ids.len();
+        for offset in 0..ids.len() {
+            let index = (start + offset) % ids.len();
+            let id = ids[index];
             if self.frame_pool.available() == 0 {
                 self.note_frame_pool_exhaustion();
+                self.timer_cursor = index;
                 break;
             }
             let retransmit = {
@@ -1672,28 +1687,46 @@ impl Reactor {
     /// socket's receive accounting is full -- a normal state here, because
     /// namespace-bound data is parked in the receive queue for backpressure
     /// -- and kernels without the option have no ACK event source at all.
-    /// The tick bounds the recovery delay to about 100 ms instead of the
-    /// namespace RTO. Recoveries on timestamped flows are counted so the
-    /// interval can be tightened if losses show up in practice.
+    /// While TAP frames are available, the tick bounds the recovery delay
+    /// to about one timer interval instead of the namespace RTO.
+    ///
+    /// Any advance found by the timer counts as a watchdog advance; that
+    /// includes the timer merely winning the race against a queued
+    /// error-queue event. Draining the queue first separates the two: an
+    /// advance with no queued acknowledgment means the notification for
+    /// those bytes never arrived, and only that counts as a recovery. The
+    /// recovery counter is the calibration signal for tightening the tick.
     fn watchdog_upstream_ack(&mut self, id: FlowId) -> Result<(), Error> {
         if self.frame_pool.available() == 0 || self.flow_is_closed(id) {
             return Ok(());
         }
-        let unacked = self
-            .flows
-            .get(id)
-            .is_some_and(|entry| entry.flow.upstream_unacked() > 0);
+        let (unacked, tx_ack_timestamps, fd) = {
+            let entry = self.flows.get(id).expect("flow exists");
+            (
+                entry.flow.upstream_unacked() > 0,
+                entry.tx_ack_timestamps,
+                entry.socket.as_raw_fd(),
+            )
+        };
         if !unacked {
             return Ok(());
         }
+        let notified = if tx_ack_timestamps {
+            let drain = yayatht_sys::socket::drain_tx_timestamps(fd)?;
+            if drain.foreign_errors > 0 {
+                self.send_reset_for_flow(id)?;
+                return self.close_flow(id);
+            }
+            drain.acknowledgments > 0
+        } else {
+            false
+        };
         let advanced = self.refresh_upstream_ack(id)?;
-        if advanced
-            && self
-                .flows
-                .get(id)
-                .is_some_and(|entry| entry.tx_ack_timestamps)
-        {
-            self.metrics.tx_ack_watchdog_recoveries += 1;
+        if advanced {
+            self.metrics.tx_ack_watchdog_advances += 1;
+            if tx_ack_timestamps && !notified {
+                self.metrics.tx_ack_watchdog_recoveries += 1;
+            }
         }
         Ok(())
     }
