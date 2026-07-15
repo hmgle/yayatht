@@ -367,7 +367,7 @@ pub struct Reactor {
     /// Flows whose upstream ACK state needs one refresh after the current
     /// TAP batch, instead of one refresh per received segment.
     ack_refresh_queue: Vec<FlowId>,
-    timer_cursor: usize,
+    timer_cursor_slot: u32,
     ack_fallback_flows: usize,
     timer_interval_fast: bool,
 }
@@ -444,7 +444,7 @@ impl Reactor {
             pending_pressure: false,
             pending_pressure_dirty: false,
             ack_refresh_queue: Vec::new(),
-            timer_cursor: 0,
+            timer_cursor_slot: 0,
             ack_fallback_flows: 0,
             timer_interval_fast: false,
         })
@@ -1671,15 +1671,17 @@ impl Reactor {
         }
         // A frame-pool break abandons the rest of the scan, and active_ids
         // always returns ascending slots, so a fixed origin would starve
-        // high slots under sustained exhaustion. Resume where the previous
-        // tick stopped instead.
-        let start = self.timer_cursor % ids.len();
+        // high slots under sustained exhaustion. Resume at the first
+        // unprocessed flow's slot -- or its successor once that flow is
+        // gone -- so churn between ticks cannot shift the origin onto
+        // flows that were already served.
+        let start = ids.partition_point(|id| id.slot < self.timer_cursor_slot) % ids.len();
         for offset in 0..ids.len() {
             let index = (start + offset) % ids.len();
             let id = ids[index];
             if self.frame_pool.available() == 0 {
                 self.note_frame_pool_exhaustion();
-                self.timer_cursor = index;
+                self.timer_cursor_slot = id.slot;
                 break;
             }
             let retransmit = {
