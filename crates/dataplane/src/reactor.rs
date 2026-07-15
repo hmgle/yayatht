@@ -44,6 +44,7 @@ const TEST_DROP_TCP_FIN_ENV: &str = "YAYATHT_TEST_DROP_TCP_FIN";
 const TEST_DROP_TCP_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_ACK";
 const TEST_DROP_TCP_FIN_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_FIN_ACK";
 const TEST_LOCAL_ISN_ENV: &str = "YAYATHT_TEST_LOCAL_ISN";
+const TEST_SUPPRESS_EVENT_ACK_REFRESH_ENV: &str = "YAYATHT_TEST_SUPPRESS_EVENT_ACK_REFRESH";
 const TEST_DISABLE_PEEK_OFF_ENV: &str = "YAYATHT_TEST_DISABLE_SO_PEEK_OFF";
 const TEST_DISABLE_BYTES_ACKED_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_BYTES_ACKED";
 const TEST_DISABLE_SEND_WINDOW_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND";
@@ -348,6 +349,7 @@ pub struct Reactor {
     test_drop_tcp_fin: usize,
     test_drop_tcp_ack: usize,
     test_drop_tcp_fin_ack: usize,
+    test_suppress_event_ack_refresh: usize,
     test_local_isn: Option<u32>,
     pending_socket_bytes: usize,
     retained_socket_bytes: usize,
@@ -424,6 +426,7 @@ impl Reactor {
             test_drop_tcp_fin: test_count(TEST_DROP_TCP_FIN_ENV),
             test_drop_tcp_ack: test_count(TEST_DROP_TCP_ACK_ENV),
             test_drop_tcp_fin_ack: test_count(TEST_DROP_TCP_FIN_ACK_ENV),
+            test_suppress_event_ack_refresh: test_count(TEST_SUPPRESS_EVENT_ACK_REFRESH_ENV),
             test_local_isn: test_value(TEST_LOCAL_ISN_ENV),
             pending_socket_bytes: 0,
             retained_socket_bytes: 0,
@@ -882,10 +885,24 @@ impl Reactor {
             if self.flow_is_closed(id) {
                 continue;
             }
-            self.refresh_upstream_ack(id)?;
+            if !self.consume_ack_refresh_suppression() {
+                self.refresh_upstream_ack(id)?;
+            }
             self.update_socket_interest(id)?;
         }
         Ok(())
+    }
+
+    /// Test-only injection that skips event-driven upstream ACK refreshes,
+    /// leaving the timer watchdog as the sole ACK-progress path so tests
+    /// can pin it deterministically. Always false outside debug builds.
+    fn consume_ack_refresh_suppression(&mut self) -> bool {
+        if self.test_suppress_event_ack_refresh > 0 {
+            self.test_suppress_event_ack_refresh -= 1;
+            true
+        } else {
+            false
+        }
     }
 
     fn submit_namespace_payload(&mut self, id: FlowId, payload: &[u8]) -> Result<bool, Error> {
@@ -1064,7 +1081,9 @@ impl Reactor {
         if events & yayatht_sys::reactor::WRITABLE != 0 {
             self.flush_socket_queue(id)?;
         }
-        self.refresh_upstream_ack(id)?;
+        if !self.consume_ack_refresh_suppression() {
+            self.refresh_upstream_ack(id)?;
+        }
         if events & (yayatht_sys::reactor::READABLE | yayatht_sys::reactor::READ_HANGUP) != 0 {
             self.send_socket_data(id)?;
         }
