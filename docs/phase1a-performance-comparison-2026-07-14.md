@@ -140,11 +140,15 @@ high-concurrency isolation item.
 
 ## Remaining Performance Work
 
-1. Disable permanent writable interest once proxy handshake output drains;
-   wait for readable proxy replies instead of competing with the same-CPU proxy.
-2. If strict upstream ACK semantics remain, evaluate acknowledged-transmit
-   notifications such as `SO_TIMESTAMPING`/`SOF_TIMESTAMPING_TX_ACK`, with
-   `TCP_INFO` polling as the compatibility fallback.
+Items 1 and 2 were implemented on 2026-07-15; the results and a
+silly-window stall found during their validation are recorded in
+`phase1a-reactor-wakeup-2026-07-15.md`.
+
+1. Done (`38b1a82`): writable interest is armed only while a writable event
+   can make progress.
+2. Done (`e89b595`): upstream ACK progress is event-driven through
+   `SOF_TIMESTAMPING_TX_ACK`, with writable-interest polling as the
+   compatibility fallback.
 3. Evaluate `IFF_VNET_HDR`, TCP GSO, and checksum offload to reduce frame and
    checksum work without increasing the namespace-visible MTU beyond 32000.
 4. Use TAP multiqueue and flow-hashed reactors when scaling beyond the current

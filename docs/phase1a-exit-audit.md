@@ -30,8 +30,11 @@ calibration gates do not yet justify freezing it for Phase 1B.
 - Missing `tcpi_bytes_acked` uses a conservative ACK path: submitted bytes are
   acknowledged only when the socket output queue is empty and
   `tcpi_unacked == 0`. The advertised window is limited to 8 KiB in this mode.
-- Missing `tcpi_snd_wnd` uses socket send-buffer capacity and a fixed 16 KiB
-  ceiling.
+- `tcpi_snd_wnd` availability is still probed and reported, but since
+  `8d3bbe1` the advertised namespace window is bounded by send-buffer
+  occupancy rather than by the upstream peer window; see
+  `phase1a-reactor-wakeup-2026-07-15.md` for the silly-window stall this
+  removed.
 - Capability and degraded-flow counters are exported through `yayatht status
   --json`; degraded flows also emit a structured warning.
 - Instances have configurable global pending and socket-retained byte limits,

@@ -53,6 +53,13 @@
 - TCP Window Scale, a monotonic advertised receive edge, TAP-batch ACK refresh,
   and `TCP_NODELAY` remove the cumulative short-flow slowdown without a 1 ms
   polling path.
+- Socket writable interest is armed only while a writable event can make
+  progress, and upstream ACK progress is event-driven through
+  `SOF_TIMESTAMPING_TX_ACK` error-queue wakeups with a writable-poll fallback
+  for kernels that reject the option. The advertised namespace window is
+  bounded by send-buffer occupancy, not the upstream peer window, so the
+  event-driven reactor cannot strand a sub-MSS window behind sender-side
+  silly-window avoidance.
 - The TAP MTU is configurable from 1280 through 65520 and defaults to 32000.
   Its dynamically sized frame pool stays within a 16 MiB payload budget and
   exports its effective dimensions through status metrics.
