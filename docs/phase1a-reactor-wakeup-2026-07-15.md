@@ -84,6 +84,44 @@ The production path through `127.0.0.1:7890` with TUN enabled:
 This matches the best previously recorded mihomo results (3.9--4.3 Gibit/s),
 so the wakeup changes did not regress the production path.
 
+## Follow-up: watchdog validation and fallback calibration (2026-07-15)
+
+A post-review pass hardened the watchdog added after the table above.
+
+- A counterfactual run (watchdog body disabled) showed the original
+  fallback echo test still passed: 48 KiB fits inside the initial
+  advertised window, TAP batches and the echo's `EPOLLIN` refresh the
+  upstream ACK regardless. The rootless suite now includes an
+  event-refresh-suppression test that fails under the same counterfactual,
+  so the watchdog path is pinned deterministically.
+- The watchdog counter was split: `tx_ack_watchdog_advances` records any
+  timer-observed progress (including the timer racing a queued error-queue
+  event), while `tx_ack_watchdog_recoveries` counts only advances found
+  with an empty error queue -- the calibration signal for genuine
+  notification gaps.
+- The timer scan resumes from where a frame-pool break stopped instead of
+  restarting at slot zero, so retransmits, probes, and watchdog refreshes
+  cannot starve high slots under sustained TAP backpressure.
+
+Debug-build A/B of the SOCKS5 local-proxy matrix (4 MiB per flow, three
+runs; debug numbers are not comparable to the release tables above):
+
+| Case | Timestamps on | Fallback, 100 ms tick | Fallback, 10 ms tick |
+| --- | ---: | ---: | ---: |
+| 1 flow, Gibit/s | 0.52--0.58 | 0.06--0.10 | 0.29--0.33 |
+| 1 flow, completion | 54--60 ms | 304--516 ms | 96--107 ms |
+| 32 flows, Gibit/s | 0.75 | 0.76 | 0.71--0.75 |
+| 32 flows, fairness | 1.000 | 1.000 | 1.000 |
+
+The 100 ms tick quantized a single fallback flow to roughly one send
+window per tick; the reactor therefore rearms the timer to 10 ms while an
+activated flow lacks TX ACK timestamps. The residual single-flow gap is
+the inherent 10 ms quantization and is accepted for this compatibility
+path; multi-flow throughput, fairness, and CPU are unaffected in every
+configuration. `YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS` only takes effect
+in debug builds, so fallback measurements must use a debug binary for
+both sides of the comparison.
+
 ## Remaining performance work
 
 Carried forward from the 2026-07-14 list:
