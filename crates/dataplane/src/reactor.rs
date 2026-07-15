@@ -107,7 +107,7 @@ pub struct Metrics {
     pub tx_ack_timestamp_flows: u64,
     pub tx_ack_watchdog_flows: u64,
     pub tx_ack_watchdog_advances: u64,
-    pub tx_ack_watchdog_recoveries: u64,
+    pub tx_ack_watchdog_tail_recoveries: u64,
     pub active_tcp_flows: u64,
     pub peak_tcp_flows: u64,
     pub pending_tcp_bytes: u64,
@@ -1728,10 +1728,15 @@ impl Reactor {
     ///
     /// Any advance found by the timer counts as a watchdog advance; that
     /// includes the timer merely winning the race against a queued
-    /// error-queue event. Draining the queue first separates the two: an
-    /// advance with no queued acknowledgment means the notification for
-    /// those bytes never arrived, and only that counts as a recovery. The
-    /// recovery counter is the calibration signal for tightening the tick.
+    /// error-queue event, and partial acknowledgment of a large send whose
+    /// timestamp legitimately fires only once its last byte is covered.
+    /// An advance is counted as a tail recovery -- the calibration signal
+    /// for genuine notification loss -- only when no silent explanation
+    /// remains: the queue was empty before the refresh, the refresh left
+    /// nothing unacknowledged (so the final send's timestamp must already
+    /// have been generated), and a second drain still finds no
+    /// acknowledgment. Mid-stream losses stay uncounted; a later
+    /// acknowledgment or the next tick re-notifies those.
     fn watchdog_upstream_ack(&mut self, id: FlowId) -> Result<(), Error> {
         if self.frame_pool.available() == 0 || self.flow_is_closed(id) {
             return Ok(());
@@ -1758,11 +1763,34 @@ impl Reactor {
             false
         };
         let advanced = self.refresh_upstream_ack(id)?;
-        if advanced {
-            self.metrics.tx_ack_watchdog_advances += 1;
-            if tx_ack_timestamps && !notified {
-                self.metrics.tx_ack_watchdog_recoveries += 1;
-            }
+        if !advanced {
+            return Ok(());
+        }
+        self.metrics.tx_ack_watchdog_advances += 1;
+        if !tx_ack_timestamps || notified || self.flow_is_closed(id) {
+            return Ok(());
+        }
+        if self
+            .flows
+            .get(id)
+            .expect("flow exists")
+            .flow
+            .upstream_unacked()
+            > 0
+        {
+            return Ok(());
+        }
+        // The acknowledgment behind this advance may have raced the first
+        // drain: the kernel enqueues the timestamp while recording the
+        // acknowledged bytes, so a queue that is still empty after the
+        // advance was observed proves the notification was dropped.
+        let redrain = yayatht_sys::socket::drain_tx_timestamps(fd)?;
+        if redrain.foreign_errors > 0 {
+            self.send_reset_for_flow(id)?;
+            return self.close_flow(id);
+        }
+        if redrain.acknowledgments == 0 {
+            self.metrics.tx_ack_watchdog_tail_recoveries += 1;
         }
         Ok(())
     }
