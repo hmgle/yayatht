@@ -148,9 +148,10 @@ the rootless suite pins each one.
   builds), reactor-subtree CPU fell from 1.67 s to 0.31 s and context
   switches from about 200/s to about 110/s. Active fallback transfers are
   unchanged (single-flow 0.297 -> 0.284 Gibit/s, 32-flow 0.751 -> 0.750
-  Gibit/s, fairness 1.000 on both sides, debug builds). Each 0 <->
-  positive transition costs one `timerfd_settime`, paid twice per upload
-  burst.
+  Gibit/s, fairness 1.000 on both sides, debug builds). Each 0 ->
+  positive transition costs one `timerfd_settime`; the downshift
+  originally rearmed the timer the same way, which the review pass below
+  defers to the next tick.
 - `tx_ack_watchdog_recoveries` became `tx_ack_watchdog_tail_recoveries`
   with the tail-confirmation semantics described above, because an empty
   pre-refresh queue alone also matches partial acknowledgment of a large
@@ -178,6 +179,31 @@ within the baseline's own pass-to-pass spread (3.675--3.838 Gibit/s), and
 no mechanism in this pass touches the timestamp fast path beyond a
 per-refresh boolean check. The mihomo scenario was not rerun for this
 pass.
+
+## Review pass: deferred fast-tick downshift (2026-07-16)
+
+A review of the tick gating found that rearming the timerfd on both
+transition edges lets one fallback flow postpone the shared timer
+indefinitely. `timerfd_settime` replaces the pending expiration with a
+full new interval. Over a fast upstream a submit arms the 10 ms tick and
+the batch-end ACK refresh often finds everything already acknowledged
+and rearmed 100 ms moments later, so a flow that keeps flipping faster
+than either pending interval expires cancels every expiration. The
+namespace retransmissions, zero-window probes, and watchdog passes of
+every other flow run only from the tick -- the epoll wait timeout never
+calls the timer handler -- so they are deferred until the flipping
+pauses.
+
+The event path now rearms only on the 0 -> positive upshift, and only
+when the fast tick is not already armed, so once armed the 10 ms
+expiration stands and a tick is guaranteed within one fast interval. The
+downshift moved to the timer event itself: after a tick runs with no
+fallback flow holding unacknowledged bytes, the interval settles back to
+100 ms. An idle transition costs at most one extra 10 ms tick, and a
+flow removal that clears the count settles the same way instead of
+rearming from cleanup. The fallback rootless test now also asserts
+`active_tcp_flows == 1` at the downshift sample, so the 100 ms reading
+pins the settle on an open, idle flow rather than on flow teardown.
 
 ## Remaining performance work
 

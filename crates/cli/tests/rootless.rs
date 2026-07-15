@@ -504,11 +504,13 @@ fn fallback_fast_tick_tracks_unacknowledged_bytes() {
     assert_eq!(value["dataplane"]["timer_interval_ms"], 10, "{value}");
     release_tx.send(()).unwrap();
     drained_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    // The server consumed everything, nc saw EOF in both directions, and
-    // the flow closed; the watchdog observes the final acknowledgment and
-    // the timer must return to the normal tick.
+    // The server consumed everything but still holds its socket open, so
+    // the flow remains open and idle with nothing unacknowledged; the
+    // timer must settle back to the normal tick on the live flow, not
+    // through flow teardown.
     thread::sleep(Duration::from_millis(300));
     let value = status_json(&name);
+    assert_eq!(value["dataplane"]["active_tcp_flows"], 1, "{value}");
     assert_eq!(value["dataplane"]["timer_interval_ms"], 100, "{value}");
     let status = child
         .wait_timeout(Duration::from_secs(15))

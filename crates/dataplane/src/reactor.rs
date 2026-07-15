@@ -481,6 +481,7 @@ impl Reactor {
                     (None, Resource::Timer) => {
                         self.timer.consume()?;
                         self.handle_timers()?;
+                        self.settle_timer_interval()?;
                     }
                     (None, Resource::Control) => self.handle_control()?,
                     (Some(id), Resource::UpstreamSocket) => self.handle_socket(id, event.events)?,
@@ -2533,16 +2534,17 @@ impl Reactor {
             self.ack_fallback_unacked_flows = self
                 .ack_fallback_unacked_flows
                 .saturating_sub(fallback_unacked_removed);
-            self.update_timer_interval()?;
+            // Removal only lowers the count, and a positive count implies
+            // the fast tick is armed, so the next tick settles the interval.
         }
         Ok(())
     }
 
     /// Tracks this flow's contribution to the count of fallback flows with
-    /// unacknowledged upstream bytes; each 0 <-> positive transition rearms
-    /// the timer interval. A transition costs one timerfd_settime, which an
-    /// upload burst pays twice -- negligible next to the per-segment
-    /// TCP_INFO reads this compatibility path already performs.
+    /// unacknowledged upstream bytes. A 0 -> positive transition arms the
+    /// fast tick immediately; the reverse transition only lowers the count
+    /// and leaves the downshift to the next tick, so event-driven flips
+    /// never move the shared timer's pending expiration.
     fn sync_ack_fallback_unacked(&mut self, id: FlowId) -> Result<(), Error> {
         let Some(entry) = self.flows.get_mut(id) else {
             return Ok(());
@@ -2560,7 +2562,7 @@ impl Reactor {
         } else {
             self.ack_fallback_unacked_flows = self.ack_fallback_unacked_flows.saturating_sub(1);
         }
-        self.update_timer_interval()
+        self.arm_fast_tick()
     }
 
     /// Runs the timer at the fallback interval only while a flow without TX
@@ -2569,19 +2571,38 @@ impl Reactor {
     /// uploads to one send window per tick. Idle fallback flows keep the
     /// normal tick, so a long-lived quiet connection never holds the
     /// reactor at the fast rate.
-    fn update_timer_interval(&mut self) -> Result<(), Error> {
-        let fast = self.ack_fallback_unacked_flows > 0;
-        if fast != self.timer_interval_fast {
-            let interval = if fast {
-                TIMER_INTERVAL_ACK_FALLBACK
-            } else {
-                TIMER_INTERVAL
-            };
-            self.timer.set_interval(interval)?;
-            self.timer_interval_fast = fast;
-            self.metrics.timer_interval_ms =
-                u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
+    ///
+    /// Only this upshift may rearm the timer from the event path, and only
+    /// when the fast tick is not already armed. Rearming replaces the
+    /// pending expiration with a full new interval, so a downshift here
+    /// would let a flow whose unacked count flips between 0 and positive
+    /// faster than either interval expires postpone the shared timer
+    /// indefinitely, starving the retransmissions, zero-window probes, and
+    /// watchdog passes other flows only receive from the tick. Once armed,
+    /// the fast expiration stands until a tick runs.
+    fn arm_fast_tick(&mut self) -> Result<(), Error> {
+        if self.ack_fallback_unacked_flows > 0 && !self.timer_interval_fast {
+            self.rearm_timer(TIMER_INTERVAL_ACK_FALLBACK, true)?;
         }
+        Ok(())
+    }
+
+    /// Returns the timer to the normal interval once a tick has run with
+    /// no fallback flow holding unacknowledged bytes. Downshifting only
+    /// from the timer event keeps the rearm from cancelling an expiration
+    /// other flows are waiting on; an idle transition costs at most one
+    /// extra fast tick.
+    fn settle_timer_interval(&mut self) -> Result<(), Error> {
+        if self.ack_fallback_unacked_flows == 0 && self.timer_interval_fast {
+            self.rearm_timer(TIMER_INTERVAL, false)?;
+        }
+        Ok(())
+    }
+
+    fn rearm_timer(&mut self, interval: Duration, fast: bool) -> Result<(), Error> {
+        self.timer.set_interval(interval)?;
+        self.timer_interval_fast = fast;
+        self.metrics.timer_interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
         Ok(())
     }
 }
