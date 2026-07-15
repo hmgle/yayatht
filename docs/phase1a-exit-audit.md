@@ -181,14 +181,21 @@ were not the bottleneck.
 
 ### Post-fix re-run
 
-The original 132--140 ms result did not contain a 100 ms idle period. At
-0.23 Gibit/s, transferring 4 MiB itself takes about 140 ms. The limiting chain
-was:
+The original 132--140 ms result did not contain a 100 ms idle period: strace
+showed a smooth reactor cycle with no 100 ms gaps, ruling out a timer stall.
+At 0.23 Gibit/s, transferring 4 MiB itself takes about 140 ms. The limiting
+chain was:
 
-1. No Window Scale capped each end-to-end ACK round at 64 KiB.
-2. Each received segment triggered repeated socket-state queries and a bare
-   ACK instead of sharing one refresh at the end of the TAP batch.
+1. No Window Scale capped each end-to-end ACK round at 64 KiB: the SYN-ACK
+   never offered the kind-3 option and the advertised window was clamped to
+   `u16::MAX`.
+2. Each received segment triggered about eleven `getsockopt` calls (TCP_INFO,
+   queue depths, buffers) plus one immediate bare ACK. Sharing one refresh at
+   the end of the TAP batch cut a 4 MiB transfer from 33483 to 391
+   `getsockopt` calls.
 3. Nagle on the forwarding socket coupled short tails to upstream delayed ACKs.
+4. MTU 1500 framing cost roughly 2900 TAP read and socket write pairs per
+   4 MiB transfer; MTU 32000 reduces the same transfer to about 130 frames.
 
 Widening the window exposed a separate correctness bug: recomputing the
 advertised window from instantaneous free space could retreat an already
