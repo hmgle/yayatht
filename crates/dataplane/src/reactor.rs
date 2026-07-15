@@ -48,6 +48,7 @@ const TEST_LOCAL_ISN_ENV: &str = "YAYATHT_TEST_LOCAL_ISN";
 const TEST_DISABLE_PEEK_OFF_ENV: &str = "YAYATHT_TEST_DISABLE_SO_PEEK_OFF";
 const TEST_DISABLE_BYTES_ACKED_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_BYTES_ACKED";
 const TEST_DISABLE_SEND_WINDOW_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND";
+const TEST_DISABLE_TX_TIMESTAMPS_ENV: &str = "YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS";
 
 #[derive(Clone, Debug)]
 pub enum Upstream {
@@ -97,6 +98,8 @@ pub struct Metrics {
     pub conservative_ack_flows: u64,
     pub send_window_flows: u64,
     pub fixed_send_window_flows: u64,
+    pub tx_ack_timestamp_flows: u64,
+    pub tx_ack_poll_flows: u64,
     pub active_tcp_flows: u64,
     pub peak_tcp_flows: u64,
     pub pending_tcp_bytes: u64,
@@ -140,6 +143,7 @@ struct FlowEntry {
     socket: OwnedFd,
     transport_connected: bool,
     armed_socket_interest: u32,
+    tx_ack_timestamps: bool,
     handshake: Option<Handshake>,
     pending_socket: PendingSocketQueue,
     pending_shutdown: bool,
@@ -700,6 +704,7 @@ impl Reactor {
             // The nonblocking connect is still in flight, so registration
             // below always starts with writable interest armed.
             armed_socket_interest: socket_interest(true, false, false, false),
+            tx_ack_timestamps: false,
             handshake: self.proxy_handshake(target_side.logical_peer),
             pending_socket: PendingSocketQueue::new(MAX_PENDING_SOCKET_BYTES),
             pending_shutdown: false,
@@ -973,7 +978,9 @@ impl Reactor {
                 .as_ref()
                 .is_some_and(|handshake| !handshake.output().is_empty()),
             !entry.pending_socket.is_empty(),
-            entry.flow.upstream_unacked() > 0,
+            // Timestamped flows learn about ACK progress from EPOLLERR
+            // error-queue messages instead of writable polling.
+            !entry.tx_ack_timestamps && entry.flow.upstream_unacked() > 0,
         )
     }
 
@@ -1007,10 +1014,22 @@ impl Reactor {
             return Ok(());
         }
         if events & yayatht_sys::reactor::ERROR != 0 {
-            let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
+            let (fd, tx_ack_timestamps) = {
+                let entry = self.flows.get(id).expect("flow exists");
+                (entry.socket.as_raw_fd(), entry.tx_ack_timestamps)
+            };
             if yayatht_sys::socket::pending_error(fd)?.is_some() {
                 self.send_reset_for_flow(id)?;
                 return self.close_flow(id);
+            }
+            if tx_ack_timestamps {
+                // Level-triggered EPOLLERR persists until the error queue
+                // is empty; the refresh below reads the acknowledged bytes.
+                let drain = yayatht_sys::socket::drain_tx_timestamps(fd)?;
+                if drain.foreign_errors > 0 {
+                    self.send_reset_for_flow(id)?;
+                    return self.close_flow(id);
+                }
             }
         }
         if !self.flows.get(id).expect("flow exists").transport_connected
@@ -1088,11 +1107,22 @@ impl Reactor {
             info.bytes_acked.is_some() && !test_capability_disabled(TEST_DISABLE_BYTES_ACKED_ENV);
         let send_window_supported =
             info.send_window.is_some() && !test_capability_disabled(TEST_DISABLE_SEND_WINDOW_ENV);
+        // Enabled before any payload is submitted so every acknowledged
+        // send queues an error-queue wakeup; unsupported kernels fall back
+        // to writable-interest ACK polling.
+        let tx_ack_timestamps = !test_capability_disabled(TEST_DISABLE_TX_TIMESTAMPS_ENV)
+            && yayatht_sys::socket::enable_tx_ack_timestamps(fd).is_ok();
+        if tx_ack_timestamps {
+            self.metrics.tx_ack_timestamp_flows += 1;
+        } else {
+            self.metrics.tx_ack_poll_flows += 1;
+        }
         {
             let entry = self.flows.get_mut(id).expect("flow exists");
             entry.peek_offset_supported = peek_offset_supported;
             entry.bytes_acked_supported = bytes_acked_supported;
             entry.send_window_supported = send_window_supported;
+            entry.tx_ack_timestamps = tx_ack_timestamps;
         }
         self.record_capabilities(
             id,

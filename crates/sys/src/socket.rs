@@ -349,6 +349,99 @@ pub fn discard(fd: RawFd, length: usize) -> io::Result<usize> {
     Ok(count as usize)
 }
 
+/// Summary of one socket error-queue drain.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct TxTimestampDrain {
+    /// Messages that carried a transmit-acknowledgment timestamp.
+    pub acknowledgments: usize,
+    /// Messages whose extended error did not originate from timestamping.
+    pub foreign_errors: usize,
+}
+
+/// Requests a software timestamp on the socket error queue each time the
+/// peer acknowledges submitted bytes. `OPT_TSONLY` keeps packet payload out
+/// of the queued messages.
+pub fn enable_tx_ack_timestamps(fd: RawFd) -> io::Result<()> {
+    let flags: libc::c_uint = libc::SOF_TIMESTAMPING_TX_ACK
+        | libc::SOF_TIMESTAMPING_SOFTWARE
+        | libc::SOF_TIMESTAMPING_OPT_TSONLY;
+    // SAFETY: flags points to a valid c_uint SO_TIMESTAMPING option value.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMPING,
+            std::ptr::from_ref(&flags).cast(),
+            size_of::<libc::c_uint>() as libc::socklen_t,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// Drains every queued error-queue message so level-triggered `EPOLLERR`
+/// clears, and classifies each one. Timestamp messages only signal that
+/// acknowledged bytes advanced; callers read the amount from `TCP_INFO`.
+pub fn drain_tx_timestamps(fd: RawFd) -> io::Result<TxTimestampDrain> {
+    let mut drain = TxTimestampDrain::default();
+    // OPT_TSONLY leaves the data part empty; control holds the timestamp
+    // block plus one extended-error header per message.
+    let mut control = [0u8; 512];
+    loop {
+        // SAFETY: zeroed msghdr is valid when only control storage is set.
+        let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+        message.msg_control = control.as_mut_ptr().cast();
+        message.msg_controllen = control.len() as _;
+        // SAFETY: message references writable storage for the duration of
+        // recvmsg.
+        let received = unsafe {
+            libc::recvmsg(
+                fd,
+                std::ptr::from_mut(&mut message),
+                libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT,
+            )
+        };
+        if received == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::WouldBlock {
+                return Ok(drain);
+            }
+            return Err(error);
+        }
+        let mut timestamped = false;
+        let mut foreign = false;
+        // SAFETY: recvmsg initialized the control region it reports.
+        let mut cursor = unsafe { libc::CMSG_FIRSTHDR(&message) };
+        while !cursor.is_null() {
+            // SAFETY: cursor is a valid cmsghdr within the control region.
+            let header = unsafe { &*cursor };
+            match (header.cmsg_level, header.cmsg_type) {
+                (libc::SOL_SOCKET, libc::SCM_TIMESTAMPING) => timestamped = true,
+                (libc::SOL_IP, libc::IP_RECVERR) | (libc::SOL_IPV6, libc::IPV6_RECVERR) => {
+                    // SAFETY: the kernel stores a sock_extended_err payload
+                    // for RECVERR control messages.
+                    let extended =
+                        unsafe { &*libc::CMSG_DATA(cursor).cast::<libc::sock_extended_err>() };
+                    if extended.ee_origin != libc::SO_EE_ORIGIN_TIMESTAMPING {
+                        foreign = true;
+                    }
+                }
+                _ => {}
+            }
+            // SAFETY: message and cursor remain valid for CMSG_NXTHDR.
+            cursor = unsafe { libc::CMSG_NXTHDR(&message, cursor) };
+        }
+        if timestamped && !foreign {
+            drain.acknowledgments += 1;
+        }
+        if foreign {
+            drain.foreign_errors += 1;
+        }
+    }
+}
+
 pub fn shutdown_write(fd: RawFd) -> io::Result<()> {
     // SAFETY: fd is borrowed and SHUT_WR is a valid mode.
     if unsafe { libc::shutdown(fd, libc::SHUT_WR) } == -1 {
@@ -397,6 +490,29 @@ mod tests {
             0
         );
         assert_eq!(enabled, 1);
+    }
+
+    #[test]
+    fn tx_ack_timestamps_surface_on_the_error_queue() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut receiver, _) = listener.accept().unwrap();
+        enable_tx_ack_timestamps(sender.as_raw_fd()).unwrap();
+        sender.write_all(b"ping").unwrap();
+        let mut out = [0u8; 4];
+        receiver.read_exact(&mut out).unwrap();
+        // The loopback ACK is prompt but asynchronous; poll briefly.
+        let mut acknowledgments = 0;
+        for _ in 0..200 {
+            let drain = drain_tx_timestamps(sender.as_raw_fd()).unwrap();
+            assert_eq!(drain.foreign_errors, 0);
+            acknowledgments += drain.acknowledgments;
+            if acknowledgments > 0 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        assert!(acknowledgments > 0, "no TX ACK timestamp was queued");
     }
 
     #[test]

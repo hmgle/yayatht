@@ -303,6 +303,7 @@ fn degraded_kernel_capabilities_preserve_tcp_echo() {
             ("YAYATHT_TEST_DISABLE_SO_PEEK_OFF", "1"),
             ("YAYATHT_TEST_DISABLE_TCP_INFO_BYTES_ACKED", "1"),
             ("YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND", "1"),
+            ("YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS", "1"),
             ("RUST_LOG", "yayatht_dataplane=warn,yayatht=info"),
         ],
     );
