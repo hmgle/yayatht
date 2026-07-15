@@ -391,6 +391,11 @@ impl Flow {
         self.upstream_submitted
     }
 
+    #[must_use]
+    pub const fn upstream_unacked(&self) -> u64 {
+        self.upstream_submitted.saturating_sub(self.upstream_acked)
+    }
+
     pub fn record_upstream_ack(&mut self, bytes_acked: u64) -> bool {
         let acknowledged = bytes_acked
             .saturating_sub(self.upstream_ack_baseline)
@@ -528,6 +533,19 @@ mod tests {
         flow.record_upstream_submitted(8);
         assert!(flow.record_upstream_ack(18));
         assert_eq!(flow.namespace_ack(), 4);
+    }
+
+    #[test]
+    fn upstream_unacked_tracks_submission_and_acknowledgment() {
+        let mut flow = flow();
+        flow.socket_connected(10);
+        flow.receive(u32::MAX - 3, Some(101), 65535, 8, false, false);
+        flow.record_upstream_submitted(8);
+        assert_eq!(flow.upstream_unacked(), 8);
+        assert!(flow.record_upstream_ack(15));
+        assert_eq!(flow.upstream_unacked(), 3);
+        assert!(flow.record_upstream_ack(18));
+        assert_eq!(flow.upstream_unacked(), 0);
     }
 
     #[test]

@@ -139,6 +139,7 @@ struct FlowEntry {
     construction: FlowConstruction,
     socket: OwnedFd,
     transport_connected: bool,
+    armed_socket_interest: u32,
     handshake: Option<Handshake>,
     pending_socket: PendingSocketQueue,
     pending_shutdown: bool,
@@ -696,6 +697,9 @@ impl Reactor {
             construction,
             socket,
             transport_connected: false,
+            // The nonblocking connect is still in flight, so registration
+            // below always starts with writable interest armed.
+            armed_socket_interest: socket_interest(true, false, false, false),
             handshake: self.proxy_handshake(target_side.logical_peer),
             pending_socket: PendingSocketQueue::new(MAX_PENDING_SOCKET_BYTES),
             pending_shutdown: false,
@@ -741,14 +745,12 @@ impl Reactor {
             .expect("inserted flow")
             .socket
             .as_raw_fd();
-        self.epoll.add(
-            fd,
-            yayatht_sys::reactor::READABLE
-                | yayatht_sys::reactor::WRITABLE
-                | yayatht_sys::reactor::ERROR
-                | yayatht_sys::reactor::READ_HANGUP,
-            token.raw(),
-        )?;
+        let initial_interest = self
+            .flows
+            .get(id)
+            .expect("inserted flow")
+            .armed_socket_interest;
+        self.epoll.add(fd, initial_interest, token.raw())?;
         self.flows
             .get_mut(id)
             .expect("inserted flow")
@@ -758,6 +760,7 @@ impl Reactor {
         self.metrics.tcp_created += 1;
         if connected {
             self.finish_transport_connect(id)?;
+            self.update_socket_interest(id)?;
         }
         Ok(())
     }
@@ -874,6 +877,7 @@ impl Reactor {
                 continue;
             }
             self.refresh_upstream_ack(id)?;
+            self.update_socket_interest(id)?;
         }
         Ok(())
     }
@@ -961,7 +965,44 @@ impl Reactor {
         }
     }
 
+    fn desired_socket_interest(entry: &FlowEntry) -> u32 {
+        socket_interest(
+            !entry.transport_connected,
+            entry
+                .handshake
+                .as_ref()
+                .is_some_and(|handshake| !handshake.output().is_empty()),
+            !entry.pending_socket.is_empty(),
+            entry.flow.upstream_unacked() > 0,
+        )
+    }
+
+    fn update_socket_interest(&mut self, id: FlowId) -> Result<(), Error> {
+        if self.flow_is_closed(id) {
+            return Ok(());
+        }
+        let entry = self.flows.get(id).expect("flow exists");
+        let desired = Self::desired_socket_interest(entry);
+        if desired == entry.armed_socket_interest {
+            return Ok(());
+        }
+        let token = EpollToken::flow(id, Resource::UpstreamSocket, true)
+            .ok_or(Error::Invariant("unable to encode flow token"))?;
+        self.epoll
+            .modify(entry.socket.as_raw_fd(), desired, token.raw())?;
+        self.flows
+            .get_mut(id)
+            .expect("flow exists")
+            .armed_socket_interest = desired;
+        Ok(())
+    }
+
     fn handle_socket(&mut self, id: FlowId, events: u32) -> Result<(), Error> {
+        self.handle_socket_events(id, events)?;
+        self.update_socket_interest(id)
+    }
+
+    fn handle_socket_events(&mut self, id: FlowId, events: u32) -> Result<(), Error> {
         if self.flow_is_closed(id) {
             return Ok(());
         }
@@ -2357,6 +2398,28 @@ fn pending_pressure_state(current: bool, bytes: usize, limit: usize) -> bool {
     if current { bytes > low } else { bytes >= high }
 }
 
+/// Level-triggered `EPOLLOUT` on an idle socket wakes the reactor on every
+/// `epoll_wait`, so writable interest is armed only while a writable event
+/// can make progress: a pending nonblocking connect, unflushed proxy
+/// handshake output, queued payload waiting for send-buffer space, or
+/// unacknowledged upstream bytes whose `TCP_INFO` ACK progress still drives
+/// the namespace-facing ACK.
+const fn socket_interest(
+    connect_pending: bool,
+    handshake_output_pending: bool,
+    queued_payload: bool,
+    upstream_unacked: bool,
+) -> u32 {
+    let base = yayatht_sys::reactor::READABLE
+        | yayatht_sys::reactor::ERROR
+        | yayatht_sys::reactor::READ_HANGUP;
+    if connect_pending || handshake_output_pending || queued_payload || upstream_unacked {
+        base | yayatht_sys::reactor::WRITABLE
+    } else {
+        base
+    }
+}
+
 pub fn run(config: Config, tap: OwnedFd, control: OwnedFd) -> Result<Metrics, Error> {
     Reactor::new(config, tap, control)?.run()
 }
@@ -2426,6 +2489,20 @@ mod tests {
         probe.advance(now);
         assert_eq!(probe.interval, ZERO_WINDOW_PROBE_MAX);
         assert_eq!(probe.deadline, now + ZERO_WINDOW_PROBE_MAX);
+    }
+
+    #[test]
+    fn writable_interest_is_armed_only_while_progress_is_possible() {
+        let base = yayatht_sys::reactor::READABLE
+            | yayatht_sys::reactor::ERROR
+            | yayatht_sys::reactor::READ_HANGUP;
+        let writable = base | yayatht_sys::reactor::WRITABLE;
+        // Idle established flow: epoll_wait must be able to block.
+        assert_eq!(socket_interest(false, false, false, false), base);
+        assert_eq!(socket_interest(true, false, false, false), writable);
+        assert_eq!(socket_interest(false, true, false, false), writable);
+        assert_eq!(socket_interest(false, false, true, false), writable);
+        assert_eq!(socket_interest(false, false, false, true), writable);
     }
 
     #[test]
