@@ -36,7 +36,6 @@ const ZERO_WINDOW_PROBE_INITIAL: Duration = Duration::from_secs(1);
 const ZERO_WINDOW_PROBE_MAX: Duration = Duration::from_secs(8);
 const PROXY_RESPONSE_CAPACITY: usize = 8 * 1024;
 const MAX_PENDING_SOCKET_BYTES: usize = 256 * 1024;
-const FALLBACK_SEND_WINDOW: usize = 16 * 1024;
 const FALLBACK_ACK_WINDOW: usize = 8 * 1024;
 const TEST_DROP_TCP_DATA_ENV: &str = "YAYATHT_TEST_DROP_TCP_DATA";
 const TEST_DROP_TCP_RETRANSMIT_ENV: &str = "YAYATHT_TEST_DROP_TCP_RETRANSMIT";
@@ -153,7 +152,6 @@ struct FlowEntry {
     last_namespace_byte: Option<u8>,
     peek_offset_supported: bool,
     bytes_acked_supported: bool,
-    send_window_supported: bool,
     socket_receive_buffer_bytes: usize,
     socket_send_buffer_bytes: usize,
 }
@@ -714,7 +712,6 @@ impl Reactor {
             last_namespace_byte: None,
             peek_offset_supported: false,
             bytes_acked_supported: false,
-            send_window_supported: false,
             socket_receive_buffer_bytes,
             socket_send_buffer_bytes,
         };
@@ -1121,7 +1118,6 @@ impl Reactor {
             let entry = self.flows.get_mut(id).expect("flow exists");
             entry.peek_offset_supported = peek_offset_supported;
             entry.bytes_acked_supported = bytes_acked_supported;
-            entry.send_window_supported = send_window_supported;
             entry.tx_ack_timestamps = tx_ack_timestamps;
         }
         self.record_capabilities(
@@ -1131,7 +1127,7 @@ impl Reactor {
             bytes_acked_supported,
             send_window_supported,
         );
-        self.update_namespace_window(id, info.send_window)?;
+        self.update_namespace_window(id)?;
         let plan = self
             .flows
             .get_mut(id)
@@ -1370,18 +1366,14 @@ impl Reactor {
                 .flow
                 .record_upstream_ack(acknowledged)
         });
-        let window_changed = self.update_namespace_window(id, info.send_window)?;
+        let window_changed = self.update_namespace_window(id)?;
         if advanced || window_changed {
             self.send_ack(id)?;
         }
         Ok(())
     }
 
-    fn update_namespace_window(
-        &mut self,
-        id: FlowId,
-        send_window: Option<u32>,
-    ) -> Result<bool, Error> {
+    fn update_namespace_window(&mut self, id: FlowId) -> Result<bool, Error> {
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         let socket_available = yayatht_sys::socket::send_buffer_available(fd)?;
         let entry = self.flows.get(id).expect("flow exists");
@@ -1393,11 +1385,17 @@ impl Reactor {
                 .max_pending_tcp_bytes
                 .saturating_sub(self.pending_socket_bytes)
         };
-        let kernel_window = if entry.send_window_supported {
-            send_window.map_or(0, |window| window as usize)
-        } else {
-            FALLBACK_SEND_WINDOW
-        };
+        // The upstream peer's receive window (tcpi_snd_wnd) is deliberately
+        // NOT part of this bound. When the peer's window collapses, the send
+        // buffer backs up and socket_available shrinks, so backpressure is
+        // preserved -- but a peer-window bound could pin the advertised
+        // window below one MSS while the socket buffer sits empty. The
+        // namespace sender then defers per sender-side silly-window
+        // avoidance, and because a pure upstream window update carries no
+        // data and acknowledges no new bytes, no event wakes the reactor
+        // until the namespace persist timer fires roughly 200 ms later.
+        // Keeping the bound on buffer occupancy guarantees the window only
+        // closes while acknowledgment (timestamp) wakeups are outstanding.
         let ack_window = if entry.bytes_acked_supported {
             entry.flow.max_advertised_window() as usize
         } else {
@@ -1406,7 +1404,6 @@ impl Reactor {
         let available = socket_available
             .min(queue_available)
             .min(global_available)
-            .min(kernel_window)
             .min(ack_window);
         let window = u32::try_from(available).unwrap_or(u32::MAX);
         Ok(self
@@ -1431,9 +1428,7 @@ impl Reactor {
                 self.pending_pressure_dirty = true;
                 break;
             }
-            let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
-            let info = yayatht_sys::tcp_info::get(fd)?;
-            if self.update_namespace_window(id, info.send_window)? {
+            if self.update_namespace_window(id)? {
                 self.send_ack(id)?;
             }
         }
