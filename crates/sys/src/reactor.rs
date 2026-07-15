@@ -124,6 +124,14 @@ impl TimerFd {
         }
         // SAFETY: raw is a newly owned descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        let timer = Self { fd };
+        timer.set_interval(interval)?;
+        Ok(timer)
+    }
+
+    /// Rearms the periodic interval; the next expiration is one full new
+    /// interval away.
+    pub fn set_interval(&self, interval: Duration) -> io::Result<()> {
         let seconds = interval.as_secs().try_into().unwrap_or(i64::MAX);
         let nanos = interval.subsec_nanos() as libc::c_long;
         let spec = libc::itimerspec {
@@ -139,7 +147,7 @@ impl TimerFd {
         // SAFETY: spec is a valid periodic timer description.
         if unsafe {
             libc::timerfd_settime(
-                fd.as_raw_fd(),
+                self.fd.as_raw_fd(),
                 0,
                 std::ptr::from_ref(&spec),
                 std::ptr::null_mut(),
@@ -148,7 +156,7 @@ impl TimerFd {
         {
             return Err(io::Error::last_os_error());
         }
-        Ok(Self { fd })
+        Ok(())
     }
 
     #[must_use]

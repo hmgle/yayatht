@@ -26,6 +26,12 @@ const TAP_FRAME_POOL_BYTES: usize = 16 * 1024 * 1024;
 const TAP_FRAME_POOL_MAX_FRAMES: usize = 4096;
 const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
+// Fallback flows have no ACK event source, so the watchdog tick is their
+// primary ACK path; 100 ms quantizes a single-flow upload to roughly one
+// send-window per tick (measured ~8x throughput loss), while 10 ms is
+// negligible reactor load and only armed while such a flow is active.
+const TIMER_INTERVAL: Duration = Duration::from_millis(100);
+const TIMER_INTERVAL_ACK_FALLBACK: Duration = Duration::from_millis(10);
 /// Window-scale shift offered on the SYN-ACK when the namespace SYN offers
 /// the option. Shift 7 allows advertising up to ~8 MiB.
 const WINDOW_SCALE_SHIFT: u8 = 7;
@@ -146,6 +152,9 @@ struct FlowEntry {
     transport_connected: bool,
     armed_socket_interest: u32,
     tx_ack_timestamps: bool,
+    // Set at activation when the flow was counted into ack_fallback_flows,
+    // so removal decrements exactly the flows that were counted.
+    ack_fallback_counted: bool,
     handshake: Option<Handshake>,
     pending_socket: PendingSocketQueue,
     pending_shutdown: bool,
@@ -359,12 +368,14 @@ pub struct Reactor {
     /// TAP batch, instead of one refresh per received segment.
     ack_refresh_queue: Vec<FlowId>,
     timer_cursor: usize,
+    ack_fallback_flows: usize,
+    timer_interval_fast: bool,
 }
 
 impl Reactor {
     pub fn new(config: Config, tap: OwnedFd, control: OwnedFd) -> Result<Self, Error> {
         let epoll = yayatht_sys::reactor::Epoll::new()?;
-        let timer = yayatht_sys::reactor::TimerFd::periodic(Duration::from_millis(100))?;
+        let timer = yayatht_sys::reactor::TimerFd::periodic(TIMER_INTERVAL)?;
         epoll.add(
             tap.as_raw_fd(),
             yayatht_sys::reactor::READABLE,
@@ -434,6 +445,8 @@ impl Reactor {
             pending_pressure_dirty: false,
             ack_refresh_queue: Vec::new(),
             timer_cursor: 0,
+            ack_fallback_flows: 0,
+            timer_interval_fast: false,
         })
     }
 
@@ -466,7 +479,7 @@ impl Reactor {
                 }
             }
             self.apply_pending_pressure()?;
-            self.cleanup_closed();
+            self.cleanup_closed()?;
             if self.shutting_down {
                 for id in self.flows.active_ids() {
                     self.close_flow(id)?;
@@ -710,6 +723,7 @@ impl Reactor {
             // below always starts with writable interest armed.
             armed_socket_interest: socket_interest(true, false, false),
             tx_ack_timestamps: false,
+            ack_fallback_counted: false,
             handshake: self.proxy_handshake(target_side.logical_peer),
             pending_socket: PendingSocketQueue::new(MAX_PENDING_SOCKET_BYTES),
             pending_shutdown: false,
@@ -1133,12 +1147,15 @@ impl Reactor {
             self.metrics.tx_ack_timestamp_flows += 1;
         } else {
             self.metrics.tx_ack_watchdog_flows += 1;
+            self.ack_fallback_flows += 1;
+            self.update_timer_interval()?;
         }
         {
             let entry = self.flows.get_mut(id).expect("flow exists");
             entry.peek_offset_supported = peek_offset_supported;
             entry.bytes_acked_supported = bytes_acked_supported;
             entry.tx_ack_timestamps = tx_ack_timestamps;
+            entry.ack_fallback_counted = !tx_ack_timestamps;
         }
         self.record_capabilities(
             id,
@@ -2464,9 +2481,35 @@ impl Reactor {
         Ok(())
     }
 
-    fn cleanup_closed(&mut self) {
+    fn cleanup_closed(&mut self) -> Result<(), Error> {
         let removed = self.flows.flush_deferred();
         self.metrics.tcp_closed += removed.len() as u64;
+        let fallback_removed = removed
+            .iter()
+            .filter(|entry| entry.ack_fallback_counted)
+            .count();
+        if fallback_removed > 0 {
+            self.ack_fallback_flows = self.ack_fallback_flows.saturating_sub(fallback_removed);
+            self.update_timer_interval()?;
+        }
+        Ok(())
+    }
+
+    /// Runs the timer at the fallback interval only while a flow without TX
+    /// ACK timestamps is active; the watchdog is that flow's primary ACK
+    /// path and the normal tick quantizes its uploads to one window per
+    /// tick.
+    fn update_timer_interval(&mut self) -> Result<(), Error> {
+        let fast = self.ack_fallback_flows > 0;
+        if fast != self.timer_interval_fast {
+            self.timer.set_interval(if fast {
+                TIMER_INTERVAL_ACK_FALLBACK
+            } else {
+                TIMER_INTERVAL
+            })?;
+            self.timer_interval_fast = fast;
+        }
+        Ok(())
     }
 }
 
