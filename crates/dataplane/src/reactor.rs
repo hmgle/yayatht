@@ -98,7 +98,8 @@ pub struct Metrics {
     pub send_window_flows: u64,
     pub send_window_unavailable_flows: u64,
     pub tx_ack_timestamp_flows: u64,
-    pub tx_ack_poll_flows: u64,
+    pub tx_ack_watchdog_flows: u64,
+    pub tx_ack_watchdog_recoveries: u64,
     pub active_tcp_flows: u64,
     pub peak_tcp_flows: u64,
     pub pending_tcp_bytes: u64,
@@ -701,7 +702,7 @@ impl Reactor {
             transport_connected: false,
             // The nonblocking connect is still in flight, so registration
             // below always starts with writable interest armed.
-            armed_socket_interest: socket_interest(true, false, false, false),
+            armed_socket_interest: socket_interest(true, false, false),
             tx_ack_timestamps: false,
             handshake: self.proxy_handshake(target_side.logical_peer),
             pending_socket: PendingSocketQueue::new(MAX_PENDING_SOCKET_BYTES),
@@ -975,9 +976,6 @@ impl Reactor {
                 .as_ref()
                 .is_some_and(|handshake| !handshake.output().is_empty()),
             !entry.pending_socket.is_empty(),
-            // Timestamped flows learn about ACK progress from EPOLLERR
-            // error-queue messages instead of writable polling.
-            !entry.tx_ack_timestamps && entry.flow.upstream_unacked() > 0,
         )
     }
 
@@ -1105,14 +1103,14 @@ impl Reactor {
         let send_window_supported =
             info.send_window.is_some() && !test_capability_disabled(TEST_DISABLE_SEND_WINDOW_ENV);
         // Enabled before any payload is submitted so every acknowledged
-        // send queues an error-queue wakeup; unsupported kernels fall back
-        // to writable-interest ACK polling.
+        // send queues an error-queue wakeup; kernels that reject the option
+        // learn ACK progress from TAP activity and the periodic watchdog.
         let tx_ack_timestamps = !test_capability_disabled(TEST_DISABLE_TX_TIMESTAMPS_ENV)
             && yayatht_sys::socket::enable_tx_ack_timestamps(fd).is_ok();
         if tx_ack_timestamps {
             self.metrics.tx_ack_timestamp_flows += 1;
         } else {
-            self.metrics.tx_ack_poll_flows += 1;
+            self.metrics.tx_ack_watchdog_flows += 1;
         }
         {
             let entry = self.flows.get_mut(id).expect("flow exists");
@@ -1344,7 +1342,9 @@ impl Reactor {
         Ok(())
     }
 
-    fn refresh_upstream_ack(&mut self, id: FlowId) -> Result<(), Error> {
+    /// Reads the upstream socket's acknowledgment progress and re-advertises
+    /// the namespace window; returns whether the ACK point advanced.
+    fn refresh_upstream_ack(&mut self, id: FlowId) -> Result<bool, Error> {
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
         let info = yayatht_sys::tcp_info::get(fd)?;
         let bytes_acked_supported = self
@@ -1372,7 +1372,7 @@ impl Reactor {
         if advanced || window_changed {
             self.send_ack(id)?;
         }
-        Ok(())
+        Ok(advanced)
     }
 
     fn update_namespace_window(&mut self, id: FlowId) -> Result<bool, Error> {
@@ -1661,6 +1661,39 @@ impl Reactor {
             if probe_due {
                 self.send_zero_window_probe(id, now)?;
             }
+            self.watchdog_upstream_ack(id)?;
+        }
+        Ok(())
+    }
+
+    /// ACK-progress watchdog, run from the periodic timer for flows with
+    /// unacknowledged upstream bytes. TX ACK timestamps normally drive the
+    /// upstream ACK, but the kernel drops the error-queue message when the
+    /// socket's receive accounting is full -- a normal state here, because
+    /// namespace-bound data is parked in the receive queue for backpressure
+    /// -- and kernels without the option have no ACK event source at all.
+    /// The tick bounds the recovery delay to about 100 ms instead of the
+    /// namespace RTO. Recoveries on timestamped flows are counted so the
+    /// interval can be tightened if losses show up in practice.
+    fn watchdog_upstream_ack(&mut self, id: FlowId) -> Result<(), Error> {
+        if self.frame_pool.available() == 0 || self.flow_is_closed(id) {
+            return Ok(());
+        }
+        let unacked = self
+            .flows
+            .get(id)
+            .is_some_and(|entry| entry.flow.upstream_unacked() > 0);
+        if !unacked {
+            return Ok(());
+        }
+        let advanced = self.refresh_upstream_ack(id)?;
+        if advanced
+            && self
+                .flows
+                .get(id)
+                .is_some_and(|entry| entry.tx_ack_timestamps)
+        {
+            self.metrics.tx_ack_watchdog_recoveries += 1;
         }
         Ok(())
     }
@@ -2428,19 +2461,21 @@ fn pending_pressure_state(current: bool, bytes: usize, limit: usize) -> bool {
 /// Level-triggered `EPOLLOUT` on an idle socket wakes the reactor on every
 /// `epoll_wait`, so writable interest is armed only while a writable event
 /// can make progress: a pending nonblocking connect, unflushed proxy
-/// handshake output, queued payload waiting for send-buffer space, or
-/// unacknowledged upstream bytes whose `TCP_INFO` ACK progress still drives
-/// the namespace-facing ACK.
+/// handshake output, or queued payload waiting for send-buffer space.
+/// Upstream ACK progress never arms writable interest: a TCP socket is
+/// writable almost permanently, so polling it busy-loops the reactor.
+/// ACK progress arrives through TX ACK timestamp error-queue events, with
+/// the periodic timer watchdog bounding the delay when a notification is
+/// lost or the kernel lacks the option.
 const fn socket_interest(
     connect_pending: bool,
     handshake_output_pending: bool,
     queued_payload: bool,
-    upstream_unacked: bool,
 ) -> u32 {
     let base = yayatht_sys::reactor::READABLE
         | yayatht_sys::reactor::ERROR
         | yayatht_sys::reactor::READ_HANGUP;
-    if connect_pending || handshake_output_pending || queued_payload || upstream_unacked {
+    if connect_pending || handshake_output_pending || queued_payload {
         base | yayatht_sys::reactor::WRITABLE
     } else {
         base
@@ -2524,12 +2559,13 @@ mod tests {
             | yayatht_sys::reactor::ERROR
             | yayatht_sys::reactor::READ_HANGUP;
         let writable = base | yayatht_sys::reactor::WRITABLE;
-        // Idle established flow: epoll_wait must be able to block.
-        assert_eq!(socket_interest(false, false, false, false), base);
-        assert_eq!(socket_interest(true, false, false, false), writable);
-        assert_eq!(socket_interest(false, true, false, false), writable);
-        assert_eq!(socket_interest(false, false, true, false), writable);
-        assert_eq!(socket_interest(false, false, false, true), writable);
+        // Idle established flow: epoll_wait must be able to block. Flows
+        // with unacknowledged upstream bytes stay unarmed too; the ACK
+        // watchdog covers them without writable busy-polling.
+        assert_eq!(socket_interest(false, false, false), base);
+        assert_eq!(socket_interest(true, false, false), writable);
+        assert_eq!(socket_interest(false, true, false), writable);
+        assert_eq!(socket_interest(false, false, true), writable);
     }
 
     #[test]

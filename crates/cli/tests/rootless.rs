@@ -335,6 +335,25 @@ fn missing_send_window_alone_is_not_reported_as_degraded() {
 }
 
 #[test]
+fn tx_timestamp_fallback_completes_without_writable_polling() {
+    // With TX ACK timestamps rejected, upstream ACK progress must come from
+    // TAP activity and the periodic watchdog; writable interest is never
+    // armed for ACK polling. The echo server reads the full payload before
+    // echoing, so the upload tail has no readable events to piggyback on.
+    let payload = (0..48 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "tx-ack-watchdog",
+        payload,
+        &[("YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS", "1")],
+    );
+}
+
+#[test]
 fn retransmit_recovers_two_dropped_namespace_segments() {
     let payload = (0..32 * 1024)
         .map(|index| (index % 251) as u8)
