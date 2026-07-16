@@ -5,6 +5,7 @@ pub mod ethernet;
 pub mod ip;
 pub mod neighbor;
 pub mod tcp;
+pub mod vnet;
 
 pub use ethernet::{EtherType, EthernetFrame, MacAddress};
 pub use ip::{IpPacket, Ipv4Packet, Ipv6Packet};

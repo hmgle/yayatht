@@ -284,7 +284,8 @@ fn namespace_child_inner(
     control::expect(control_fd.as_raw_fd(), Kind::MapsReady)?;
     yayatht_sys::mount::mount_private_proc()?;
     debug_failpoint("ns_tap")?;
-    let tap = yayatht_sys::tun::create_tap(&config.network.interface_name)?;
+    let tap =
+        yayatht_sys::tun::create_tap(&config.network.interface_name, config.network.tap_offload)?;
     yayatht_sys::netlink::configure_namespace(
         &config.network.interface_name,
         config.network.target_mac.octets(),

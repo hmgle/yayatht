@@ -16,7 +16,7 @@ machinery are gone; setup failures fail the flow instead of degrading it;
 watchdog dropped-notification recovery is preserved; docs state Linux 6.6+.
 **Tests**: Existing watchdog suppression test adapted to timestamps-on
 semantics; truncated-`TCP_INFO` unit test; full serial workspace suite.
-**Status**: In Progress
+**Status**: Complete
 
 ## Stage 2: vnet_hdr frame layout plumbing (zeroed header)
 
@@ -27,7 +27,7 @@ namespace → dataplane (off reproduces today's exact behavior).
 **Success Criteria**: Full rootless matrix passes in both modes; RX frames
 with unexpected vnet flags are counted as parse drops.
 **Tests**: vnet header encode/decode unit tests; matrix in both modes.
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 3: checksum offload + GRO large-frame receive
 

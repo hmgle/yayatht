@@ -39,7 +39,7 @@ fn echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str) {
     echo_payload_case(
         bind,
         gateway,
-        family_flag,
+        &[family_flag],
         label,
         format!("yayatht-{label}\n").into_bytes(),
         &[],
@@ -49,7 +49,7 @@ fn echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str) {
 fn echo_payload_case(
     bind: SocketAddr,
     gateway: &str,
-    family_flag: &str,
+    run_flags: &[&str],
     label: &str,
     payload: Vec<u8>,
     environment: &[(&str, &str)],
@@ -73,21 +73,20 @@ fn echo_payload_case(
 
     let name = unique_name(label);
     let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
-    command.args([
-        "run",
-        "--direct",
-        "--host-loopback",
-        family_flag,
-        "--name",
-        &name,
-        "--",
-        "busybox",
-        "nc",
-        "-w",
-        "8",
-        gateway,
-        &port.to_string(),
-    ]);
+    command
+        .args(["run", "--direct", "--host-loopback"])
+        .args(run_flags)
+        .args([
+            "--name",
+            &name,
+            "--",
+            "busybox",
+            "nc",
+            "-w",
+            "8",
+            gateway,
+            &port.to_string(),
+        ]);
     for (key, value) in environment {
         command.env(key, value);
     }
@@ -289,6 +288,23 @@ fn ipv6_busybox_echo() {
 }
 
 #[test]
+fn tap_offload_off_preserves_tcp_echo() {
+    // --tap-offload=off opens the TAP without IFF_VNET_HDR, so this pins
+    // the plain frame layout as an A/B reference for the offload path.
+    let payload = (0..32 * 1024)
+        .map(|index| (index % 251) as u8)
+        .collect::<Vec<_>>();
+    echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        &["--no-ipv6", "--tap-offload", "off"],
+        "offload-off",
+        payload,
+        &[],
+    );
+}
+
+#[test]
 fn watchdog_advances_upstream_ack_without_event_refreshes() {
     if !supported() {
         return;
@@ -381,7 +397,7 @@ fn retransmit_recovers_two_dropped_namespace_segments() {
     echo_payload_case(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         "192.0.2.1",
-        "--no-ipv6",
+        &["--no-ipv6"],
         "retransmit",
         payload,
         &[("YAYATHT_TEST_DROP_TCP_DATA", "2")],
@@ -396,7 +412,7 @@ fn retransmit_recovers_when_the_first_retransmission_is_lost() {
     echo_payload_case(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         "192.0.2.1",
-        "--no-ipv6",
+        &["--no-ipv6"],
         "retransmit-retry",
         payload,
         &[
@@ -411,7 +427,7 @@ fn lost_syn_ack_is_retransmitted() {
     echo_payload_case(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         "192.0.2.1",
-        "--no-ipv6",
+        &["--no-ipv6"],
         "syn-ack-loss",
         b"syn-ack-recovered\n".to_vec(),
         &[("YAYATHT_TEST_DROP_TCP_SYN_ACK", "1")],
@@ -423,7 +439,7 @@ fn lost_fin_is_retransmitted() {
     echo_payload_case(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         "192.0.2.1",
-        "--no-ipv6",
+        &["--no-ipv6"],
         "fin-loss",
         b"fin-recovered\n".to_vec(),
         &[("YAYATHT_TEST_DROP_TCP_FIN", "1")],
@@ -438,7 +454,7 @@ fn local_sequence_wrap_survives_a_long_transfer() {
     echo_payload_case(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         "192.0.2.1",
-        "--no-ipv6",
+        &["--no-ipv6"],
         "sequence-wrap",
         payload,
         &[("YAYATHT_TEST_LOCAL_ISN", "4294963200")],
@@ -1082,8 +1098,10 @@ fn status_socket_reports_running_instance() {
     );
     assert_eq!(value["dataplane"]["flow_fd_limit"], 4096 + 32);
     assert_eq!(value["dataplane"]["tap_mtu"], 32_000);
-    assert_eq!(value["dataplane"]["tap_frame_capacity"], 32_014);
-    assert_eq!(value["dataplane"]["tap_frame_pool_frames"], 524);
+    assert_eq!(value["dataplane"]["tap_offload"], 1);
+    // MTU + Ethernet header + the 10-byte virtio_net_hdr prefix.
+    assert_eq!(value["dataplane"]["tap_frame_capacity"], 32_024);
+    assert_eq!(value["dataplane"]["tap_frame_pool_frames"], 523);
     let dataplane_pid = value["dataplane_pid"].as_i64().unwrap();
     let limits = fs::read_to_string(format!("/proc/{dataplane_pid}/limits")).unwrap();
     let open_files = limits

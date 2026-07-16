@@ -13,6 +13,7 @@ use yayatht_packet::ethernet::{self, EtherType, EthernetFrame, MacAddress};
 use yayatht_packet::ip::{self, Ipv4Packet, Ipv6Packet};
 use yayatht_packet::neighbor;
 use yayatht_packet::tcp::{self, TcpFlags, TcpHeaderSpec, TcpSegment};
+use yayatht_packet::vnet;
 use yayatht_proxy_proto::{Credentials, Handshake, Protocol};
 use yayatht_tcp_adapter::flow::{
     ConstructionState, Flow, FlowConstruction, FlowInterface, FlowKey, FlowSide, FlowType,
@@ -70,6 +71,7 @@ pub struct Config {
     pub target_ipv6: Option<Ipv6Addr>,
     pub gateway_ipv6: Option<Ipv6Addr>,
     pub tap_mtu: u32,
+    pub tap_offload: bool,
     pub upstream: Upstream,
     pub max_tcp_flows: usize,
     pub max_pending_tcp_bytes: usize,
@@ -105,6 +107,7 @@ pub struct Metrics {
     pub pending_high_water_events: u64,
     pub frame_pool_exhaustions: u64,
     pub tap_mtu: u64,
+    pub tap_offload: u64,
     pub tap_frame_capacity: u64,
     pub tap_frame_pool_frames: u64,
     pub tap_frame_pool_bytes: u64,
@@ -328,6 +331,9 @@ pub struct Reactor {
     frame_pool: BufferPool,
     tap_rx_buffer: Vec<u8>,
     tap_queue: VecDeque<QueuedFrame>,
+    /// Length of the `virtio_net_hdr` prefix on every TAP read and write;
+    /// zero when the TAP was opened without `IFF_VNET_HDR`.
+    vnet_len: usize,
     metrics: Metrics,
     shutting_down: bool,
     test_drop_tcp_data: usize,
@@ -368,9 +374,14 @@ impl Reactor {
             EpollToken::global(Resource::Control).raw(),
         )?;
         let max_tcp_flows = config.max_tcp_flows;
+        let vnet_len = if config.tap_offload {
+            vnet::VNET_HEADER_LEN
+        } else {
+            0
+        };
         let frame_capacity = usize::try_from(config.tap_mtu)
             .map_err(|_| Error::Invariant("TAP MTU exceeds usize"))?
-            .checked_add(ethernet::ETHERNET_HEADER_LEN)
+            .checked_add(ethernet::ETHERNET_HEADER_LEN + vnet_len)
             .ok_or(Error::Invariant("TAP frame capacity overflow"))?;
         let frame_pool_frames =
             (TAP_FRAME_POOL_BYTES / frame_capacity).clamp(1, TAP_FRAME_POOL_MAX_FRAMES);
@@ -379,6 +390,7 @@ impl Reactor {
             max_retained_tcp_bytes: config.max_retained_tcp_bytes as u64,
             flow_fd_limit: yayatht_sys::resource::dataplane_nofile_limit(max_tcp_flows)?,
             tap_mtu: u64::from(config.tap_mtu),
+            tap_offload: u64::from(config.tap_offload),
             tap_frame_capacity: frame_capacity as u64,
             tap_frame_pool_frames: frame_pool_frames as u64,
             tap_frame_pool_bytes: frame_pool_frames.saturating_mul(frame_capacity) as u64,
@@ -405,6 +417,7 @@ impl Reactor {
             frame_pool: BufferPool::new(frame_pool_frames, frame_capacity),
             tap_rx_buffer: vec![0; frame_capacity],
             tap_queue: VecDeque::new(),
+            vnet_len,
             metrics,
             shutting_down: false,
             test_drop_tcp_data: test_drop_tcp_data_count(),
@@ -518,6 +531,7 @@ impl Reactor {
     }
 
     fn handle_frame(&mut self, bytes: &[u8]) -> Result<(), Error> {
+        let bytes = self.strip_rx_vnet(bytes)?;
         let ethernet = EthernetFrame::parse(bytes)?;
         match ethernet.ether_type() {
             EtherType::Arp => self.handle_arp(ethernet),
@@ -525,6 +539,24 @@ impl Reactor {
             EtherType::Ipv6 => self.handle_ipv6(ethernet),
             _ => Ok(()),
         }
+    }
+
+    /// Strips and validates the `virtio_net_hdr` prefix on a received TAP
+    /// frame. Offload features are not negotiated yet, so only plain
+    /// headers (complete checksum, no GSO) are accepted; anything else is
+    /// a parse drop that surfaces in metrics instead of a silently
+    /// misread frame body.
+    fn strip_rx_vnet<'a>(&self, bytes: &'a [u8]) -> Result<&'a [u8], Error> {
+        if self.vnet_len == 0 {
+            return Ok(bytes);
+        }
+        let header = vnet::VnetHeader::parse(bytes)?;
+        if !header.is_plain() {
+            return Err(Error::Invariant(
+                "TAP frame carries unnegotiated vnet offload state",
+            ));
+        }
+        Ok(&bytes[self.vnet_len..])
     }
 
     fn handle_arp(&mut self, ethernet: EthernetFrame<'_>) -> Result<(), Error> {
@@ -535,9 +567,12 @@ impl Reactor {
         if request.target_ip != gateway.octets() {
             return Ok(());
         }
+        let vnet_len = self.vnet_len;
         let mut frame = self.acquire_frame()?;
+        let buffer = frame.buffer.writable();
+        buffer[..vnet_len].fill(0);
         let length = match neighbor::write_arp_reply(
-            frame.buffer.writable(),
+            &mut buffer[vnet_len..],
             self.config.gateway_mac,
             gateway.octets(),
             request,
@@ -548,7 +583,7 @@ impl Reactor {
                 return Err(error.into());
             }
         };
-        frame.buffer.set_len(length);
+        frame.buffer.set_len(vnet_len + length);
         self.queue_tap(None, frame, None)
     }
 
@@ -585,9 +620,12 @@ impl Reactor {
             if target != gateway.octets() {
                 return Ok(());
             }
+            let vnet_len = self.vnet_len;
             let mut frame = self.acquire_frame()?;
+            let buffer = frame.buffer.writable();
+            buffer[..vnet_len].fill(0);
             let length = match neighbor::write_neighbor_advertisement(
-                frame.buffer.writable(),
+                &mut buffer[vnet_len..],
                 self.config.gateway_mac,
                 ethernet.source(),
                 gateway.octets(),
@@ -599,7 +637,7 @@ impl Reactor {
                     return Err(error.into());
                 }
             };
-            frame.buffer.set_len(length);
+            frame.buffer.set_len(vnet_len + length);
             debug!(gateway = %gateway, "sending neighbor advertisement");
             return self.queue_tap(None, frame, None);
         }
@@ -1485,7 +1523,7 @@ impl Reactor {
                         .ok_or(Error::Invariant("inactive flow reached socket reader"))?
                         .namespace_key();
                     let last_byte = frame.buffer.writable()
-                        [Self::tcp_payload_offset(key, None, None) + length - 1];
+                        [self.tcp_payload_offset(key, None, None) + length - 1];
                     self.flows
                         .get_mut(id)
                         .expect("flow exists")
@@ -1863,7 +1901,7 @@ impl Reactor {
                 entry.socket.as_raw_fd(),
             )
         };
-        let payload_offset = Self::tcp_payload_offset(key, None, None);
+        let payload_offset = self.tcp_payload_offset(key, None, None);
         let offset = i32::try_from(offset)
             .map_err(|_| Error::Invariant("socket peek offset exceeds i32"))?;
         let mut frame = self.acquire_frame()?;
@@ -2003,7 +2041,7 @@ impl Reactor {
         window: u16,
     ) -> Result<PooledFrame, Error> {
         let mut frame = self.acquire_frame()?;
-        let payload_offset = Self::tcp_payload_offset(key, mss, window_scale);
+        let payload_offset = self.tcp_payload_offset(key, mss, window_scale);
         let frame_len = payload_offset + payload.len();
         if frame_len > frame.buffer.capacity() {
             self.release_frame(frame);
@@ -2044,12 +2082,20 @@ impl Reactor {
         self.frame_pool.release(frame.pool_index, frame.buffer);
     }
 
-    fn tcp_payload_offset(key: FlowKey, mss: Option<u16>, window_scale: Option<u8>) -> usize {
+    /// Offset of the TCP payload within a TAP frame buffer: the
+    /// `virtio_net_hdr` prefix (when negotiated) plus Ethernet, IP and TCP
+    /// headers.
+    fn tcp_payload_offset(
+        &self,
+        key: FlowKey,
+        mss: Option<u16>,
+        window_scale: Option<u8>,
+    ) -> usize {
         let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
         let tcp_header_len = tcp::TCP_MIN_HEADER_LEN
             + if mss.is_some() { 4 } else { 0 }
             + if window_scale.is_some() { 4 } else { 0 };
-        ethernet::ETHERNET_HEADER_LEN + ip_header_len + tcp_header_len
+        self.vnet_len + ethernet::ETHERNET_HEADER_LEN + ip_header_len + tcp_header_len
     }
 
     fn finalize_tcp_frame(&self, frame: &mut PooledFrame, spec: TcpFrameSpec) -> Result<(), Error> {
@@ -2063,11 +2109,12 @@ impl Reactor {
             payload_len,
         } = spec;
         let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
-        let payload_offset = Self::tcp_payload_offset(key, mss, window_scale);
+        let payload_offset = self.tcp_payload_offset(key, mss, window_scale);
         let frame_len = payload_offset + payload_len;
         let bytes = frame.buffer.writable();
+        bytes[..self.vnet_len].fill(0);
         ethernet::write_header(
-            bytes,
+            &mut bytes[self.vnet_len..],
             self.config.target_mac,
             self.config.gateway_mac,
             if key.target.is_ipv4() {
@@ -2076,7 +2123,7 @@ impl Reactor {
                 EtherType::Ipv6
             },
         )?;
-        let ip_offset = ethernet::ETHERNET_HEADER_LEN;
+        let ip_offset = self.vnet_len + ethernet::ETHERNET_HEADER_LEN;
         let tcp_offset = ip_offset + ip_header_len;
         let written = tcp::write_header(
             &mut bytes[tcp_offset..frame_len],

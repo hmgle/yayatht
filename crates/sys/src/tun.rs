@@ -15,7 +15,10 @@ struct IfReq {
     padding: [u8; 22],
 }
 
-pub fn create_tap(name: &str) -> io::Result<OwnedFd> {
+/// Creates the namespace-side TAP device. `vnet_hdr` negotiates
+/// `IFF_VNET_HDR`, prefixing every read and write on the returned fd with
+/// a `virtio_net_hdr`; offload feature bits are enabled separately.
+pub fn create_tap(name: &str, vnet_hdr: bool) -> io::Result<OwnedFd> {
     let name = CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL"))?;
     if name.as_bytes().len() >= libc::IFNAMSIZ {
@@ -37,9 +40,13 @@ pub fn create_tap(name: &str) -> io::Result<OwnedFd> {
     }
     // SAFETY: raw was returned by open and ownership is transferred here.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    let mut flags = libc::IFF_TAP | libc::IFF_NO_PI;
+    if vnet_hdr {
+        flags |= libc::IFF_VNET_HDR;
+    }
     let mut request = IfReq {
         name: [0; libc::IFNAMSIZ],
-        flags: (libc::IFF_TAP | libc::IFF_NO_PI) as libc::c_short,
+        flags: flags as libc::c_short,
         padding: [0; 22],
     };
     for (target, source) in request.name.iter_mut().zip(name.as_bytes()) {

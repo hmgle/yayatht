@@ -21,6 +21,7 @@ pub enum UpstreamConfig {
 pub struct NetworkConfig {
     pub interface_name: String,
     pub tap_mtu: u32,
+    pub tap_offload: bool,
     pub target_mac: MacAddress,
     pub gateway_mac: MacAddress,
     pub target_ipv4: Option<(Ipv4Addr, u8)>,
@@ -31,10 +32,11 @@ pub struct NetworkConfig {
 
 impl NetworkConfig {
     #[must_use]
-    pub fn synthetic(ipv4: bool, ipv6: bool, tap_mtu: u32) -> Self {
+    pub fn synthetic(ipv4: bool, ipv6: bool, tap_mtu: u32, tap_offload: bool) -> Self {
         Self {
             interface_name: "eth0".to_owned(),
             tap_mtu,
+            tap_offload,
             target_mac: MacAddress([0x02, 0x79, 0x61, 0x79, 0x61, 0x02]),
             gateway_mac: MacAddress([0x02, 0x79, 0x61, 0x79, 0x61, 0x01]),
             target_ipv4: ipv4.then_some((Ipv4Addr::new(192, 0, 2, 2), 24)),
@@ -71,6 +73,7 @@ impl NetworkConfig {
             target_ipv6: self.target_ipv6.map(|(address, _)| address),
             gateway_ipv6: self.gateway_ipv6,
             tap_mtu: self.tap_mtu,
+            tap_offload: self.tap_offload,
             upstream: match upstream {
                 UpstreamConfig::Direct { host_loopback } => {
                     yayatht_dataplane::reactor::Upstream::Direct {

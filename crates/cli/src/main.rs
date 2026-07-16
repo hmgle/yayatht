@@ -83,6 +83,14 @@ struct RunArgs {
         value_name = "BYTES"
     )]
     tap_mtu: u32,
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(["on", "off"]),
+        default_value = "on",
+        value_name = "on|off",
+        help = "Negotiate TAP vnet_hdr and kernel offloads"
+    )]
+    tap_offload: String,
     #[arg(long)]
     no_ipv4: bool,
     #[arg(long)]
@@ -171,7 +179,12 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         command: args.command,
         name: args.name,
         runtime_root: args.runtime_dir,
-        network: NetworkConfig::synthetic(!args.no_ipv4, !args.no_ipv6, args.tap_mtu),
+        network: NetworkConfig::synthetic(
+            !args.no_ipv4,
+            !args.no_ipv6,
+            args.tap_mtu,
+            args.tap_offload == "on",
+        ),
         upstream,
         max_tcp_flows: args.max_tcp_flows,
         max_pending_tcp_bytes: args.max_pending_tcp_bytes,
