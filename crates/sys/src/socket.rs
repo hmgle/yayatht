@@ -77,6 +77,28 @@ pub fn connect_nonblocking(
     }
 }
 
+/// Zero-timeout probe for an in-flight nonblocking connect: true once the
+/// socket is writable or carries a pending error. A loopback handshake
+/// usually completes inside the kernel before the caller returns to its
+/// event loop, so this catches it without a sleep/wake round trip.
+pub fn poll_writable_now(fd: RawFd) -> io::Result<bool> {
+    let mut probe = libc::pollfd {
+        fd,
+        events: libc::POLLOUT,
+        revents: 0,
+    };
+    // SAFETY: probe points to one valid pollfd and the timeout is zero.
+    let ready = unsafe { libc::poll(std::ptr::from_mut(&mut probe), 1, 0) };
+    if ready == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::Interrupted {
+            return Ok(false);
+        }
+        return Err(error);
+    }
+    Ok(ready > 0 && probe.revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP) != 0)
+}
+
 fn set_nodelay(fd: RawFd) -> io::Result<()> {
     let enabled = 1i32;
     // SAFETY: enabled points to a valid c_int TCP_NODELAY option value.
@@ -413,6 +435,26 @@ mod tests {
             local_address(stream.as_raw_fd()).unwrap(),
             stream.local_addr().unwrap()
         );
+    }
+
+    #[test]
+    fn writable_probe_catches_a_loopback_connect_without_events() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let (socket, connected) =
+            connect_nonblocking(listener.local_addr().unwrap(), 256 << 10, 256 << 10).unwrap();
+        // The loopback handshake completes inside the kernel almost
+        // immediately; bound the wait instead of assuming the very first
+        // probe wins the race.
+        let mut ready = connected;
+        for _ in 0..1000 {
+            if ready {
+                break;
+            }
+            ready = poll_writable_now(socket.as_raw_fd()).unwrap();
+            std::thread::sleep(std::time::Duration::from_micros(50));
+        }
+        assert!(ready, "loopback connect never became writable");
+        assert_eq!(pending_error(socket.as_raw_fd()).unwrap(), None);
     }
 
     #[test]

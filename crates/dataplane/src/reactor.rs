@@ -619,6 +619,7 @@ impl Reactor {
         if request.target_ip != gateway.octets() {
             return Ok(());
         }
+        debug!(gateway = %gateway, "answering ARP request");
         let vnet_len = self.vnet_len;
         let mut frame = self.acquire_frame()?;
         let buffer = frame.buffer.writable();
@@ -727,6 +728,7 @@ impl Reactor {
         if !flags.syn || flags.ack || flags.rst {
             return Ok(());
         }
+        debug!(namespace = %key.namespace, target = %key.target, "received namespace SYN");
         let (target_interface, transport_peer) = self.route_target(key.target);
         let (socket, connected) = match yayatht_sys::socket::connect_nonblocking(
             transport_peer,
@@ -849,6 +851,14 @@ impl Reactor {
             .activate()
             .map_err(|_| Error::Invariant("unable to activate TCP flow"))?;
         self.metrics.tcp_created += 1;
+        // A loopback (or otherwise immediate) upstream handshake usually
+        // completes inside the kernel before this handler returns, so a
+        // zero-timeout probe finishes activation -- SYN-ACK or proxy
+        // greeting -- in the same wakeup instead of paying a sleep/wake
+        // round trip for the EPOLLOUT event. Slower targets stay fully
+        // event-driven; a probed pending error takes the normal
+        // finish_transport_connect failure path.
+        let connected = connected || yayatht_sys::socket::poll_writable_now(fd)?;
         if connected {
             self.finish_transport_connect(id)?;
             self.update_socket_interest(id)?;
@@ -1224,6 +1234,7 @@ impl Reactor {
                 ..TcpFlags::default()
             },
         )?;
+        debug!(flow_slot = id.slot, "queueing SYN-ACK");
         self.queue_tap(Some(id), frame, Some(plan))
     }
 
