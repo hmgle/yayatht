@@ -80,6 +80,12 @@ pub struct Config {
     pub tap_mtu: u32,
     pub tap_offload: bool,
     pub upstream: Upstream,
+    /// Intercept gateway-directed 53/UDP and 53/TCP (design §9 `proxy-tcp`).
+    pub dns_proxy_tcp: bool,
+    /// Resolver behind the interception; `None` answers SERVFAIL/RST so a
+    /// host without a usable resolver stays leak-free without failing
+    /// TCP-only workloads.
+    pub dns_upstream: Option<SocketAddr>,
     pub max_tcp_flows: usize,
     pub max_pending_tcp_bytes: usize,
     pub max_retained_tcp_bytes: usize,

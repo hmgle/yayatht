@@ -1,9 +1,48 @@
 use std::ffi::OsString;
-use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use thiserror::Error;
 use yayatht_packet::MacAddress;
 use yayatht_proxy_proto::{Credentials, Protocol};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DnsMode {
+    ProxyTcp,
+    Off,
+}
+
+#[derive(Clone, Debug)]
+pub struct DnsConfig {
+    pub mode: DnsMode,
+    /// Resolver the intercepted queries are forwarded to. `None` with
+    /// `ProxyTcp` keeps interception active but answers SERVFAIL, so a
+    /// missing host resolver never leaks queries or blocks TCP workloads.
+    pub upstream: Option<SocketAddr>,
+}
+
+impl DnsConfig {
+    #[must_use]
+    pub fn off() -> Self {
+        Self {
+            mode: DnsMode::Off,
+            upstream: None,
+        }
+    }
+}
+
+/// Returns the first `nameserver` address in `resolv.conf` contents.
+#[must_use]
+pub fn first_nameserver(resolv_conf: &str) -> Option<IpAddr> {
+    resolv_conf
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            (fields.next() == Some("nameserver"))
+                .then(|| fields.next())
+                .flatten()
+        })
+        .find_map(|value| value.parse().ok())
+}
 
 #[derive(Clone, Debug)]
 pub enum UpstreamConfig {
@@ -54,27 +93,36 @@ impl NetworkConfig {
             ),
         }
     }
+}
 
+#[derive(Clone, Debug)]
+pub struct LaunchConfig {
+    pub command: Vec<OsString>,
+    pub name: Option<String>,
+    pub runtime_root: Option<PathBuf>,
+    pub network: NetworkConfig,
+    pub upstream: UpstreamConfig,
+    pub dns: DnsConfig,
+    pub max_tcp_flows: usize,
+    pub max_pending_tcp_bytes: usize,
+    pub max_retained_tcp_bytes: usize,
+    pub tcp_receive_buffer_bytes: usize,
+    pub tcp_send_buffer_bytes: usize,
+}
+
+impl LaunchConfig {
     #[must_use]
-    pub fn dataplane(
-        &self,
-        upstream: &UpstreamConfig,
-        max_tcp_flows: usize,
-        max_pending_tcp_bytes: usize,
-        max_retained_tcp_bytes: usize,
-        tcp_receive_buffer_bytes: usize,
-        tcp_send_buffer_bytes: usize,
-    ) -> yayatht_dataplane::reactor::Config {
+    pub fn dataplane(&self) -> yayatht_dataplane::reactor::Config {
         yayatht_dataplane::reactor::Config {
-            target_mac: self.target_mac,
-            gateway_mac: self.gateway_mac,
-            target_ipv4: self.target_ipv4.map(|(address, _)| address),
-            gateway_ipv4: self.gateway_ipv4,
-            target_ipv6: self.target_ipv6.map(|(address, _)| address),
-            gateway_ipv6: self.gateway_ipv6,
-            tap_mtu: self.tap_mtu,
-            tap_offload: self.tap_offload,
-            upstream: match upstream {
+            target_mac: self.network.target_mac,
+            gateway_mac: self.network.gateway_mac,
+            target_ipv4: self.network.target_ipv4.map(|(address, _)| address),
+            gateway_ipv4: self.network.gateway_ipv4,
+            target_ipv6: self.network.target_ipv6.map(|(address, _)| address),
+            gateway_ipv6: self.network.gateway_ipv6,
+            tap_mtu: self.network.tap_mtu,
+            tap_offload: self.network.tap_offload,
+            upstream: match &self.upstream {
                 UpstreamConfig::Direct { host_loopback } => {
                     yayatht_dataplane::reactor::Upstream::Direct {
                         host_loopback: *host_loopback,
@@ -90,27 +138,15 @@ impl NetworkConfig {
                     credentials: credentials.clone(),
                 },
             },
-            max_tcp_flows,
-            max_pending_tcp_bytes,
-            max_retained_tcp_bytes,
-            tcp_receive_buffer_bytes,
-            tcp_send_buffer_bytes,
+            dns_proxy_tcp: self.dns.mode == DnsMode::ProxyTcp,
+            dns_upstream: self.dns.upstream,
+            max_tcp_flows: self.max_tcp_flows,
+            max_pending_tcp_bytes: self.max_pending_tcp_bytes,
+            max_retained_tcp_bytes: self.max_retained_tcp_bytes,
+            tcp_receive_buffer_bytes: self.tcp_receive_buffer_bytes,
+            tcp_send_buffer_bytes: self.tcp_send_buffer_bytes,
         }
     }
-}
-
-#[derive(Clone, Debug)]
-pub struct LaunchConfig {
-    pub command: Vec<OsString>,
-    pub name: Option<String>,
-    pub runtime_root: Option<PathBuf>,
-    pub network: NetworkConfig,
-    pub upstream: UpstreamConfig,
-    pub max_tcp_flows: usize,
-    pub max_pending_tcp_bytes: usize,
-    pub max_retained_tcp_bytes: usize,
-    pub tcp_receive_buffer_bytes: usize,
-    pub tcp_send_buffer_bytes: usize,
 }
 
 #[derive(Debug, Error)]
@@ -172,5 +208,38 @@ impl LaunchConfig {
         if let UpstreamConfig::Proxy { credentials, .. } = &mut self.upstream {
             *credentials = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::first_nameserver;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+
+    #[test]
+    fn first_nameserver_skips_comments_and_options() {
+        let contents = "# Generated by NetworkManager\n\
+                        options edns0 trust-ad\n\
+                        search example.net\n\
+                        nameserver 192.0.2.53\n\
+                        nameserver 192.0.2.54\n";
+        assert_eq!(
+            first_nameserver(contents),
+            Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 53)))
+        );
+    }
+
+    #[test]
+    fn first_nameserver_accepts_ipv6_and_ignores_garbage() {
+        let contents = "nameserver not-an-address\nnameserver 2001:db8::53\n";
+        assert_eq!(
+            first_nameserver(contents),
+            Some(IpAddr::V6("2001:db8::53".parse::<Ipv6Addr>().unwrap()))
+        );
+    }
+
+    #[test]
+    fn first_nameserver_handles_empty_host_files() {
+        assert_eq!(first_nameserver("# Generated by NetworkManager\n"), None);
     }
 }

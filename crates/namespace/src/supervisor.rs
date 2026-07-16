@@ -61,14 +61,7 @@ impl Supervisor {
         let (ns_parent, ns_child) = yayatht_sys::fdpass::seqpacket_pair()?;
         let (tap_dp, tap_ns) = yayatht_sys::fdpass::seqpacket_pair()?;
 
-        let dataplane_config = config.network.dataplane(
-            &config.upstream,
-            config.max_tcp_flows,
-            config.max_pending_tcp_bytes,
-            config.max_retained_tcp_bytes,
-            config.tcp_receive_buffer_bytes,
-            config.tcp_send_buffer_bytes,
-        );
+        let dataplane_config = config.dataplane();
         let (dataplane_pid, dataplane_pidfd) = match clone_namespaced(COMMON_NAMESPACES)? {
             CloneResult::Child => {
                 drop(signal_fd);

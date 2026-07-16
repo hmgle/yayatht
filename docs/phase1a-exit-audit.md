@@ -16,6 +16,13 @@ DNS proxy-tcp should therefore remain blocked. The current TCP adapter remains
 the working implementation, but the kernel-compatibility and high-concurrency
 calibration gates do not yet justify freezing it for Phase 1B.
 
+> 2026-07-16 re-evaluation: **the block is lifted.** The kernel-compatibility
+> gate dissolved when the baseline moved to Linux 6.6 LTS and the degraded
+> paths were removed; the calibration gate closed with Phase 1B
+> (`docs/phase1b-calibration-2026-07-16.md`). The remaining 128-flow fairness
+> variance is a host-TUN attribution question, not an adapter-freeze blocker.
+> DNS proxy-tcp proceeds as Phase 1C: `docs/phase1c-plan.md`.
+
 ## Delivered in this audit
 
 - `FlowSide` now records `{ interface, local_endpoint, logical_peer,

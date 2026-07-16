@@ -23,7 +23,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    Run(RunArgs),
+    Run(Box<RunArgs>),
     Status(StatusArgs),
 }
 
@@ -91,6 +91,21 @@ struct RunArgs {
         help = "Negotiate TAP vnet_hdr and kernel offloads"
     )]
     tap_offload: String,
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(["proxy-tcp", "off"]),
+        default_value = "proxy-tcp",
+        value_name = "proxy-tcp|off",
+        help = "Intercept namespace DNS and forward it over TCP through the upstream"
+    )]
+    dns: String,
+    #[arg(
+        long,
+        value_name = "ADDR",
+        value_parser = parse_resolver,
+        help = "Resolver for intercepted DNS (default: first host resolv.conf nameserver, port 53)"
+    )]
+    dns_upstream: Option<SocketAddr>,
     #[arg(long)]
     no_ipv4: bool,
     #[arg(long)]
@@ -123,7 +138,7 @@ fn main() {
         .with_writer(std::io::stderr)
         .init();
     let result = match Cli::parse().command {
-        Command::Run(args) => run(args),
+        Command::Run(args) => run(*args),
         Command::Status(args) => status(args),
     };
     match result {
@@ -175,6 +190,7 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         }
         _ => return Err("select exactly one of --direct, --socks5, or --http-connect".into()),
     };
+    let dns = dns_config(&args.dns, args.dns_upstream, &upstream);
     let config = LaunchConfig {
         command: args.command,
         name: args.name,
@@ -186,6 +202,7 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
             args.tap_offload == "on",
         ),
         upstream,
+        dns,
         max_tcp_flows: args.max_tcp_flows,
         max_pending_tcp_bytes: args.max_pending_tcp_bytes,
         max_retained_tcp_bytes: args.max_retained_tcp_bytes,
@@ -193,6 +210,51 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         tcp_send_buffer_bytes: args.tcp_send_buffer_bytes,
     };
     Ok(Supervisor::run(config)?.code)
+}
+
+fn parse_resolver(value: &str) -> Result<SocketAddr, String> {
+    if let Ok(address) = value.parse::<SocketAddr>() {
+        return Ok(address);
+    }
+    value
+        .parse::<std::net::IpAddr>()
+        .map(|ip| SocketAddr::new(ip, 53))
+        .map_err(|_| format!("expected IP or IP:PORT, got {value:?}"))
+}
+
+fn dns_config(
+    mode: &str,
+    explicit_upstream: Option<SocketAddr>,
+    upstream: &UpstreamConfig,
+) -> yayatht_namespace::DnsConfig {
+    if mode == "off" {
+        return yayatht_namespace::DnsConfig::off();
+    }
+    let resolver = explicit_upstream.or_else(|| {
+        std::fs::read_to_string("/etc/resolv.conf")
+            .ok()
+            .and_then(|contents| yayatht_namespace::config::first_nameserver(&contents))
+            .map(|ip| SocketAddr::new(ip, 53))
+    });
+    match resolver {
+        None => tracing::warn!(
+            "no DNS resolver found: intercepted namespace queries will be answered \
+             SERVFAIL; pass --dns-upstream <ADDR> or --dns off"
+        ),
+        Some(address)
+            if address.ip().is_loopback() && matches!(upstream, UpstreamConfig::Proxy { .. }) =>
+        {
+            tracing::warn!(
+                resolver = %address,
+                "loopback resolver behind a proxy resolves on the proxy host itself"
+            );
+        }
+        Some(_) => {}
+    }
+    yayatht_namespace::DnsConfig {
+        mode: yayatht_namespace::DnsMode::ProxyTcp,
+        upstream: resolver,
+    }
 }
 
 fn read_credential(path: &std::path::Path) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
