@@ -240,35 +240,6 @@ pub fn local_address(fd: RawFd) -> io::Result<SocketAddr> {
     }
 }
 
-pub fn send_buffer_available(fd: RawFd) -> io::Result<usize> {
-    let mut send_buffer = 0i32;
-    let mut len = size_of::<i32>() as libc::socklen_t;
-    // SAFETY: send_buffer and len are valid getsockopt output storage.
-    if unsafe {
-        libc::getsockopt(
-            fd,
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            std::ptr::from_mut(&mut send_buffer).cast(),
-            std::ptr::from_mut(&mut len),
-        )
-    } == -1
-    {
-        return Err(io::Error::last_os_error());
-    }
-    let usable = usize::try_from(send_buffer.max(0)).unwrap_or(0) / 2;
-    Ok(usable.saturating_sub(send_queue_bytes(fd)?))
-}
-
-pub fn send_queue_bytes(fd: RawFd) -> io::Result<usize> {
-    let mut queued = 0i32;
-    // SAFETY: queued points to writable integer storage for TIOCOUTQ.
-    if unsafe { libc::ioctl(fd, libc::TIOCOUTQ, std::ptr::from_mut(&mut queued)) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(usize::try_from(queued.max(0)).unwrap_or(usize::MAX))
-}
-
 pub fn send(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
     // SAFETY: bytes is borrowed for the duration of send.
     let count = unsafe {

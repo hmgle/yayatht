@@ -1410,9 +1410,18 @@ impl Reactor {
     }
 
     fn update_namespace_window(&mut self, id: FlowId) -> Result<bool, Error> {
-        let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
-        let socket_available = yayatht_sys::socket::send_buffer_available(fd)?;
         let entry = self.flows.get(id).expect("flow exists");
+        // SO_SNDBUF is set explicitly at socket creation, so the capacity
+        // captured at construction is fixed (the kernel reports it doubled
+        // to cover bookkeeping overhead; the usable half matches what
+        // setsockopt requested). Occupancy is submitted-minus-acknowledged
+        // bytes: `upstream_acked` lags the kernel between TCP_INFO reads,
+        // which can only shrink the advertised window, never inflate it.
+        // Still-unacked proxy handshake bytes predate the accounting
+        // baseline and are the one transient overestimate; any resulting
+        // short write lands in the bounded pending queue.
+        let socket_available = (entry.socket_send_buffer_bytes / 2)
+            .saturating_sub(usize::try_from(entry.flow.upstream_unacked()).unwrap_or(usize::MAX));
         let queue_available = entry.pending_socket.remaining();
         let global_available = if self.pending_pressure {
             0

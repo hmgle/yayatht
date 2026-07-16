@@ -86,7 +86,7 @@ regression in the rootless matrix (zero-window, retransmit, 16 MiB pause
 cases); direct throughput not worse in either scope.
 **Tests**: flow-level unit test for the occupancy bound; full serial
 workspace suite.
-**Status**: Not Started
+**Status**: Complete
 
 ### Stage 3: Error-queue drain batching
 

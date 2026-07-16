@@ -553,6 +553,18 @@ mod tests {
     }
 
     #[test]
+    fn upstream_unacked_never_underflows_on_overshooting_ack() {
+        let mut flow = flow();
+        flow.socket_connected(10);
+        flow.receive(u32::MAX - 3, Some(101), 65535, 8, false, false);
+        flow.record_upstream_submitted(8);
+        // bytes_acked past the submitted count (for example counting bytes
+        // written before the accounting baseline) clamps at fully acked.
+        assert!(flow.record_upstream_ack(1000));
+        assert_eq!(flow.upstream_unacked(), 0);
+    }
+
+    #[test]
     fn duplicate_is_not_submitted_twice() {
         let mut flow = flow();
         flow.socket_connected(0);
