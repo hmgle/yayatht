@@ -109,7 +109,8 @@ MTU 1500 spot check; local SOCKS5 spot check), write
 and annotate the design-doc gate interpretation.
 **Success criteria**: data-plane-scope direct ≥ 15 Gbit/s-class recorded
 with medians; whole-stack scope shows no regression against 11.44.
-**Status**: Not Started
+**Status**: Complete — 18.12 Gibit/s data-plane scope, 11.68 whole-stack
+(`docs/phase1b-calibration-2026-07-16.md`)
 
 ## Non-goals
 

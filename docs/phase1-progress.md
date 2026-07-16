@@ -101,11 +101,27 @@ DNS, or external routing.
   `docs/phase1-connect-latency-2026-07-16.md` and reproducible via
   `scripts/bench_connect_latency.py`.
 
+- Phase 1B closed the 15 Gbit/s-class single-core acceptance line by
+  separating the measurement scopes: the harness's historical pinning put
+  the sink, source, and whole instance on one shared core, capping the
+  composite at ~11 Gibit/s regardless of data-plane speed. With
+  `--load-cpu` moving the load generators off the proxy core, direct
+  throughput is 18.1 Gibit/s at 32 flows / MTU 32000 and 16.1 Gibit/s at
+  MTU 1500 — the gate is met without pulling Phase 2 multiqueue forward.
+  The ACK-refresh path also dropped from 7.8 to 4.6 syscalls per socket
+  send (send-buffer occupancy derived from flow accounting instead of
+  `SO_SNDBUF`/`TIOCOUTQ`; error-queue timestamps drained via `recvmmsg`),
+  improving the whole-stack scope 11.44 → 11.68 Gibit/s. Plan:
+  `docs/phase1b-plan.md`; evidence:
+  `docs/phase1b-calibration-2026-07-16.md`.
+
 ## Remaining Phase 1 Work
 
-- The 15 Gbit/s-class single-core direct line: 11.5 Gbit/s reached with
-  offload under whole-stack single-core pinning; the remaining levers are
+- Per-byte copy costs (TAP read, socket send) dominate the remaining
+  single-reactor profile; scaling past ~18 Gibit/s per core belongs to
   multiqueue (#3) and io_uring/`SEND_ZC` (#4) per the design backlog.
+- Single-flow direct throughput variance needs longer interleaved
+  calibration runs before it can gate anything.
 - Isolate real-mihomo 128-flow fairness variance from the shared host TUN path.
 - Review the 2 GiB default worst-case socket-buffer budget.
 - DNS proxy-tcp and resolver mount isolation remain blocked by the Phase 1A
