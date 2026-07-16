@@ -46,6 +46,19 @@
   timer tick were removed. A socket that rejects these options fails its flow
   at activation instead of degrading. The timer watchdog remains as the
   recovery path for dropped TX ACK timestamp notifications.
+- TAP offload is negotiated by default (`IFF_VNET_HDR` +
+  `TUNSETOFFLOAD(TUN_F_CSUM|TSO4|TSO6)`, `--tap-offload=off` reverts to the
+  plain frame layout): every TAP frame carries a legacy `virtio_net_hdr`,
+  received `NEEDS_CSUM`/`DATA_VALID` frames skip software checksum
+  verification and GRO super-frames up to the 16-bit IP limit are forwarded
+  upstream in one write, transmitted TCP frames seed pseudo-header sums for
+  the kernel to complete, and namespace-bound sends beyond one MSS leave as
+  TSO super-frames drawn from a dedicated maximum-size pool with graceful
+  degradation to MTU frames. Offload state and `gso_frames_rx/tx` counters
+  are exported through status metrics; the integration matrix runs on the
+  offload path and asserts engagement in both directions. Validation:
+  `docs/phase1-offload-2026-07-16.md` (+36-46% direct at MTU 32000, up to
+  9.6x at MTU 1500, +25% local SOCKS5, no regression).
 - Global pending and socket-retained byte limits, per-flow socket quotas, and a
   max-flow-derived data-plane RLIMIT_NOFILE provide hard instance boundaries.
   High pending watermarks publish zero windows across active flows.
@@ -80,9 +93,12 @@ DNS, or external routing.
 
 ## Remaining Phase 1 Work
 
+- Proxy handshake scheduling for the connect-latency target (backlog #2,
+  connect p99 < 3 ms; unchanged by offload at ~24-26 ms).
+- The 15 Gbit/s-class single-core direct line: 11.5 Gbit/s reached with
+  offload under whole-stack single-core pinning; the remaining levers are
+  multiqueue (#3) and io_uring/`SEND_ZC` (#4) per the design backlog.
 - Isolate real-mihomo 128-flow fairness variance from the shared host TUN path.
-- TAP offload (`IFF_VNET_HDR` + `TUNSETOFFLOAD` GSO/GRO/csum) per the
-  performance-first design revision; staged in `IMPLEMENTATION_PLAN.md`.
 - Review the 2 GiB default worst-case socket-buffer budget.
 - DNS proxy-tcp and resolver mount isolation remain blocked by the Phase 1A
   no-go decision in `docs/phase1a-exit-audit.md`.

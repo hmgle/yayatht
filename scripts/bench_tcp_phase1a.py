@@ -252,6 +252,7 @@ def backend_command(
     transfer: list[str],
     pasta_target: str,
     tap_mtu: int,
+    tap_offload: str,
     tcp_send_buffer_bytes: int,
     username_file: Path,
     password_file: Path,
@@ -267,6 +268,8 @@ def backend_command(
             "--no-ipv6",
             "--tap-mtu",
             str(tap_mtu),
+            "--tap-offload",
+            tap_offload,
             "--tcp-send-buffer-bytes",
             str(tcp_send_buffer_bytes),
             "--",
@@ -304,6 +307,8 @@ def backend_command(
             "--no-ipv6",
             "--tap-mtu",
             str(tap_mtu),
+            "--tap-offload",
+            tap_offload,
             "--tcp-send-buffer-bytes",
             str(tcp_send_buffer_bytes),
         ]
@@ -414,6 +419,7 @@ def run_case(
         transfer,
         args.pasta_target,
         args.tap_mtu,
+        args.tap_offload,
         args.tcp_send_buffer_bytes,
         username_file,
         password_file,
@@ -511,6 +517,7 @@ def run_case(
         "target": transfer[2],
         "cpu": args.cpu,
         "requested_tap_mtu": args.tap_mtu,
+        "requested_tap_offload": args.tap_offload,
         "requested_tcp_send_buffer_bytes": args.tcp_send_buffer_bytes,
         "kernel": run_text(["uname", "-srmo"]),
         "mihomo_version": run_text([str(args.mihomo), "-v"]).replace("\n", "; "),
@@ -547,6 +554,7 @@ def error_record(
         "target": args.target,
         "cpu": args.cpu,
         "requested_tap_mtu": args.tap_mtu,
+        "requested_tap_offload": args.tap_offload,
         "requested_tcp_send_buffer_bytes": args.tcp_send_buffer_bytes,
         "kernel": run_text(["uname", "-srmo"]),
         "mihomo_version": run_text([str(args.mihomo), "-v"]).replace("\n", "; "),
@@ -595,6 +603,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--flows", default="1,8,32,128")
     parser.add_argument("--mib-per-flow", type=int, default=4)
     parser.add_argument("--tap-mtu", type=int, default=32000)
+    parser.add_argument("--tap-offload", default="on", choices=["on", "off"])
     parser.add_argument("--tcp-send-buffer-bytes", type=int, default=256 * 1024)
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
