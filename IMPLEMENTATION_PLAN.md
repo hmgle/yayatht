@@ -38,7 +38,7 @@ only on the offload-off path.
 **Success Criteria**: Large-upload integration case observes
 `gso_frames_rx > 0` with byte-exact delivery; both modes pass the matrix.
 **Tests**: pseudo-header partial-sum unit tests; upload integrity case.
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 4: TSO large-frame transmit
 

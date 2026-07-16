@@ -3,6 +3,10 @@ use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
 const TUNSETIFF: libc::Ioctl = 0x4004_54ca as libc::Ioctl;
+const TUNSETOFFLOAD: libc::Ioctl = 0x4004_54d0 as libc::Ioctl;
+const TUN_F_CSUM: libc::c_ulong = 0x01;
+const TUN_F_TSO4: libc::c_ulong = 0x02;
+const TUN_F_TSO6: libc::c_ulong = 0x04;
 
 pub const DEFAULT_TAP_MTU: u32 = 32_000;
 pub const MIN_TAP_MTU: u32 = 1_280;
@@ -15,10 +19,15 @@ struct IfReq {
     padding: [u8; 22],
 }
 
-/// Creates the namespace-side TAP device. `vnet_hdr` negotiates
+/// Creates the namespace-side TAP device. `offload` negotiates
 /// `IFF_VNET_HDR`, prefixing every read and write on the returned fd with
-/// a `virtio_net_hdr`; offload feature bits are enabled separately.
-pub fn create_tap(name: &str, vnet_hdr: bool) -> io::Result<OwnedFd> {
+/// a `virtio_net_hdr`, and enables checksum plus TCP segmentation
+/// offload: the namespace kernel may then hand over `NEEDS_CSUM` frames
+/// and TSO super-frames up to 64 KiB, and accepts the same from the data
+/// plane. UDP offloads (USO) wait for UDP support. The Linux 6.6
+/// baseline guarantees these feature bits, so a rejected negotiation is
+/// an error rather than a degraded mode.
+pub fn create_tap(name: &str, offload: bool) -> io::Result<OwnedFd> {
     let name = CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL"))?;
     if name.as_bytes().len() >= libc::IFNAMSIZ {
@@ -41,7 +50,7 @@ pub fn create_tap(name: &str, vnet_hdr: bool) -> io::Result<OwnedFd> {
     // SAFETY: raw was returned by open and ownership is transferred here.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     let mut flags = libc::IFF_TAP | libc::IFF_NO_PI;
-    if vnet_hdr {
+    if offload {
         flags |= libc::IFF_VNET_HDR;
     }
     let mut request = IfReq {
@@ -55,6 +64,19 @@ pub fn create_tap(name: &str, vnet_hdr: bool) -> io::Result<OwnedFd> {
     // SAFETY: request matches Linux struct ifreq size/layout for TUNSETIFF.
     if unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF, &request) } == -1 {
         return Err(io::Error::last_os_error());
+    }
+    if offload {
+        // SAFETY: TUNSETOFFLOAD passes the feature mask by value.
+        if unsafe {
+            libc::ioctl(
+                fd.as_raw_fd(),
+                TUNSETOFFLOAD,
+                TUN_F_CSUM | TUN_F_TSO4 | TUN_F_TSO6,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
     }
     Ok(fd)
 }

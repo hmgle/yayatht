@@ -18,23 +18,31 @@ pub struct TcpSegment<'a> {
 }
 
 impl<'a> TcpSegment<'a> {
-    pub fn parse_ipv4(ip: Ipv4Packet<'a>) -> Result<Self, PacketError> {
+    /// Parses the TCP segment inside an IPv4 packet. `verify_checksum` is
+    /// false for frames whose vnet header marks the checksum as either
+    /// already verified or intentionally incomplete (`NEEDS_CSUM`).
+    pub fn parse_ipv4(ip: Ipv4Packet<'a>, verify_checksum: bool) -> Result<Self, PacketError> {
         if ip.protocol() != crate::ip::IPPROTO_TCP {
             return Err(PacketError::ProtocolMismatch);
         }
         let payload = ip.payload();
-        if checksum::ipv4_transport(ip.source(), ip.destination(), 6, payload) != 0 {
+        if verify_checksum
+            && checksum::ipv4_transport(ip.source(), ip.destination(), 6, payload) != 0
+        {
             return Err(PacketError::InvalidChecksum);
         }
         Self::parse(payload)
     }
 
-    pub fn parse_ipv6(ip: Ipv6Packet<'a>) -> Result<Self, PacketError> {
+    /// IPv6 counterpart of [`TcpSegment::parse_ipv4`].
+    pub fn parse_ipv6(ip: Ipv6Packet<'a>, verify_checksum: bool) -> Result<Self, PacketError> {
         if ip.next_header() != crate::ip::IPPROTO_TCP {
             return Err(PacketError::ProtocolMismatch);
         }
         let payload = ip.payload();
-        if checksum::ipv6_transport(ip.source(), ip.destination(), 6, payload) != 0 {
+        if verify_checksum
+            && checksum::ipv6_transport(ip.source(), ip.destination(), 6, payload) != 0
+        {
             return Err(PacketError::InvalidChecksum);
         }
         Self::parse(payload)
@@ -202,6 +210,37 @@ pub fn set_ipv6_checksum(
     Ok(())
 }
 
+/// Seeds the checksum field with the IPv4 pseudo-header sum for a frame
+/// handed to the kernel with `VIRTIO_NET_HDR_F_NEEDS_CSUM`: the kernel
+/// checksums from `csum_start` over the stored seed and writes the final
+/// value at `csum_offset`, so the hot path never walks the payload.
+pub fn set_ipv4_partial_checksum(
+    tcp: &mut [u8],
+    source: [u8; 4],
+    destination: [u8; 4],
+) -> Result<(), PacketError> {
+    if tcp.len() < TCP_MIN_HEADER_LEN {
+        return Err(PacketError::Truncated);
+    }
+    let value = checksum::ipv4_pseudo_header(source, destination, 6, tcp.len());
+    tcp[16..18].copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
+/// IPv6 counterpart of [`set_ipv4_partial_checksum`].
+pub fn set_ipv6_partial_checksum(
+    tcp: &mut [u8],
+    source: [u8; 16],
+    destination: [u8; 16],
+) -> Result<(), PacketError> {
+    if tcp.len() < TCP_MIN_HEADER_LEN {
+        return Err(PacketError::Truncated);
+    }
+    let value = checksum::ipv6_pseudo_header(source, destination, 6, tcp.len());
+    tcp[16..18].copy_from_slice(&value.to_be_bytes());
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -263,5 +302,24 @@ mod tests {
         bytes[21] = 1;
         let segment = TcpSegment::parse(&bytes[..24]).expect("parse");
         assert_eq!(segment.window_scale(), None);
+    }
+
+    #[test]
+    fn partial_checksum_completes_to_a_valid_checksum() {
+        // Emulate the kernel side of NEEDS_CSUM: checksum the segment with
+        // the pseudo-header seed in place and store the complement at the
+        // checksum offset. The result must verify as a complete checksum.
+        let source = [192, 0, 2, 7];
+        let destination = [192, 0, 2, 9];
+        let mut segment = [0u8; 20 + 11];
+        write_header(&mut segment, spec(None, None)).expect("write");
+        segment[20..].copy_from_slice(b"hello world");
+        set_ipv4_partial_checksum(&mut segment, source, destination).expect("seed");
+        let completed = checksum::checksum(&segment);
+        segment[16..18].copy_from_slice(&completed.to_be_bytes());
+        assert_eq!(
+            checksum::ipv4_transport(source, destination, 6, &segment),
+            0
+        );
     }
 }

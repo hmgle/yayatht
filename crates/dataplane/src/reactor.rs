@@ -31,6 +31,9 @@ const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 // watchdog that bounds recovery from a dropped TX ACK timestamp
 // notification to about one interval instead of the namespace RTO.
 const TIMER_INTERVAL: Duration = Duration::from_millis(100);
+/// Largest L3 packet a TSO/GRO super-frame can carry: both IP length
+/// fields are 16 bits wide.
+const GSO_MAX_L3_BYTES: usize = 65_535;
 /// Window-scale shift offered on the SYN-ACK when the namespace SYN offers
 /// the option. Shift 7 allows advertising up to ~8 MiB.
 const WINDOW_SCALE_SHIFT: u8 = 7;
@@ -108,6 +111,7 @@ pub struct Metrics {
     pub frame_pool_exhaustions: u64,
     pub tap_mtu: u64,
     pub tap_offload: u64,
+    pub gso_frames_rx: u64,
     pub tap_frame_capacity: u64,
     pub tap_frame_pool_frames: u64,
     pub tap_frame_pool_bytes: u64,
@@ -406,6 +410,14 @@ impl Reactor {
                 ),
             ..Metrics::default()
         };
+        // Received frames may be GRO/TSO super-frames up to the 16-bit IP
+        // length limit when offload is negotiated; the TX frame pool stays
+        // MTU-sized until TSO transmit lands.
+        let tap_rx_capacity = if config.tap_offload {
+            vnet_len + ethernet::ETHERNET_HEADER_LEN + GSO_MAX_L3_BYTES
+        } else {
+            frame_capacity
+        };
         Ok(Self {
             config,
             tap,
@@ -415,7 +427,7 @@ impl Reactor {
             flows: FlowTable::with_capacity(max_tcp_flows),
             by_key: HashMap::with_capacity(max_tcp_flows),
             frame_pool: BufferPool::new(frame_pool_frames, frame_capacity),
-            tap_rx_buffer: vec![0; frame_capacity],
+            tap_rx_buffer: vec![0; tap_rx_capacity],
             tap_queue: VecDeque::new(),
             vnet_len,
             metrics,
@@ -531,32 +543,42 @@ impl Reactor {
     }
 
     fn handle_frame(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let bytes = self.strip_rx_vnet(bytes)?;
+        let (bytes, verify_checksum) = self.split_rx_vnet(bytes)?;
         let ethernet = EthernetFrame::parse(bytes)?;
         match ethernet.ether_type() {
             EtherType::Arp => self.handle_arp(ethernet),
-            EtherType::Ipv4 => self.handle_ipv4(ethernet),
-            EtherType::Ipv6 => self.handle_ipv6(ethernet),
+            EtherType::Ipv4 => self.handle_ipv4(ethernet, verify_checksum),
+            EtherType::Ipv6 => self.handle_ipv6(ethernet, verify_checksum),
             _ => Ok(()),
         }
     }
 
-    /// Strips and validates the `virtio_net_hdr` prefix on a received TAP
-    /// frame. Offload features are not negotiated yet, so only plain
-    /// headers (complete checksum, no GSO) are accepted; anything else is
-    /// a parse drop that surfaces in metrics instead of a silently
-    /// misread frame body.
-    fn strip_rx_vnet<'a>(&self, bytes: &'a [u8]) -> Result<&'a [u8], Error> {
+    /// Splits and validates the `virtio_net_hdr` prefix on a received TAP
+    /// frame, returning the frame body and whether the transport checksum
+    /// still needs software verification. With offload negotiated the
+    /// namespace kernel hands over frames whose checksum is either already
+    /// verified (`DATA_VALID`) or never computed (`NEEDS_CSUM`, pseudo
+    /// sum only); both originate from the local kernel and skip
+    /// verification. TSO super-frames carry a TCP GSO type and need no
+    /// segmentation here -- the payload is forwarded to the upstream
+    /// socket whole. UDP GSO types are not negotiated and drop as counted
+    /// parse errors.
+    fn split_rx_vnet<'a>(&mut self, bytes: &'a [u8]) -> Result<(&'a [u8], bool), Error> {
         if self.vnet_len == 0 {
-            return Ok(bytes);
+            return Ok((bytes, true));
         }
         let header = vnet::VnetHeader::parse(bytes)?;
-        if !header.is_plain() {
-            return Err(Error::Invariant(
-                "TAP frame carries unnegotiated vnet offload state",
-            ));
+        match header.gso_type {
+            vnet::GSO_NONE => {}
+            vnet::GSO_TCPV4 | vnet::GSO_TCPV6 => self.metrics.gso_frames_rx += 1,
+            _ => {
+                return Err(Error::Invariant(
+                    "TAP frame carries an unnegotiated GSO type",
+                ));
+            }
         }
-        Ok(&bytes[self.vnet_len..])
+        let verify_checksum = header.flags & (vnet::FLAG_NEEDS_CSUM | vnet::FLAG_DATA_VALID) == 0;
+        Ok((&bytes[self.vnet_len..], verify_checksum))
     }
 
     fn handle_arp(&mut self, ethernet: EthernetFrame<'_>) -> Result<(), Error> {
@@ -587,12 +609,16 @@ impl Reactor {
         self.queue_tap(None, frame, None)
     }
 
-    fn handle_ipv4(&mut self, ethernet: EthernetFrame<'_>) -> Result<(), Error> {
+    fn handle_ipv4(
+        &mut self,
+        ethernet: EthernetFrame<'_>,
+        verify_checksum: bool,
+    ) -> Result<(), Error> {
         let packet = Ipv4Packet::parse(ethernet.payload())?;
         if packet.protocol() != ip::IPPROTO_TCP {
             return Ok(());
         }
-        let segment = TcpSegment::parse_ipv4(packet)?;
+        let segment = TcpSegment::parse_ipv4(packet, verify_checksum)?;
         let key = FlowKey {
             namespace: SocketAddr::new(
                 IpAddr::V4(Ipv4Addr::from(packet.source())),
@@ -606,7 +632,11 @@ impl Reactor {
         self.handle_tcp(key, segment)
     }
 
-    fn handle_ipv6(&mut self, ethernet: EthernetFrame<'_>) -> Result<(), Error> {
+    fn handle_ipv6(
+        &mut self,
+        ethernet: EthernetFrame<'_>,
+        verify_checksum: bool,
+    ) -> Result<(), Error> {
         let packet = Ipv6Packet::parse(ethernet.payload())?;
         if packet.next_header() == ip::IPPROTO_ICMPV6 {
             if packet.payload().first().copied() != Some(135) {
@@ -644,7 +674,7 @@ impl Reactor {
         if packet.next_header() != ip::IPPROTO_TCP {
             return Ok(());
         }
-        let segment = TcpSegment::parse_ipv6(packet)?;
+        let segment = TcpSegment::parse_ipv6(packet, verify_checksum)?;
         debug!(source = %Ipv6Addr::from(packet.source()), destination = %Ipv6Addr::from(packet.destination()), flags = ?segment.flags(), "received IPv6 TCP segment");
         let key = FlowKey {
             namespace: SocketAddr::new(
@@ -2138,6 +2168,7 @@ impl Reactor {
                 window_scale,
             },
         )?;
+        let offload = self.vnet_len > 0;
         match (key.target.ip(), key.namespace.ip()) {
             (IpAddr::V4(source), IpAddr::V4(destination)) => {
                 ip::write_ipv4_header(
@@ -2148,11 +2179,19 @@ impl Reactor {
                     written + payload_len,
                     0,
                 )?;
-                tcp::set_ipv4_checksum(
-                    &mut bytes[tcp_offset..frame_len],
-                    source.octets(),
-                    destination.octets(),
-                )?;
+                if offload {
+                    tcp::set_ipv4_partial_checksum(
+                        &mut bytes[tcp_offset..frame_len],
+                        source.octets(),
+                        destination.octets(),
+                    )?;
+                } else {
+                    tcp::set_ipv4_checksum(
+                        &mut bytes[tcp_offset..frame_len],
+                        source.octets(),
+                        destination.octets(),
+                    )?;
+                }
             }
             (IpAddr::V6(source), IpAddr::V6(destination)) => {
                 ip::write_ipv6_header(
@@ -2162,13 +2201,35 @@ impl Reactor {
                     ip::IPPROTO_TCP,
                     written + payload_len,
                 )?;
-                tcp::set_ipv6_checksum(
-                    &mut bytes[tcp_offset..frame_len],
-                    source.octets(),
-                    destination.octets(),
-                )?;
+                if offload {
+                    tcp::set_ipv6_partial_checksum(
+                        &mut bytes[tcp_offset..frame_len],
+                        source.octets(),
+                        destination.octets(),
+                    )?;
+                } else {
+                    tcp::set_ipv6_checksum(
+                        &mut bytes[tcp_offset..frame_len],
+                        source.octets(),
+                        destination.octets(),
+                    )?;
+                }
             }
             _ => return Err(Error::Invariant("mixed address families in flow")),
+        }
+        if offload {
+            // The kernel completes the transport checksum from csum_start
+            // over the seeded pseudo-header sum; offsets are relative to
+            // the frame body after the vnet header.
+            vnet::VnetHeader {
+                flags: vnet::FLAG_NEEDS_CSUM,
+                gso_type: vnet::GSO_NONE,
+                hdr_len: (payload_offset - self.vnet_len) as u16,
+                gso_size: 0,
+                csum_start: (ethernet::ETHERNET_HEADER_LEN + ip_header_len) as u16,
+                csum_offset: 16,
+            }
+            .write(&mut bytes[..self.vnet_len])?;
         }
         frame.buffer.set_len(frame_len);
         Ok(())

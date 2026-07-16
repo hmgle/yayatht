@@ -305,6 +305,84 @@ fn tap_offload_off_preserves_tcp_echo() {
 }
 
 #[test]
+fn gro_upload_arrives_in_aggregated_frames() {
+    if !supported() {
+        return;
+    }
+    // A bulk namespace upload against a paused reader: while the receive
+    // side holds, the namespace kernel coalesces the queued payload into
+    // 64 KiB send skbs, so reopening the window forces TSO super-frames
+    // larger than one MSS through the TAP, observable as gso_frames_rx.
+    // A fast reader could otherwise drain each sub-MSS write immediately
+    // and never trigger aggregation. The trailing sleep keeps the
+    // instance alive so status can be queried after the transfer.
+    const BYTE_COUNT: usize = 4 * 1024 * 1024;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (accept_tx, accept_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let (read_tx, read_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        accept_tx.send(()).unwrap();
+        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        let mut received = vec![0u8; BYTE_COUNT];
+        stream.read_exact(&mut received).unwrap();
+        assert!(received.iter().all(|&byte| byte == 0));
+        read_tx.send(()).unwrap();
+    });
+    let name = unique_name("gro-upload");
+    let script = format!(
+        "busybox dd if=/dev/zero bs=65536 count=64 2>/dev/null \
+         | busybox nc -w 8 192.0.2.1 {port}; busybox sleep 2"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    accept_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    // Let the sender queue enough payload behind the closed window that
+    // its send skbs coalesce past one MSS.
+    thread::sleep(Duration::from_millis(500));
+    release_tx.send(()).unwrap();
+    read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let value = status_json(&name);
+    assert!(
+        value["dataplane"]["gso_frames_rx"].as_u64().unwrap() > 0,
+        "no aggregated frame was received: {value}"
+    );
+    let status = child
+        .wait_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("gro upload test timed out")
+        });
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
+    server.join().unwrap();
+}
+
+#[test]
 fn watchdog_advances_upstream_ack_without_event_refreshes() {
     if !supported() {
         return;
