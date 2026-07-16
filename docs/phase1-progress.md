@@ -91,10 +91,18 @@ an intentional deviation from the normal mihomo endpoint at `127.0.0.1:7890`
 so the tests validate protocol behavior without depending on host proxy state,
 DNS, or external routing.
 
+- Immediate upstream handshakes (loopback, local proxy) finish inside the
+  SYN wakeup through a zero-timeout writable probe instead of a second
+  reactor wakeup. Connect latency converged: steady-state p99 0.18 ms
+  direct / 0.55 ms local SOCKS5, spin-bounded cold 0.2 ms — the < 3 ms
+  design target is met by the software path; the double-digit
+  first-connect numbers on an idle machine are platform power management
+  across the wakeup chain, quantified with pasta comparison in
+  `docs/phase1-connect-latency-2026-07-16.md` and reproducible via
+  `scripts/bench_connect_latency.py`.
+
 ## Remaining Phase 1 Work
 
-- Proxy handshake scheduling for the connect-latency target (backlog #2,
-  connect p99 < 3 ms; unchanged by offload at ~24-26 ms).
 - The 15 Gbit/s-class single-core direct line: 11.5 Gbit/s reached with
   offload under whole-stack single-core pinning; the remaining levers are
   multiqueue (#3) and io_uring/`SEND_ZC` (#4) per the design backlog.
