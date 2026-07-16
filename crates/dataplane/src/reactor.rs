@@ -105,6 +105,8 @@ pub struct Metrics {
     pub tcp_resets: u64,
     pub proxy_handshakes: u64,
     pub proxy_failures: u64,
+    /// Gateway DNS attempts refused because no resolver is configured.
+    pub dns_refused: u64,
     pub tx_ack_watchdog_advances: u64,
     pub tx_ack_watchdog_tail_recoveries: u64,
     pub active_tcp_flows: u64,
@@ -735,7 +737,23 @@ impl Reactor {
             return Ok(());
         }
         debug!(namespace = %key.namespace, target = %key.target, "received namespace SYN");
-        let (target_interface, transport_peer) = self.route_target(key.target);
+        // Gateway-directed DNS keeps stream semantics but is retargeted at
+        // the configured resolver (design §9 proxy-tcp). Without a usable
+        // resolver the connection is refused rather than leaked.
+        let logical_target = if self.dns_intercepts(key.target) {
+            match self.config.dns_upstream {
+                Some(resolver) => resolver,
+                None => {
+                    let frame = self.build_reset(key, segment.sequence().wrapping_add(1))?;
+                    self.metrics.tcp_resets += 1;
+                    self.metrics.dns_refused += 1;
+                    return self.queue_tap(None, frame, None);
+                }
+            }
+        } else {
+            key.target
+        };
+        let (target_interface, transport_peer) = self.route_target(logical_target);
         let (socket, connected) = match yayatht_sys::socket::connect_nonblocking(
             transport_peer,
             self.config.tcp_receive_buffer_bytes,
@@ -751,7 +769,7 @@ impl Reactor {
         let target_side = FlowSide {
             interface: target_interface,
             local_endpoint: yayatht_sys::socket::local_address(socket.as_raw_fd())?,
-            logical_peer: key.target,
+            logical_peer: logical_target,
             transport_peer,
         };
         let (socket_receive_buffer_bytes, socket_send_buffer_bytes) =
@@ -1972,6 +1990,18 @@ impl Reactor {
         warn!(%reason, "TCP flow invariant failed");
         self.send_reset_for_flow(id)?;
         self.close_flow(id)
+    }
+
+    /// Whether a namespace destination falls under DNS interception:
+    /// gateway-directed port 53 with `proxy-tcp` mode active.
+    fn dns_intercepts(&self, target: SocketAddr) -> bool {
+        if !self.config.dns_proxy_tcp || target.port() != 53 {
+            return false;
+        }
+        match target.ip() {
+            IpAddr::V4(ip) => Some(ip) == self.config.gateway_ipv4,
+            IpAddr::V6(ip) => Some(ip) == self.config.gateway_ipv6,
+        }
     }
 
     fn route_target(&self, logical: SocketAddr) -> (FlowInterface, SocketAddr) {

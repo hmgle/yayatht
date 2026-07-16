@@ -1,12 +1,13 @@
-use crate::config::LaunchConfig;
+use crate::config::{DnsMode, LaunchConfig, NetworkConfig};
 use crate::control;
 use crate::instance::Instance;
 use std::ffi::CString;
+use std::fmt::Write as _;
 use std::fs;
 use std::io::{self, Read, Write};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
@@ -61,6 +62,11 @@ impl Supervisor {
         let (ns_parent, ns_child) = yayatht_sys::fdpass::seqpacket_pair()?;
         let (tap_dp, tap_ns) = yayatht_sys::fdpass::seqpacket_pair()?;
 
+        let resolv_conf = if config.dns.mode == DnsMode::ProxyTcp {
+            Some(instance.write_resolv_conf(&gateway_resolv_conf(&config.network))?)
+        } else {
+            None
+        };
         let dataplane_config = config.dataplane();
         let (dataplane_pid, dataplane_pidfd) = match clone_namespaced(COMMON_NAMESPACES)? {
             CloneResult::Child => {
@@ -84,7 +90,7 @@ impl Supervisor {
                     drop(dp_parent);
                     drop(dp_child);
                     drop(tap_dp);
-                    namespace_child(ns_child, tap_ns, config);
+                    namespace_child(ns_child, tap_ns, config, resolv_conf);
                 }
                 Ok(CloneResult::Parent { pid, pidfd }) => (pid, pidfd),
                 Err(error) => {
@@ -248,8 +254,13 @@ fn data_plane_child(
     }
 }
 
-fn namespace_child(control_fd: OwnedFd, tap_channel: OwnedFd, config: LaunchConfig) -> ! {
-    let result = namespace_child_inner(&control_fd, &tap_channel, &config);
+fn namespace_child(
+    control_fd: OwnedFd,
+    tap_channel: OwnedFd,
+    config: LaunchConfig,
+    resolv_conf: Option<PathBuf>,
+) -> ! {
+    let result = namespace_child_inner(&control_fd, &tap_channel, &config, resolv_conf.as_deref());
     match result {
         Ok(code) => {
             let _ = control::send(control_fd.as_raw_fd(), Kind::Exit, 3, &code.to_le_bytes());
@@ -272,10 +283,14 @@ fn namespace_child_inner(
     control_fd: &OwnedFd,
     tap_channel: &OwnedFd,
     config: &LaunchConfig,
+    resolv_conf: Option<&Path>,
 ) -> io::Result<i32> {
     yayatht_sys::caps::set_parent_death_signal(libc::SIGKILL)?;
     control::expect(control_fd.as_raw_fd(), Kind::MapsReady)?;
     yayatht_sys::mount::mount_private_proc()?;
+    if let Some(source) = resolv_conf {
+        yayatht_sys::mount::bind_resolv_conf(source)?;
+    }
     debug_failpoint("ns_tap")?;
     let tap =
         yayatht_sys::tun::create_tap(&config.network.interface_name, config.network.tap_offload)?;
@@ -568,6 +583,19 @@ impl Drop for ChildGuard {
         let _ = yayatht_sys::process::wait_pid(self.dataplane_pid, false);
         let _ = yayatht_sys::process::wait_pid(self.namespace_pid, false);
     }
+}
+
+/// Namespace `resolv.conf` pointing every enabled family at the virtual
+/// gateway, where the data plane intercepts 53/UDP and 53/TCP.
+fn gateway_resolv_conf(network: &NetworkConfig) -> String {
+    let mut contents = String::new();
+    if let Some(gateway) = network.gateway_ipv4 {
+        let _ = writeln!(contents, "nameserver {gateway}");
+    }
+    if let Some(gateway) = network.gateway_ipv6 {
+        let _ = writeln!(contents, "nameserver {gateway}");
+    }
+    contents
 }
 
 fn debug_failpoint(name: &str) -> io::Result<()> {

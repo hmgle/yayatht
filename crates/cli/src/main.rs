@@ -230,8 +230,12 @@ fn dns_config(
     if mode == "off" {
         return yayatht_namespace::DnsConfig::off();
     }
+    // YAYATHT_RESOLV_CONF redirects the host resolver lookup; tests use it
+    // to pin the "no usable nameserver" configuration deterministically.
+    let host_resolv_conf = std::env::var_os("YAYATHT_RESOLV_CONF")
+        .map_or_else(|| PathBuf::from("/etc/resolv.conf"), PathBuf::from);
     let resolver = explicit_upstream.or_else(|| {
-        std::fs::read_to_string("/etc/resolv.conf")
+        std::fs::read_to_string(host_resolv_conf)
             .ok()
             .and_then(|contents| yayatht_namespace::config::first_nameserver(&contents))
             .map(|ip| SocketAddr::new(ip, 53))

@@ -1369,3 +1369,154 @@ fn interrupt_is_forwarded_to_target() {
     assert_eq!(status.code(), Some(130));
     assert!(!socket.parent().unwrap().exists());
 }
+
+fn namespace_output(
+    run_args: &[&str],
+    target: &[&str],
+    environment: &[(&str, &str)],
+) -> std::process::Output {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
+    command.args(["run"]).args(run_args).arg("--").args(target);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    command.output().expect("run yayatht")
+}
+
+#[test]
+fn resolv_conf_is_bind_mounted_with_gateway_nameservers() {
+    if !supported() {
+        return;
+    }
+    let output = namespace_output(&["--direct"], &["busybox", "cat", "/etc/resolv.conf"], &[]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("nameserver 192.0.2.1"),
+        "missing IPv4 gateway nameserver: {stdout}"
+    );
+    assert!(
+        stdout.contains("nameserver fd79:6179:6174:6874::1"),
+        "missing IPv6 gateway nameserver: {stdout}"
+    );
+}
+
+#[test]
+fn dns_off_keeps_the_host_resolv_conf() {
+    if !supported() {
+        return;
+    }
+    let output = namespace_output(
+        &["--direct", "--dns", "off"],
+        &["busybox", "cat", "/etc/resolv.conf"],
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !stdout.contains("nameserver 192.0.2.1"),
+        "gateway nameserver mounted despite --dns off: {stdout}"
+    );
+}
+
+#[test]
+fn tcp_dns_is_redirected_to_the_resolver_through_the_proxy() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock proxy");
+    let proxy = listener.local_addr().unwrap();
+    let payload = b"dns-stream-semantics".to_vec();
+    let expected = payload.clone();
+    let server = thread::spawn(move || {
+        let mut stream = proxy_stream(listener);
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).unwrap();
+        let target = read_socks_target(&mut stream);
+        assert_eq!(
+            target,
+            "203.0.113.53:53".parse::<SocketAddr>().unwrap(),
+            "gateway TCP DNS must CONNECT to the configured resolver"
+        );
+        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        proxy_echo(stream, &expected);
+    });
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--socks5",
+            &proxy.to_string(),
+            "--dns-upstream",
+            "203.0.113.53",
+            "--",
+            "busybox",
+            "nc",
+            "-w",
+            "8",
+            "192.0.2.1",
+            "53",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn yayatht");
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(&payload)
+        .expect("write query stream");
+    let status = child
+        .wait_timeout(Duration::from_secs(10))
+        .expect("wait for yayatht");
+    let status = status.unwrap_or_else(|| {
+        child.kill().unwrap();
+        panic!("TCP DNS redirect test timed out")
+    });
+    let mut stdout = Vec::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_end(&mut stdout)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
+    assert_eq!(stdout, payload, "unexpected stream payload: {stderr}");
+    server.join().unwrap();
+}
+
+#[test]
+fn tcp_dns_without_a_resolver_is_refused() {
+    if !supported() {
+        return;
+    }
+    let resolv = std::env::temp_dir().join(format!("yayatht-empty-resolv-{}", std::process::id()));
+    fs::write(&resolv, "# no nameservers\n").unwrap();
+    let output = namespace_output(
+        &["--direct"],
+        &["busybox", "nc", "-w", "4", "192.0.2.1", "53"],
+        &[("YAYATHT_RESOLV_CONF", resolv.to_str().unwrap())],
+    );
+    fs::remove_file(&resolv).ok();
+    assert!(
+        !output.status.success(),
+        "gateway DNS connect must be refused without a resolver"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "refused connection produced output: {:?}",
+        output.stdout
+    );
+}

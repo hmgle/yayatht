@@ -95,6 +95,21 @@ impl Instance {
         serde_json::to_vec_pretty(&self.metadata).map_err(io::Error::other)
     }
 
+    /// Writes the namespace-visible `resolv.conf` into the instance
+    /// directory and returns its path. World-readable so any uid inside
+    /// the namespace can read it through the bind mount.
+    pub fn write_resolv_conf(&self, contents: &str) -> io::Result<PathBuf> {
+        let path = self.directory.join("resolv.conf");
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o644)
+            .open(&path)?;
+        file.write_all(contents.as_bytes())?;
+        Ok(path)
+    }
+
     fn persist(&mut self) -> io::Result<()> {
         let temporary = self.directory.join("instance.json.tmp");
         let mut file = OpenOptions::new()
@@ -121,6 +136,7 @@ impl Drop for Instance {
         }
         let _ = fs::remove_file(&self.control_path);
         let _ = fs::remove_file(&self.metadata_path);
+        let _ = fs::remove_file(self.directory.join("resolv.conf"));
         let _ = fs::remove_dir(&self.directory);
     }
 }
