@@ -256,6 +256,15 @@ pub fn send(fd: RawFd, bytes: &[u8]) -> io::Result<usize> {
     Ok(count as usize)
 }
 
+pub fn recv(fd: RawFd, out: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: out is writable for the duration of recv.
+    let count = unsafe { libc::recv(fd, out.as_mut_ptr().cast(), out.len(), libc::MSG_DONTWAIT) };
+    if count == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(count as usize)
+}
+
 pub fn peek(fd: RawFd, out: &mut [u8]) -> io::Result<usize> {
     // SAFETY: out is writable for the duration of recv.
     let count = unsafe {

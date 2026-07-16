@@ -5,11 +5,13 @@ pub mod ethernet;
 pub mod ip;
 pub mod neighbor;
 pub mod tcp;
+pub mod udp;
 pub mod vnet;
 
 pub use ethernet::{EtherType, EthernetFrame, MacAddress};
 pub use ip::{IpPacket, Ipv4Packet, Ipv6Packet};
 pub use tcp::TcpSegment;
+pub use udp::UdpDatagram;
 
 #[derive(Debug, thiserror::Error, Clone, Copy, PartialEq, Eq)]
 pub enum PacketError {

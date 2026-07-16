@@ -1,4 +1,5 @@
 use crate::buffer::{BufferPool, FrameBuffer};
+use crate::dns;
 use crate::flow_table::{EpollToken, FlowId, FlowTable, Resource};
 use getrandom::fill as random_fill;
 use serde::Serialize;
@@ -13,6 +14,7 @@ use yayatht_packet::ethernet::{self, EtherType, EthernetFrame, MacAddress};
 use yayatht_packet::ip::{self, Ipv4Packet, Ipv6Packet};
 use yayatht_packet::neighbor;
 use yayatht_packet::tcp::{self, TcpFlags, TcpHeaderSpec, TcpSegment};
+use yayatht_packet::udp::{self, UdpDatagram};
 use yayatht_packet::vnet;
 use yayatht_proxy_proto::{Credentials, Handshake, Protocol};
 use yayatht_tcp_adapter::flow::{
@@ -48,6 +50,18 @@ const ZERO_WINDOW_PROBE_INITIAL: Duration = Duration::from_secs(1);
 const ZERO_WINDOW_PROBE_MAX: Duration = Duration::from_secs(8);
 const PROXY_RESPONSE_CAPACITY: usize = 8 * 1024;
 const MAX_PENDING_SOCKET_BYTES: usize = 256 * 1024;
+/// Socket buffers for the single DNS resolver connection.
+const DNS_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
+/// Bound on length-prefixed queries queued toward the resolver; overflow
+/// answers the query SERVFAIL instead of growing without limit.
+const DNS_WRITE_BUFFER_LIMIT: usize = 64 * 1024;
+/// Bound on the buffered upstream response stream (one maximum frame plus
+/// its length prefix, with read-chunk slack).
+const DNS_READ_BUFFER_LIMIT: usize = 128 * 1024;
+/// Close the resolver connection after this quiet period with no
+/// outstanding transactions (design §7: DNS flow idle timeout).
+const DNS_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const TEST_DNS_QUERY_TIMEOUT_MS_ENV: &str = "YAYATHT_TEST_DNS_QUERY_TIMEOUT_MS";
 const TEST_DROP_TCP_DATA_ENV: &str = "YAYATHT_TEST_DROP_TCP_DATA";
 const TEST_DROP_TCP_RETRANSMIT_ENV: &str = "YAYATHT_TEST_DROP_TCP_RETRANSMIT";
 const TEST_DROP_TCP_SYN_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_SYN_ACK";
@@ -107,6 +121,18 @@ pub struct Metrics {
     pub proxy_failures: u64,
     /// Gateway DNS attempts refused because no resolver is configured.
     pub dns_refused: u64,
+    /// Intercepted namespace UDP queries.
+    pub dns_queries: u64,
+    /// Resolver responses relayed back into the namespace.
+    pub dns_responses: u64,
+    /// Locally synthesized SERVFAIL/FORMERR answers.
+    pub dns_failures: u64,
+    /// Responses truncated with TC for the client's UDP capacity.
+    pub dns_truncated: u64,
+    /// Resolver TCP connections opened.
+    pub dns_upstream_connects: u64,
+    /// Unparsable intercepted DNS messages dropped without an answer.
+    pub dns_dropped: u64,
     pub tx_ack_watchdog_advances: u64,
     pub tx_ack_watchdog_tail_recoveries: u64,
     pub active_tcp_flows: u64,
@@ -350,6 +376,30 @@ struct TcpFrameSpec {
     gso_size: Option<u16>,
 }
 
+/// The single resolver connection behind DNS interception. It never
+/// carries flow traffic, reconnects on demand, and closes after an idle
+/// period; dropping the descriptor also clears its epoll registration.
+enum DnsConnection {
+    Idle,
+    Connecting {
+        socket: OwnedFd,
+        connected: bool,
+        handshake: Option<Handshake>,
+    },
+    Ready {
+        socket: OwnedFd,
+    },
+}
+
+impl DnsConnection {
+    fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        match self {
+            Self::Idle => None,
+            Self::Connecting { socket, .. } | Self::Ready { socket } => Some(socket.as_raw_fd()),
+        }
+    }
+}
+
 pub struct Reactor {
     config: Config,
     tap: OwnedFd,
@@ -386,6 +436,13 @@ pub struct Reactor {
     /// TAP batch, instead of one refresh per received segment.
     ack_refresh_queue: Vec<FlowId>,
     timer_cursor_slot: u32,
+    dns_engine: dns::Engine,
+    dns_connection: DnsConnection,
+    /// Length-prefixed queries waiting for the resolver stream.
+    dns_write_buffer: VecDeque<u8>,
+    /// Reassembly buffer for the length-prefixed response stream.
+    dns_read_buffer: Vec<u8>,
+    dns_last_activity: Instant,
 }
 
 impl Reactor {
@@ -484,6 +541,14 @@ impl Reactor {
             pending_pressure_dirty: false,
             ack_refresh_queue: Vec::new(),
             timer_cursor_slot: 0,
+            dns_engine: dns::Engine::with_query_timeout(
+                test_value(TEST_DNS_QUERY_TIMEOUT_MS_ENV)
+                    .map_or(dns::QUERY_TIMEOUT, Duration::from_millis),
+            ),
+            dns_connection: DnsConnection::Idle,
+            dns_write_buffer: VecDeque::new(),
+            dns_read_buffer: Vec::new(),
+            dns_last_activity: Instant::now(),
         })
     }
 
@@ -511,6 +576,7 @@ impl Reactor {
                         self.handle_timers()?;
                     }
                     (None, Resource::Control) => self.handle_control()?,
+                    (None, Resource::DnsUpstream) => self.handle_dns_upstream(event.events)?,
                     (Some(id), Resource::UpstreamSocket) => self.handle_socket(id, event.events)?,
                     _ => {}
                 }
@@ -654,6 +720,18 @@ impl Reactor {
         verify_checksum: bool,
     ) -> Result<(), Error> {
         let packet = Ipv4Packet::parse(ethernet.payload())?;
+        if packet.protocol() == ip::IPPROTO_UDP {
+            let datagram = UdpDatagram::parse_ipv4(packet, verify_checksum)?;
+            let client = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(packet.source())),
+                datagram.source_port(),
+            );
+            let gateway = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(packet.destination())),
+                datagram.destination_port(),
+            );
+            return self.handle_udp(client, gateway, datagram.payload());
+        }
         if packet.protocol() != ip::IPPROTO_TCP {
             return Ok(());
         }
@@ -709,6 +787,18 @@ impl Reactor {
             frame.buffer.set_len(vnet_len + length);
             debug!(gateway = %gateway, "sending neighbor advertisement");
             return self.queue_tap(None, frame, None);
+        }
+        if packet.next_header() == ip::IPPROTO_UDP {
+            let datagram = UdpDatagram::parse_ipv6(packet, verify_checksum)?;
+            let client = SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(packet.source())),
+                datagram.source_port(),
+            );
+            let gateway = SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(packet.destination())),
+                datagram.destination_port(),
+            );
+            return self.handle_udp(client, gateway, datagram.payload());
         }
         if packet.next_header() != ip::IPPROTO_TCP {
             return Ok(());
@@ -1695,6 +1785,7 @@ impl Reactor {
 
     fn handle_timers(&mut self) -> Result<(), Error> {
         let now = Instant::now();
+        self.handle_dns_timers(now)?;
         let ids = self.flows.active_ids();
         if ids.is_empty() {
             return Ok(());
@@ -2002,6 +2093,438 @@ impl Reactor {
             IpAddr::V4(ip) => Some(ip) == self.config.gateway_ipv4,
             IpAddr::V6(ip) => Some(ip) == self.config.gateway_ipv6,
         }
+    }
+
+    /// Entry point for namespace UDP: gateway-directed DNS is intercepted,
+    /// everything else is dropped exactly as before UDP parsing existed.
+    fn handle_udp(
+        &mut self,
+        client: SocketAddr,
+        gateway: SocketAddr,
+        message: &[u8],
+    ) -> Result<(), Error> {
+        if !self.dns_intercepts(gateway) {
+            return Ok(());
+        }
+        self.metrics.dns_queries += 1;
+        let now = Instant::now();
+        let resolver_available = self.config.dns_upstream.is_some();
+        match self
+            .dns_engine
+            .accept_query(client, gateway, message, resolver_available, now)
+        {
+            dns::QueryDisposition::Drop => {
+                self.metrics.dns_dropped += 1;
+                Ok(())
+            }
+            dns::QueryDisposition::Respond(reply) => {
+                self.metrics.dns_failures += 1;
+                if !resolver_available {
+                    self.metrics.dns_refused += 1;
+                }
+                self.queue_dns_reply(client, gateway, &reply)
+            }
+            dns::QueryDisposition::Forward { upstream_id } => {
+                self.forward_dns_query(upstream_id, message)
+            }
+        }
+    }
+
+    /// Appends the query to the resolver stream under its rewritten ID and
+    /// makes sure a connection is coming up to carry it.
+    fn forward_dns_query(&mut self, upstream_id: u16, message: &[u8]) -> Result<(), Error> {
+        let length = u16::try_from(message.len()).ok();
+        let fits = length.is_some()
+            && self.dns_write_buffer.len() + 2 + message.len() <= DNS_WRITE_BUFFER_LIMIT;
+        if !fits {
+            if let Some((transaction, reply)) = self.dns_engine.abort(upstream_id) {
+                self.metrics.dns_failures += 1;
+                self.queue_dns_reply(transaction.client, transaction.gateway, &reply)?;
+            }
+            return Ok(());
+        }
+        self.dns_write_buffer
+            .extend(length.expect("checked above").to_be_bytes());
+        self.dns_write_buffer.extend(upstream_id.to_be_bytes());
+        self.dns_write_buffer.extend(message[2..].iter().copied());
+        self.dns_last_activity = Instant::now();
+        self.ensure_dns_connection()?;
+        if matches!(self.dns_connection, DnsConnection::Ready { .. }) {
+            self.flush_dns_write()?;
+        }
+        self.update_dns_interest()
+    }
+
+    /// Opens the resolver connection if none exists: through the proxy
+    /// with a dedicated CONNECT tunnel targeting the resolver, or a direct
+    /// host socket. Never shares a flow's tunnel.
+    fn ensure_dns_connection(&mut self) -> Result<(), Error> {
+        if !matches!(self.dns_connection, DnsConnection::Idle) {
+            return Ok(());
+        }
+        let resolver = self
+            .config
+            .dns_upstream
+            .ok_or(Error::Invariant("DNS forward without a resolver"))?;
+        let (transport, handshake) = match &self.config.upstream {
+            Upstream::Proxy {
+                protocol,
+                address,
+                credentials,
+            } => (
+                *address,
+                Some(Handshake::new(*protocol, resolver, credentials.clone())),
+            ),
+            Upstream::Direct { .. } => (resolver, None),
+        };
+        match yayatht_sys::socket::connect_nonblocking(
+            transport,
+            DNS_SOCKET_BUFFER_BYTES,
+            DNS_SOCKET_BUFFER_BYTES,
+        ) {
+            Ok((socket, connected)) => {
+                self.epoll.add(
+                    socket.as_raw_fd(),
+                    socket_interest(true, false, false),
+                    EpollToken::global(Resource::DnsUpstream).raw(),
+                )?;
+                self.metrics.dns_upstream_connects += 1;
+                self.dns_connection = DnsConnection::Connecting {
+                    socket,
+                    connected,
+                    handshake,
+                };
+                Ok(())
+            }
+            Err(error) => {
+                debug!(%error, "DNS resolver connect failed");
+                self.fail_dns_connection()
+            }
+        }
+    }
+
+    fn handle_dns_upstream(&mut self, events: u32) -> Result<(), Error> {
+        let Some(fd) = self.dns_connection.raw_fd() else {
+            return Ok(());
+        };
+        if events & yayatht_sys::reactor::ERROR != 0
+            && yayatht_sys::socket::pending_error(fd)?.is_some()
+        {
+            return self.fail_dns_connection();
+        }
+        if let DnsConnection::Connecting { connected, .. } = &mut self.dns_connection {
+            if !*connected {
+                if events & yayatht_sys::reactor::WRITABLE == 0 {
+                    return Ok(());
+                }
+                if yayatht_sys::socket::pending_error(fd)?.is_some() {
+                    return self.fail_dns_connection();
+                }
+                *connected = true;
+            }
+            self.drive_dns_handshake()?;
+        }
+        if let DnsConnection::Ready { .. } = self.dns_connection {
+            if events & yayatht_sys::reactor::WRITABLE != 0 {
+                self.flush_dns_write()?;
+            }
+            if events & (yayatht_sys::reactor::READABLE | yayatht_sys::reactor::READ_HANGUP) != 0
+                && !self.read_dns_stream()?
+            {
+                return self.fail_dns_connection();
+            }
+        }
+        if matches!(self.dns_connection, DnsConnection::Idle) {
+            return Ok(());
+        }
+        self.update_dns_interest()
+    }
+
+    /// Drives the proxy CONNECT handshake on the connecting resolver
+    /// socket; on completion promotes the connection and flushes queued
+    /// queries. Stream bytes the proxy pipelined after its final reply
+    /// stay in the socket for the Ready read path.
+    fn drive_dns_handshake(&mut self) -> Result<(), Error> {
+        loop {
+            let DnsConnection::Connecting {
+                socket, handshake, ..
+            } = &mut self.dns_connection
+            else {
+                return Ok(());
+            };
+            let Some(pending) = handshake.as_mut() else {
+                break;
+            };
+            if pending.is_complete() {
+                break;
+            }
+            let fd = socket.as_raw_fd();
+            while !pending.output().is_empty() {
+                match yayatht_sys::socket::send(fd, pending.output()) {
+                    Ok(0) => return self.fail_dns_connection(),
+                    Ok(sent) => {
+                        if pending.advance_output(sent).is_err() {
+                            return self.fail_dns_connection();
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                    Err(_) => return self.fail_dns_connection(),
+                }
+            }
+            if !pending.wants_input() {
+                continue;
+            }
+            let mut response = [0u8; PROXY_RESPONSE_CAPACITY];
+            let length = match yayatht_sys::socket::peek(fd, &mut response) {
+                Ok(0) => return self.fail_dns_connection(),
+                Ok(length) => length,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+                Err(_) => return self.fail_dns_connection(),
+            };
+            match pending.receive(&response[..length]) {
+                Ok(0) => return Ok(()),
+                Ok(consumed) => {
+                    if yayatht_sys::socket::discard(fd, consumed)? != consumed {
+                        return self.fail_dns_connection();
+                    }
+                }
+                Err(error) => {
+                    debug!(%error, "DNS resolver proxy handshake failed");
+                    return self.fail_dns_connection();
+                }
+            }
+        }
+        let DnsConnection::Connecting { socket, .. } =
+            std::mem::replace(&mut self.dns_connection, DnsConnection::Idle)
+        else {
+            return Ok(());
+        };
+        self.dns_connection = DnsConnection::Ready { socket };
+        self.flush_dns_write()
+    }
+
+    fn flush_dns_write(&mut self) -> Result<(), Error> {
+        let DnsConnection::Ready { socket } = &self.dns_connection else {
+            return Ok(());
+        };
+        let fd = socket.as_raw_fd();
+        while !self.dns_write_buffer.is_empty() {
+            let (chunk, _) = self.dns_write_buffer.as_slices();
+            match yayatht_sys::socket::send(fd, chunk) {
+                Ok(0) => return self.fail_dns_connection(),
+                Ok(sent) => {
+                    self.dns_write_buffer.drain(..sent);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => return self.fail_dns_connection(),
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads the length-prefixed response stream. Returns false when the
+    /// resolver closed or overflowed the connection.
+    fn read_dns_stream(&mut self) -> Result<bool, Error> {
+        let DnsConnection::Ready { socket } = &self.dns_connection else {
+            return Ok(true);
+        };
+        let fd = socket.as_raw_fd();
+        let mut chunk = [0u8; 4096];
+        loop {
+            match yayatht_sys::socket::recv(fd, &mut chunk) {
+                Ok(0) => return Ok(false),
+                Ok(length) => {
+                    if self.dns_read_buffer.len() + length > DNS_READ_BUFFER_LIMIT {
+                        return Ok(false);
+                    }
+                    self.dns_read_buffer.extend_from_slice(&chunk[..length]);
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                Err(_) => return Ok(false),
+            }
+        }
+        self.process_dns_frames()?;
+        Ok(true)
+    }
+
+    fn process_dns_frames(&mut self) -> Result<(), Error> {
+        loop {
+            if self.dns_read_buffer.len() < 2 {
+                return Ok(());
+            }
+            let frame_len = usize::from(u16::from_be_bytes([
+                self.dns_read_buffer[0],
+                self.dns_read_buffer[1],
+            ]));
+            if self.dns_read_buffer.len() < 2 + frame_len {
+                return Ok(());
+            }
+            let frame: Vec<u8> = self
+                .dns_read_buffer
+                .drain(..2 + frame_len)
+                .skip(2)
+                .collect();
+            // The reply must fit one TAP frame; IPv6 overhead is assumed
+            // so the bound holds for both families.
+            let frame_limit = self.mtu_frame_capacity
+                - self.vnet_len
+                - ethernet::ETHERNET_HEADER_LEN
+                - 40
+                - udp::UDP_HEADER_LEN;
+            if let Some(reply) = self.dns_engine.accept_response(&frame, frame_limit) {
+                self.metrics.dns_responses += 1;
+                if reply.truncated {
+                    self.metrics.dns_truncated += 1;
+                }
+                self.dns_last_activity = Instant::now();
+                self.queue_dns_reply(
+                    reply.transaction.client,
+                    reply.transaction.gateway,
+                    &reply.payload,
+                )?;
+            }
+        }
+    }
+
+    /// Tears down the resolver connection and answers every outstanding
+    /// transaction SERVFAIL. The next query reconnects on demand.
+    fn fail_dns_connection(&mut self) -> Result<(), Error> {
+        self.dns_connection = DnsConnection::Idle;
+        self.dns_write_buffer.clear();
+        self.dns_read_buffer.clear();
+        for (transaction, reply) in self.dns_engine.fail_all() {
+            self.metrics.dns_failures += 1;
+            self.queue_dns_reply(transaction.client, transaction.gateway, &reply)?;
+        }
+        Ok(())
+    }
+
+    fn update_dns_interest(&mut self) -> Result<(), Error> {
+        let (fd, interest) = match &self.dns_connection {
+            DnsConnection::Idle => return Ok(()),
+            DnsConnection::Connecting {
+                socket,
+                connected,
+                handshake,
+            } => (
+                socket.as_raw_fd(),
+                socket_interest(
+                    !connected,
+                    handshake
+                        .as_ref()
+                        .is_some_and(|pending| !pending.output().is_empty()),
+                    false,
+                ),
+            ),
+            DnsConnection::Ready { socket } => (
+                socket.as_raw_fd(),
+                socket_interest(false, false, !self.dns_write_buffer.is_empty()),
+            ),
+        };
+        self.epoll.modify(
+            fd,
+            interest,
+            EpollToken::global(Resource::DnsUpstream).raw(),
+        )?;
+        Ok(())
+    }
+
+    /// Expires overdue transactions with SERVFAIL and closes the resolver
+    /// connection after an idle period.
+    fn handle_dns_timers(&mut self, now: Instant) -> Result<(), Error> {
+        let expired = self.dns_engine.expire(now);
+        for (transaction, reply) in expired {
+            self.metrics.dns_failures += 1;
+            self.queue_dns_reply(transaction.client, transaction.gateway, &reply)?;
+        }
+        if self.dns_engine.is_idle()
+            && self.dns_write_buffer.is_empty()
+            && !matches!(self.dns_connection, DnsConnection::Idle)
+            && now.duration_since(self.dns_last_activity) >= DNS_IDLE_TIMEOUT
+        {
+            self.dns_connection = DnsConnection::Idle;
+            self.dns_read_buffer.clear();
+        }
+        Ok(())
+    }
+
+    /// Builds and queues a gateway-sourced UDP frame carrying a DNS
+    /// message back to its namespace client.
+    fn queue_dns_reply(
+        &mut self,
+        client: SocketAddr,
+        gateway: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        let vnet_len = self.vnet_len;
+        let ip_header_len = if client.is_ipv4() { 20 } else { 40 };
+        let ip_offset = vnet_len + ethernet::ETHERNET_HEADER_LEN;
+        let udp_offset = ip_offset + ip_header_len;
+        let frame_len = udp_offset + udp::UDP_HEADER_LEN + payload.len();
+        let mut frame = self.acquire_frame()?;
+        if frame_len > frame.buffer.capacity() {
+            self.release_frame(frame);
+            return Err(Error::Invariant("DNS reply exceeds frame capacity"));
+        }
+        let result = (|| {
+            let bytes = frame.buffer.writable();
+            bytes[..vnet_len].fill(0);
+            ethernet::write_header(
+                &mut bytes[vnet_len..],
+                self.config.target_mac,
+                self.config.gateway_mac,
+                if client.is_ipv4() {
+                    EtherType::Ipv4
+                } else {
+                    EtherType::Ipv6
+                },
+            )?;
+            bytes[udp_offset + udp::UDP_HEADER_LEN..frame_len].copy_from_slice(payload);
+            udp::write_header(
+                &mut bytes[udp_offset..frame_len],
+                gateway.port(),
+                client.port(),
+                payload.len(),
+            )?;
+            match (gateway.ip(), client.ip()) {
+                (IpAddr::V4(source), IpAddr::V4(destination)) => {
+                    ip::write_ipv4_header(
+                        &mut bytes[ip_offset..frame_len],
+                        source.octets(),
+                        destination.octets(),
+                        ip::IPPROTO_UDP,
+                        udp::UDP_HEADER_LEN + payload.len(),
+                        0,
+                    )?;
+                    udp::set_ipv4_checksum(
+                        &mut bytes[udp_offset..frame_len],
+                        source.octets(),
+                        destination.octets(),
+                    )
+                }
+                (IpAddr::V6(source), IpAddr::V6(destination)) => {
+                    ip::write_ipv6_header(
+                        &mut bytes[ip_offset..frame_len],
+                        source.octets(),
+                        destination.octets(),
+                        ip::IPPROTO_UDP,
+                        udp::UDP_HEADER_LEN + payload.len(),
+                    )?;
+                    udp::set_ipv6_checksum(
+                        &mut bytes[udp_offset..frame_len],
+                        source.octets(),
+                        destination.octets(),
+                    )
+                }
+                _ => Err(yayatht_packet::PacketError::ProtocolMismatch),
+            }
+        })();
+        if let Err(error) = result {
+            self.release_frame(frame);
+            return Err(error.into());
+        }
+        frame.buffer.set_len(frame_len);
+        self.queue_tap(None, frame, None)
     }
 
     fn route_target(&self, logical: SocketAddr) -> (FlowInterface, SocketAddr) {
