@@ -2330,21 +2330,31 @@ impl Reactor {
         };
         let fd = socket.as_raw_fd();
         let mut chunk = [0u8; 4096];
+        let mut alive = true;
         loop {
             match yayatht_sys::socket::recv(fd, &mut chunk) {
-                Ok(0) => return Ok(false),
+                Ok(0) => {
+                    alive = false;
+                    break;
+                }
                 Ok(length) => {
                     if self.dns_read_buffer.len() + length > DNS_READ_BUFFER_LIMIT {
-                        return Ok(false);
+                        alive = false;
+                        break;
                     }
                     self.dns_read_buffer.extend_from_slice(&chunk[..length]);
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(_) => return Ok(false),
+                Err(_) => {
+                    alive = false;
+                    break;
+                }
             }
         }
+        // Responses that arrived ahead of an EOF still count: answer them
+        // before the connection teardown fails whatever remains.
         self.process_dns_frames()?;
-        Ok(true)
+        Ok(alive)
     }
 
     fn process_dns_frames(&mut self) -> Result<(), Error> {

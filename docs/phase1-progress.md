@@ -115,6 +115,23 @@ DNS, or external routing.
   `docs/phase1b-plan.md`; evidence:
   `docs/phase1b-calibration-2026-07-16.md`.
 
+- Phase 1C lifted the Phase 1A DNS no-go (its kernel-compatibility gate
+  dissolved with the 6.6 baseline; its calibration gate closed in
+  Phase 1B) and delivered DNS `proxy-tcp` (design §9 mode 1) with the
+  resolver bind mount. The namespace resolver points at the virtual
+  gateway through an instance-owned `resolv.conf` bind-mounted by
+  ns-init; gateway 53/UDP is converted to DNS-over-TCP on one dedicated
+  resolver connection tunneled separately from all flow traffic, with
+  upstream ID rewrite for concurrent same-ID transactions, response
+  ID/question validation, EDNS0 payload sizing, TC truncation, FORMERR/
+  SERVFAIL synthesis, a 5 s per-query timeout, and a 15 s idle
+  disconnect; gateway 53/TCP keeps stream semantics through the normal
+  flow machinery with its logical target rewritten to the resolver.
+  `--dns off` restores the previous behavior; without a usable resolver
+  the instance stays leak-free (SERVFAIL/RST) instead of failing
+  TCP-only workloads. `dns_*` metrics are exported through status. Plan
+  and verification: `docs/phase1c-plan.md`.
+
 ## Remaining Phase 1 Work
 
 - Per-byte copy costs (TAP read, socket send) dominate the remaining
@@ -124,8 +141,9 @@ DNS, or external routing.
   calibration runs before it can gate anything.
 - Isolate real-mihomo 128-flow fairness variance from the shared host TUN path.
 - Review the 2 GiB default worst-case socket-buffer budget.
-- DNS proxy-tcp and resolver mount isolation remain blocked by the Phase 1A
-  no-go decision in `docs/phase1a-exit-audit.md`.
+- DNS integration against packetdrill-style capture assertions and the
+  design §12 no-leak tshark oracle (functional matrix landed in Phase 1C;
+  `proxy-udp`/`fake-ip` modes stay in Phase 2/4 per the backlog).
 - Generated seccomp profiles, pivoted data-plane filesystem, and remaining
   role-specific rlimits.
 - Final seccomp/rlimit locking and 24-hour soak tests.

@@ -81,7 +81,7 @@ from CLI through `LaunchConfig` into the reactor `Config`.
 **Success Criteria**: `--dns off` reproduces today's behavior; invalid
 combinations rejected with clear errors.
 **Tests**: config validation unit tests.
-**Status**: In Progress
+**Status**: Complete (`c576fa3`)
 
 ### Stage 2: Resolver bind mount and TCP/53 redirect
 
@@ -91,7 +91,7 @@ gateway:53 TCP flows redirected to the resolver.
 **Success Criteria**: `cat /etc/resolv.conf` in the namespace shows the
 gateway; a TCP/53 connection reaches the resolver through the proxy.
 **Tests**: rootless integration cases for both.
-**Status**: Not Started
+**Status**: Complete (`9057111`)
 
 ### Stage 3: UDP parsing and the DNS transaction engine
 
@@ -100,7 +100,7 @@ table with ID rewrite, EDNS0/TC/FORMERR/SERVFAIL handling, `dns_*` metrics.
 **Success Criteria**: pure-logic unit tests for framing, ID allocation,
 question validation, truncation, and error synthesis all pass.
 **Tests**: unit tests beside `dns.rs` and `packet/udp.rs`.
-**Status**: Not Started
+**Status**: Complete (`4995fef`)
 
 ### Stage 4: Integration matrix, docs, gates
 
@@ -111,4 +111,23 @@ over TCP/53; FORMERR; timeout SERVFAIL; busybox `nslookup` smoke; docs
 updated; `cargo fmt --check`, `clippy -D warnings`, serial workspace tests
 all green.
 **Tests**: new cases in `crates/cli/tests/rootless.rs`.
-**Status**: Not Started
+**Status**: Complete
+
+## Verification (2026-07-16)
+
+- `cargo fmt --all --check`, `cargo clippy --workspace --all-targets
+  --all-features -- -D warnings`, and `cargo test --workspace --
+  --test-threads=1` (39 rootless integration tests, 11 of them new DNS
+  cases) all pass. `cargo deny` is not installed on this host, unchanged
+  from the Phase 1A/1B audits.
+- New rootless coverage: resolv.conf mount contents (`--dns off`
+  contrast), TCP/53 redirect target through mock SOCKS5, no-resolver RST,
+  UDP query through a dedicated proxy tunnel, out-of-order responses to
+  concurrent same-ID queries, TC truncation with TCP retry, EDNS0 payload
+  sizing, FORMERR, timeout SERVFAIL, and a busybox `nslookup` smoke test.
+- Live check in the documented host environment: `yayatht run --socks5
+  127.0.0.1:7890 --dns-upstream 1.1.1.1 -- busybox nslookup example.com
+  192.0.2.1` resolves A and AAAA through mihomo.
+- One EOF-ordering bug was found by the same-ID integration test and
+  fixed: responses buffered ahead of a resolver EOF are answered before
+  the teardown SERVFAILs the remainder.

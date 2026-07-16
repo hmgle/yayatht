@@ -1520,3 +1520,319 @@ fn tcp_dns_without_a_resolver_is_refused() {
         output.stdout
     );
 }
+
+fn dns_client_binary() -> Option<String> {
+    let path = std::path::Path::new(env!("CARGO_BIN_EXE_yayatht"))
+        .parent()?
+        .join("dns-client");
+    path.exists().then(|| path.to_str().unwrap().to_owned())
+}
+
+fn read_dns_query(stream: &mut std::net::TcpStream) -> Option<Vec<u8>> {
+    let mut prefix = [0u8; 2];
+    stream.read_exact(&mut prefix).ok()?;
+    let mut query = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+    stream.read_exact(&mut query).ok()?;
+    Some(query)
+}
+
+fn dns_qname(query: &[u8]) -> String {
+    let mut name = String::new();
+    let mut offset = 12;
+    while query[offset] != 0 {
+        let length = usize::from(query[offset]);
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(std::str::from_utf8(&query[offset + 1..offset + 1 + length]).unwrap());
+        offset += length + 1;
+    }
+    name
+}
+
+/// Response echoing the query's ID and question with `count` A records.
+fn dns_answer_message(query: &[u8], ip: [u8; 4], count: u16) -> Vec<u8> {
+    let mut offset = 12;
+    while query[offset] != 0 {
+        offset += usize::from(query[offset]) + 1;
+    }
+    let question_end = offset + 5;
+    let mut message = Vec::new();
+    message.extend_from_slice(&query[..2]);
+    message.extend_from_slice(&0x8180u16.to_be_bytes());
+    message.extend_from_slice(&[0, 1]);
+    message.extend_from_slice(&count.to_be_bytes());
+    message.extend_from_slice(&[0, 0, 0, 0]);
+    message.extend_from_slice(&query[12..question_end]);
+    for _ in 0..count {
+        message.extend_from_slice(&[0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+        message.extend_from_slice(&ip);
+    }
+    message
+}
+
+fn write_dns_frame(stream: &mut std::net::TcpStream, message: &[u8]) {
+    let length = u16::try_from(message.len()).unwrap();
+    stream.write_all(&length.to_be_bytes()).unwrap();
+    stream.write_all(message).unwrap();
+}
+
+/// Serves length-prefixed DNS on one connection until EOF; `lookup`
+/// returning None swallows the query without answering.
+fn serve_dns_connection(
+    mut stream: std::net::TcpStream,
+    lookup: impl Fn(&str) -> Option<([u8; 4], u16)>,
+) {
+    stream
+        .set_read_timeout(Some(Duration::from_secs(8)))
+        .unwrap();
+    while let Some(query) = read_dns_query(&mut stream) {
+        if let Some((ip, count)) = lookup(&dns_qname(&query)) {
+            let answer = dns_answer_message(&query, ip, count);
+            write_dns_frame(&mut stream, &answer);
+        }
+    }
+}
+
+/// Accepts resolver connections forever; leaked at test exit by design.
+fn spawn_mock_resolver(
+    listener: TcpListener,
+    lookup: impl Fn(&str) -> Option<([u8; 4], u16)> + Clone + Send + 'static,
+) {
+    thread::spawn(move || {
+        while let Ok((stream, _)) = listener.accept() {
+            let lookup = lookup.clone();
+            thread::spawn(move || serve_dns_connection(stream, lookup));
+        }
+    });
+}
+
+#[test]
+fn udp_dns_resolves_through_a_dedicated_proxy_tunnel() {
+    if !supported() {
+        return;
+    }
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock proxy");
+    let proxy = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let mut stream = proxy_stream(listener);
+        let mut greeting = [0u8; 3];
+        stream.read_exact(&mut greeting).unwrap();
+        assert_eq!(greeting, [5, 1, 0]);
+        stream.write_all(&[5, 0]).unwrap();
+        let target = read_socks_target(&mut stream);
+        assert_eq!(
+            target,
+            "203.0.113.53:53".parse::<SocketAddr>().unwrap(),
+            "resolver tunnel must CONNECT to the configured resolver"
+        );
+        stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+        serve_dns_connection(stream, |name| {
+            assert_eq!(name, "example.com");
+            Some(([198, 51, 100, 7], 1))
+        });
+    });
+    let output = namespace_output(
+        &[
+            "--socks5",
+            &proxy.to_string(),
+            "--dns-upstream",
+            "203.0.113.53",
+        ],
+        &[&client, "query", "192.0.2.1", "example.com"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("rcode=0")
+            && stdout.contains("a=198.51.100.7")
+            && stdout.contains("tc=0")
+            && stdout.contains("id=ok"),
+        "unexpected DNS result: {stdout} {stderr}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn same_id_queries_return_out_of_order_to_the_right_clients() {
+    if !supported() {
+        return;
+    }
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock resolver");
+    let resolver = listener.local_addr().unwrap();
+    // Read both queries before answering, then answer in reverse order.
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept resolver connection");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(8)))
+            .unwrap();
+        let first = read_dns_query(&mut stream).expect("first query");
+        let second = read_dns_query(&mut stream).expect("second query");
+        for query in [&second, &first] {
+            let ip = if dns_qname(query) == "alpha.test" {
+                [198, 51, 100, 1]
+            } else {
+                [198, 51, 100, 2]
+            };
+            let answer = dns_answer_message(query, ip, 1);
+            write_dns_frame(&mut stream, &answer);
+        }
+    });
+    let output = namespace_output(
+        &["--direct", "--dns-upstream", &resolver.to_string()],
+        &[&client, "same-id", "192.0.2.1", "alpha.test", "beta.test"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("alpha.test") && stdout.contains("a=198.51.100.1"),
+        "alpha answer misrouted: {stdout} {stderr}"
+    );
+    assert!(
+        stdout.contains("beta.test") && stdout.contains("a=198.51.100.2"),
+        "beta answer misrouted: {stdout} {stderr}"
+    );
+    assert_eq!(
+        stdout.matches("id=ok").count(),
+        2,
+        "IDs not restored: {stdout}"
+    );
+}
+
+#[test]
+fn oversized_udp_answer_truncates_and_tcp_retry_succeeds() {
+    if !supported() {
+        return;
+    }
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock resolver");
+    let resolver = listener.local_addr().unwrap();
+    // 60 A records: far past the 512-byte plain-UDP limit.
+    spawn_mock_resolver(listener, |_| Some(([198, 51, 100, 3], 60)));
+    let output = namespace_output(
+        &["--direct", "--dns-upstream", &resolver.to_string()],
+        &[&client, "tc-fallback", "192.0.2.1", "big.test"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(stdout.contains("udp tc"), "expected truncation: {stdout}");
+    assert!(
+        stdout.contains("tcp rcode=0") && stdout.contains("answers=60") && stdout.contains("id=ok"),
+        "TCP retry failed: {stdout} {stderr}"
+    );
+}
+
+#[test]
+fn edns0_payload_size_avoids_truncation() {
+    if !supported() {
+        return;
+    }
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock resolver");
+    let resolver = listener.local_addr().unwrap();
+    spawn_mock_resolver(listener, |_| Some(([198, 51, 100, 4], 60)));
+    let output = namespace_output(
+        &["--direct", "--dns-upstream", &resolver.to_string()],
+        &[&client, "edns", "192.0.2.1", "big.test", "4096"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("tc=0") && stdout.contains("answers=60"),
+        "EDNS0 answer truncated: {stdout} {stderr}"
+    );
+}
+
+#[test]
+fn malformed_query_is_answered_formerr_without_contacting_the_resolver() {
+    if !supported() {
+        return;
+    }
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    // TEST-NET resolver: any contact would hang, proving the local answer.
+    let output = namespace_output(
+        &["--direct", "--dns-upstream", "203.0.113.53"],
+        &[&client, "malformed", "192.0.2.1", "example.com"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("rcode=1") && stdout.contains("id=ok"),
+        "expected FORMERR: {stdout} {stderr}"
+    );
+}
+
+#[test]
+fn unanswered_query_times_out_with_servfail() {
+    if !supported() {
+        return;
+    }
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock resolver");
+    let resolver = listener.local_addr().unwrap();
+    spawn_mock_resolver(listener, |_| None);
+    let output = namespace_output(
+        &["--direct", "--dns-upstream", &resolver.to_string()],
+        &[&client, "query", "192.0.2.1", "slow.test"],
+        &[("YAYATHT_TEST_DNS_QUERY_TIMEOUT_MS", "300")],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("rcode=2") && stdout.contains("id=ok"),
+        "expected SERVFAIL: {stdout} {stderr}"
+    );
+}
+
+#[test]
+fn busybox_nslookup_resolves_through_the_default_dns_mode() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock resolver");
+    let resolver = listener.local_addr().unwrap();
+    spawn_mock_resolver(listener, |_| Some(([192, 0, 2, 99], 1)));
+    let output = namespace_output(
+        &["--direct", "--dns-upstream", &resolver.to_string()],
+        &["busybox", "nslookup", "example.com", "192.0.2.1"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("192.0.2.99"),
+        "nslookup missing answer: {stdout} {stderr}"
+    );
+}
