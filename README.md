@@ -15,7 +15,7 @@ sandbox are not exposed yet.
 cargo build --release
 ```
 
-Linux 5.11 or newer with unprivileged user namespaces and `/dev/net/tun` is
+Linux 6.6 or newer with unprivileged user namespaces and `/dev/net/tun` is
 required. No setuid binary or host capability is used.
 
 ## Run

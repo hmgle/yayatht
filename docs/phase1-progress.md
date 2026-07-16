@@ -39,9 +39,13 @@
   full byte count after the reader resumes.
 - `FlowSide` is now the endpoint source of truth, with separate local, logical,
   and transport endpoints for both initiating and target sides.
-- TCP_INFO fields are length-gated and SO_PEEK_OFF is probed at runtime.
-  Missing capabilities use tested iovec, conservative-ACK, and fixed-window
-  fallbacks, with degraded state exported through status metrics.
+- The kernel baseline is Linux 6.6 LTS (design revision ca68f9e). `SO_PEEK_OFF`,
+  a complete `TCP_INFO` (`tcpi_bytes_acked`), and `SOF_TIMESTAMPING_TX_ACK` are
+  assumed present: capability probing, the iovec peek fallback, the
+  conservative-ACK fallback, the fixed fallback window, and the fallback fast
+  timer tick were removed. A socket that rejects these options fails its flow
+  at activation instead of degrading. The timer watchdog remains as the
+  recovery path for dropped TX ACK timestamp notifications.
 - Global pending and socket-retained byte limits, per-flow socket quotas, and a
   max-flow-derived data-plane RLIMIT_NOFILE provide hard instance boundaries.
   High pending watermarks publish zero windows across active flows.
@@ -77,7 +81,8 @@ DNS, or external routing.
 ## Remaining Phase 1 Work
 
 - Isolate real-mihomo 128-flow fairness variance from the shared host TUN path.
-- Validate the degraded capability paths on an actual Linux 5.11 kernel.
+- TAP offload (`IFF_VNET_HDR` + `TUNSETOFFLOAD` GSO/GRO/csum) per the
+  performance-first design revision; staged in `IMPLEMENTATION_PLAN.md`.
 - Review the 2 GiB default worst-case socket-buffer budget.
 - DNS proxy-tcp and resolver mount isolation remain blocked by the Phase 1A
   no-go decision in `docs/phase1a-exit-audit.md`.

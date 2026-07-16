@@ -26,13 +26,10 @@ const TAP_FRAME_POOL_BYTES: usize = 16 * 1024 * 1024;
 const TAP_FRAME_POOL_MAX_FRAMES: usize = 4096;
 const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
-// Fallback flows have no ACK event source, so the watchdog tick is their
-// primary ACK path; 100 ms quantizes a single-flow upload to roughly one
-// send-window per tick (measured ~8x throughput loss), while 10 ms is
-// negligible reactor load and only armed while such a flow has
-// unacknowledged upstream bytes.
+// Periodic tick driving retransmissions, zero-window probes and the ACK
+// watchdog that bounds recovery from a dropped TX ACK timestamp
+// notification to about one interval instead of the namespace RTO.
 const TIMER_INTERVAL: Duration = Duration::from_millis(100);
-const TIMER_INTERVAL_ACK_FALLBACK: Duration = Duration::from_millis(10);
 /// Window-scale shift offered on the SYN-ACK when the namespace SYN offers
 /// the option. Shift 7 allows advertising up to ~8 MiB.
 const WINDOW_SCALE_SHIFT: u8 = 7;
@@ -43,7 +40,6 @@ const ZERO_WINDOW_PROBE_INITIAL: Duration = Duration::from_secs(1);
 const ZERO_WINDOW_PROBE_MAX: Duration = Duration::from_secs(8);
 const PROXY_RESPONSE_CAPACITY: usize = 8 * 1024;
 const MAX_PENDING_SOCKET_BYTES: usize = 256 * 1024;
-const FALLBACK_ACK_WINDOW: usize = 8 * 1024;
 const TEST_DROP_TCP_DATA_ENV: &str = "YAYATHT_TEST_DROP_TCP_DATA";
 const TEST_DROP_TCP_RETRANSMIT_ENV: &str = "YAYATHT_TEST_DROP_TCP_RETRANSMIT";
 const TEST_DROP_TCP_SYN_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_SYN_ACK";
@@ -52,10 +48,6 @@ const TEST_DROP_TCP_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_ACK";
 const TEST_DROP_TCP_FIN_ACK_ENV: &str = "YAYATHT_TEST_DROP_TCP_FIN_ACK";
 const TEST_LOCAL_ISN_ENV: &str = "YAYATHT_TEST_LOCAL_ISN";
 const TEST_SUPPRESS_EVENT_ACK_REFRESH_ENV: &str = "YAYATHT_TEST_SUPPRESS_EVENT_ACK_REFRESH";
-const TEST_DISABLE_PEEK_OFF_ENV: &str = "YAYATHT_TEST_DISABLE_SO_PEEK_OFF";
-const TEST_DISABLE_BYTES_ACKED_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_BYTES_ACKED";
-const TEST_DISABLE_SEND_WINDOW_ENV: &str = "YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND";
-const TEST_DISABLE_TX_TIMESTAMPS_ENV: &str = "YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS";
 
 #[derive(Clone, Debug)]
 pub enum Upstream {
@@ -98,20 +90,8 @@ pub struct Metrics {
     pub tcp_resets: u64,
     pub proxy_handshakes: u64,
     pub proxy_failures: u64,
-    pub degraded_tcp_flows: u64,
-    pub peek_offset_flows: u64,
-    pub peek_iovec_fallback_flows: u64,
-    pub bytes_acked_flows: u64,
-    pub conservative_ack_flows: u64,
-    pub send_window_flows: u64,
-    pub send_window_unavailable_flows: u64,
-    pub tx_ack_timestamp_flows: u64,
-    pub tx_ack_watchdog_flows: u64,
     pub tx_ack_watchdog_advances: u64,
     pub tx_ack_watchdog_tail_recoveries: u64,
-    /// Current periodic tick in milliseconds; the fast fallback interval
-    /// shows up here while some fallback flow has unacknowledged bytes.
-    pub timer_interval_ms: u64,
     pub active_tcp_flows: u64,
     pub peak_tcp_flows: u64,
     pub pending_tcp_bytes: u64,
@@ -155,14 +135,6 @@ struct FlowEntry {
     socket: OwnedFd,
     transport_connected: bool,
     armed_socket_interest: u32,
-    tx_ack_timestamps: bool,
-    // Set at activation when the kernel rejected TX ACK timestamps; only
-    // these flows may arm the fast fallback tick.
-    ack_fallback: bool,
-    // Mirrors this flow's membership in the reactor's count of fallback
-    // flows with unacknowledged bytes, so transitions and removal adjust
-    // exactly the flows that were counted.
-    ack_fallback_unacked: bool,
     handshake: Option<Handshake>,
     pending_socket: PendingSocketQueue,
     pending_shutdown: bool,
@@ -170,8 +142,6 @@ struct FlowEntry {
     upstream_window_clamp: Option<u32>,
     zero_window_probe: Option<ZeroWindowProbe>,
     last_namespace_byte: Option<u8>,
-    peek_offset_supported: bool,
-    bytes_acked_supported: bool,
     socket_receive_buffer_bytes: usize,
     socket_send_buffer_bytes: usize,
 }
@@ -376,8 +346,6 @@ pub struct Reactor {
     /// TAP batch, instead of one refresh per received segment.
     ack_refresh_queue: Vec<FlowId>,
     timer_cursor_slot: u32,
-    ack_fallback_unacked_flows: usize,
-    timer_interval_fast: bool,
 }
 
 impl Reactor {
@@ -414,7 +382,6 @@ impl Reactor {
             tap_frame_capacity: frame_capacity as u64,
             tap_frame_pool_frames: frame_pool_frames as u64,
             tap_frame_pool_bytes: frame_pool_frames.saturating_mul(frame_capacity) as u64,
-            timer_interval_ms: u64::try_from(TIMER_INTERVAL.as_millis()).unwrap_or(u64::MAX),
             max_socket_buffer_bytes: u64::try_from(max_tcp_flows)
                 .unwrap_or(u64::MAX)
                 .saturating_mul(
@@ -454,8 +421,6 @@ impl Reactor {
             pending_pressure_dirty: false,
             ack_refresh_queue: Vec::new(),
             timer_cursor_slot: 0,
-            ack_fallback_unacked_flows: 0,
-            timer_interval_fast: false,
         })
     }
 
@@ -481,7 +446,6 @@ impl Reactor {
                     (None, Resource::Timer) => {
                         self.timer.consume()?;
                         self.handle_timers()?;
-                        self.settle_timer_interval()?;
                     }
                     (None, Resource::Control) => self.handle_control()?,
                     (Some(id), Resource::UpstreamSocket) => self.handle_socket(id, event.events)?,
@@ -732,9 +696,6 @@ impl Reactor {
             // The nonblocking connect is still in flight, so registration
             // below always starts with writable interest armed.
             armed_socket_interest: socket_interest(true, false, false),
-            tx_ack_timestamps: false,
-            ack_fallback: false,
-            ack_fallback_unacked: false,
             handshake: self.proxy_handshake(target_side.logical_peer),
             pending_socket: PendingSocketQueue::new(MAX_PENDING_SOCKET_BYTES),
             pending_shutdown: false,
@@ -742,8 +703,6 @@ impl Reactor {
             upstream_window_clamp: None,
             zero_window_probe: None,
             last_namespace_byte: None,
-            peek_offset_supported: false,
-            bytes_acked_supported: false,
             socket_receive_buffer_bytes,
             socket_send_buffer_bytes,
         };
@@ -939,7 +898,6 @@ impl Reactor {
                     .expect("flow exists")
                     .flow
                     .record_upstream_submitted(sent);
-                self.sync_ack_fallback_unacked(id)?;
                 if sent < payload.len() && !self.enqueue_pending_payload(id, &payload[sent..])? {
                     return Ok(false);
                 }
@@ -1055,22 +1013,17 @@ impl Reactor {
             return Ok(());
         }
         if events & yayatht_sys::reactor::ERROR != 0 {
-            let (fd, tx_ack_timestamps) = {
-                let entry = self.flows.get(id).expect("flow exists");
-                (entry.socket.as_raw_fd(), entry.tx_ack_timestamps)
-            };
+            let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
             if yayatht_sys::socket::pending_error(fd)?.is_some() {
                 self.send_reset_for_flow(id)?;
                 return self.close_flow(id);
             }
-            if tx_ack_timestamps {
-                // Level-triggered EPOLLERR persists until the error queue
-                // is empty; the refresh below reads the acknowledged bytes.
-                let drain = yayatht_sys::socket::drain_tx_timestamps(fd)?;
-                if drain.foreign_errors > 0 {
-                    self.send_reset_for_flow(id)?;
-                    return self.close_flow(id);
-                }
+            // Level-triggered EPOLLERR persists until the error queue
+            // is empty; the refresh below reads the acknowledged bytes.
+            let drain = yayatht_sys::socket::drain_tx_timestamps(fd)?;
+            if drain.foreign_errors > 0 {
+                self.send_reset_for_flow(id)?;
+                return self.close_flow(id);
             }
         }
         if !self.flows.get(id).expect("flow exists").transport_connected
@@ -1139,48 +1092,30 @@ impl Reactor {
 
     fn activate_flow(&mut self, id: FlowId) -> Result<(), Error> {
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
-        let info = yayatht_sys::tcp_info::get(fd)?;
-        let probed_peek_offset = yayatht_sys::tcp_info::probe_peek_offset(fd)?;
-        let peek_offset_supported =
-            probed_peek_offset && !test_capability_disabled(TEST_DISABLE_PEEK_OFF_ENV);
-        if probed_peek_offset && !peek_offset_supported {
-            yayatht_sys::tcp_info::set_peek_offset(fd, -1)?;
+        // The Linux 6.6 baseline guarantees SO_PEEK_OFF, TX ACK timestamps
+        // and a complete TCP_INFO; a socket that rejects them is broken, so
+        // the flow fails instead of degrading. Timestamps are enabled before
+        // any payload is submitted so every acknowledged send queues an
+        // error-queue wakeup.
+        if let Err(error) = yayatht_sys::tcp_info::set_peek_offset(fd, 0) {
+            return self.fail_tcp_flow(id, &format!("SO_PEEK_OFF activation failed: {error}"));
         }
-        let bytes_acked_supported =
-            info.bytes_acked.is_some() && !test_capability_disabled(TEST_DISABLE_BYTES_ACKED_ENV);
-        let send_window_supported =
-            info.send_window.is_some() && !test_capability_disabled(TEST_DISABLE_SEND_WINDOW_ENV);
-        // Enabled before any payload is submitted so every acknowledged
-        // send queues an error-queue wakeup; kernels that reject the option
-        // learn ACK progress from TAP activity and the periodic watchdog.
-        let tx_ack_timestamps = !test_capability_disabled(TEST_DISABLE_TX_TIMESTAMPS_ENV)
-            && yayatht_sys::socket::enable_tx_ack_timestamps(fd).is_ok();
-        if tx_ack_timestamps {
-            self.metrics.tx_ack_timestamp_flows += 1;
-        } else {
-            self.metrics.tx_ack_watchdog_flows += 1;
+        if let Err(error) = yayatht_sys::socket::enable_tx_ack_timestamps(fd) {
+            return self.fail_tcp_flow(id, &format!("TX ACK timestamps unavailable: {error}"));
         }
-        {
-            let entry = self.flows.get_mut(id).expect("flow exists");
-            entry.peek_offset_supported = peek_offset_supported;
-            entry.bytes_acked_supported = bytes_acked_supported;
-            entry.tx_ack_timestamps = tx_ack_timestamps;
-            entry.ack_fallback = !tx_ack_timestamps;
-        }
-        self.record_capabilities(
-            id,
-            info.returned_len,
-            peek_offset_supported,
-            bytes_acked_supported,
-            send_window_supported,
-        );
+        let bytes_acked = match yayatht_sys::tcp_info::bytes_acked(fd) {
+            Ok(bytes_acked) => bytes_acked,
+            Err(error) => {
+                return self.fail_tcp_flow(id, &format!("TCP_INFO unavailable: {error}"));
+            }
+        };
         self.update_namespace_window(id)?;
         let plan = self
             .flows
             .get_mut(id)
             .expect("flow exists")
             .flow
-            .socket_connected(info.bytes_acked.unwrap_or(0));
+            .socket_connected(bytes_acked);
         let frame = self.build_flow_frame(
             id,
             plan,
@@ -1192,50 +1127,6 @@ impl Reactor {
             },
         )?;
         self.queue_tap(Some(id), frame, Some(plan))
-    }
-
-    fn record_capabilities(
-        &mut self,
-        id: FlowId,
-        tcp_info_len: usize,
-        peek_offset_supported: bool,
-        bytes_acked_supported: bool,
-        send_window_supported: bool,
-    ) {
-        if peek_offset_supported {
-            self.metrics.peek_offset_flows += 1;
-        } else {
-            self.metrics.peek_iovec_fallback_flows += 1;
-        }
-        if bytes_acked_supported {
-            self.metrics.bytes_acked_flows += 1;
-        } else {
-            self.metrics.conservative_ack_flows += 1;
-        }
-        // tcpi_snd_wnd no longer feeds the namespace window computation, so
-        // its absence is recorded for observability but is not a degraded
-        // data path and must not raise the degraded warning.
-        if send_window_supported {
-            self.metrics.send_window_flows += 1;
-        } else {
-            self.metrics.send_window_unavailable_flows += 1;
-        }
-        if !peek_offset_supported || !bytes_acked_supported {
-            self.metrics.degraded_tcp_flows += 1;
-            let target = self
-                .flows
-                .get(id)
-                .and_then(|entry| entry.construction.active_sides())
-                .map(|sides| sides.target.logical_peer);
-            warn!(
-                flow_slot = id.slot,
-                ?target,
-                tcp_info_len,
-                so_peek_off = peek_offset_supported,
-                tcpi_bytes_acked = bytes_acked_supported,
-                "TCP flow is using degraded kernel capability paths"
-            );
-        }
     }
 
     fn flush_proxy_output(&mut self, id: FlowId) -> Result<(), Error> {
@@ -1369,7 +1260,6 @@ impl Reactor {
                         .expect("flow exists")
                         .flow
                         .record_upstream_submitted(sent);
-                    self.sync_ack_fallback_unacked(id)?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) => return Err(error.into()),
@@ -1396,33 +1286,17 @@ impl Reactor {
     /// the namespace window; returns whether the ACK point advanced.
     fn refresh_upstream_ack(&mut self, id: FlowId) -> Result<bool, Error> {
         let fd = self.flows.get(id).expect("flow exists").socket.as_raw_fd();
-        let info = yayatht_sys::tcp_info::get(fd)?;
-        let bytes_acked_supported = self
+        let acknowledged = yayatht_sys::tcp_info::bytes_acked(fd)?;
+        let advanced = self
             .flows
-            .get(id)
+            .get_mut(id)
             .expect("flow exists")
-            .bytes_acked_supported;
-        let acknowledged = if bytes_acked_supported {
-            info.bytes_acked
-        } else {
-            let entry = self.flows.get(id).expect("flow exists");
-            (entry.pending_socket.is_empty()
-                && info.unacked_segments == Some(0)
-                && yayatht_sys::socket::send_queue_bytes(fd)? == 0)
-                .then_some(entry.flow.upstream_submitted())
-        };
-        let advanced = acknowledged.is_some_and(|acknowledged| {
-            self.flows
-                .get_mut(id)
-                .expect("flow exists")
-                .flow
-                .record_upstream_ack(acknowledged)
-        });
+            .flow
+            .record_upstream_ack(acknowledged);
         let window_changed = self.update_namespace_window(id)?;
         if advanced || window_changed {
             self.send_ack(id)?;
         }
-        self.sync_ack_fallback_unacked(id)?;
         Ok(advanced)
     }
 
@@ -1449,11 +1323,7 @@ impl Reactor {
         // until the namespace persist timer fires roughly 200 ms later.
         // Keeping the bound on buffer occupancy guarantees the window only
         // closes while acknowledgment (timestamp) wakeups are outstanding.
-        let ack_window = if entry.bytes_acked_supported {
-            entry.flow.max_advertised_window() as usize
-        } else {
-            FALLBACK_ACK_WINDOW
-        };
+        let ack_window = entry.flow.max_advertised_window() as usize;
         let available = socket_available
             .min(queue_available)
             .min(global_available)
@@ -1735,8 +1605,7 @@ impl Reactor {
     /// unacknowledged upstream bytes. TX ACK timestamps normally drive the
     /// upstream ACK, but the kernel drops the error-queue message when the
     /// socket's receive accounting is full -- a normal state here, because
-    /// namespace-bound data is parked in the receive queue for backpressure
-    /// -- and kernels without the option have no ACK event source at all.
+    /// namespace-bound data is parked in the receive queue for backpressure.
     /// While TAP frames are available, the tick bounds the recovery delay
     /// to about one timer interval instead of the namespace RTO.
     ///
@@ -1755,33 +1624,25 @@ impl Reactor {
         if self.frame_pool.available() == 0 || self.flow_is_closed(id) {
             return Ok(());
         }
-        let (unacked, tx_ack_timestamps, fd) = {
+        let (unacked, fd) = {
             let entry = self.flows.get(id).expect("flow exists");
-            (
-                entry.flow.upstream_unacked() > 0,
-                entry.tx_ack_timestamps,
-                entry.socket.as_raw_fd(),
-            )
+            (entry.flow.upstream_unacked() > 0, entry.socket.as_raw_fd())
         };
         if !unacked {
             return Ok(());
         }
-        let notified = if tx_ack_timestamps {
-            let drain = yayatht_sys::socket::drain_tx_timestamps(fd)?;
-            if drain.foreign_errors > 0 {
-                self.send_reset_for_flow(id)?;
-                return self.close_flow(id);
-            }
-            drain.acknowledgments > 0
-        } else {
-            false
-        };
+        let drain = yayatht_sys::socket::drain_tx_timestamps(fd)?;
+        if drain.foreign_errors > 0 {
+            self.send_reset_for_flow(id)?;
+            return self.close_flow(id);
+        }
+        let notified = drain.acknowledgments > 0;
         let advanced = self.refresh_upstream_ack(id)?;
         if !advanced {
             return Ok(());
         }
         self.metrics.tx_ack_watchdog_advances += 1;
-        if !tx_ack_timestamps || notified || self.flow_is_closed(id) {
+        if notified || self.flow_is_closed(id) {
             return Ok(());
         }
         if self
@@ -1827,18 +1688,9 @@ impl Reactor {
                 retained.is_some(),
             )
         };
-        let peek_offset_supported = self
-            .flows
-            .get(id)
-            .expect("flow exists")
-            .peek_offset_supported;
         let mut socket_byte = [0u8; 1];
-        let length = match if peek_offset_supported {
-            yayatht_sys::tcp_info::set_peek_offset(fd, 0)?;
-            yayatht_sys::socket::peek(fd, &mut socket_byte)
-        } else {
-            yayatht_sys::socket::peek_with_offset(fd, 0, &mut socket_byte)
-        } {
+        yayatht_sys::tcp_info::set_peek_offset(fd, 0)?;
+        let length = match yayatht_sys::socket::peek(fd, &mut socket_byte) {
             Ok(length) => length,
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
             Err(error) => return Err(error.into()),
@@ -2000,7 +1852,7 @@ impl Reactor {
         offset: usize,
         capacity: usize,
     ) -> Result<PeekedFrame, Error> {
-        let (key, fd, peek_offset_supported) = {
+        let (key, fd) = {
             let entry = self.flows.get(id).expect("flow exists");
             (
                 entry
@@ -2009,7 +1861,6 @@ impl Reactor {
                     .ok_or(Error::Invariant("inactive flow reached socket reader"))?
                     .namespace_key(),
                 entry.socket.as_raw_fd(),
-                entry.peek_offset_supported,
             )
         };
         let payload_offset = Self::tcp_payload_offset(key, None, None);
@@ -2018,12 +1869,8 @@ impl Reactor {
         let mut frame = self.acquire_frame()?;
         let capacity = capacity.min(frame.buffer.capacity().saturating_sub(payload_offset));
         let out = &mut frame.buffer.writable()[payload_offset..payload_offset + capacity];
-        let result = if peek_offset_supported {
-            yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
-            yayatht_sys::socket::peek(fd, out)
-        } else {
-            yayatht_sys::socket::peek_with_offset(fd, offset as usize, out)
-        };
+        yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
+        let result = yayatht_sys::socket::peek(fd, out);
         match result {
             Ok(0) => {
                 self.release_frame(frame);
@@ -2526,83 +2373,6 @@ impl Reactor {
     fn cleanup_closed(&mut self) -> Result<(), Error> {
         let removed = self.flows.flush_deferred();
         self.metrics.tcp_closed += removed.len() as u64;
-        let fallback_unacked_removed = removed
-            .iter()
-            .filter(|entry| entry.ack_fallback_unacked)
-            .count();
-        if fallback_unacked_removed > 0 {
-            self.ack_fallback_unacked_flows = self
-                .ack_fallback_unacked_flows
-                .saturating_sub(fallback_unacked_removed);
-            // Removal only lowers the count, and a positive count implies
-            // the fast tick is armed, so the next tick settles the interval.
-        }
-        Ok(())
-    }
-
-    /// Tracks this flow's contribution to the count of fallback flows with
-    /// unacknowledged upstream bytes. A 0 -> positive transition arms the
-    /// fast tick immediately; the reverse transition only lowers the count
-    /// and leaves the downshift to the next tick, so event-driven flips
-    /// never move the shared timer's pending expiration.
-    fn sync_ack_fallback_unacked(&mut self, id: FlowId) -> Result<(), Error> {
-        let Some(entry) = self.flows.get_mut(id) else {
-            return Ok(());
-        };
-        if !entry.ack_fallback {
-            return Ok(());
-        }
-        let unacked = entry.flow.upstream_unacked() > 0;
-        if unacked == entry.ack_fallback_unacked {
-            return Ok(());
-        }
-        entry.ack_fallback_unacked = unacked;
-        if unacked {
-            self.ack_fallback_unacked_flows += 1;
-        } else {
-            self.ack_fallback_unacked_flows = self.ack_fallback_unacked_flows.saturating_sub(1);
-        }
-        self.arm_fast_tick()
-    }
-
-    /// Runs the timer at the fallback interval only while a flow without TX
-    /// ACK timestamps has unacknowledged upstream bytes; the watchdog is
-    /// that flow's only ACK path, and the normal tick would quantize its
-    /// uploads to one send window per tick. Idle fallback flows keep the
-    /// normal tick, so a long-lived quiet connection never holds the
-    /// reactor at the fast rate.
-    ///
-    /// Only this upshift may rearm the timer from the event path, and only
-    /// when the fast tick is not already armed. Rearming replaces the
-    /// pending expiration with a full new interval, so a downshift here
-    /// would let a flow whose unacked count flips between 0 and positive
-    /// faster than either interval expires postpone the shared timer
-    /// indefinitely, starving the retransmissions, zero-window probes, and
-    /// watchdog passes other flows only receive from the tick. Once armed,
-    /// the fast expiration stands until a tick runs.
-    fn arm_fast_tick(&mut self) -> Result<(), Error> {
-        if self.ack_fallback_unacked_flows > 0 && !self.timer_interval_fast {
-            self.rearm_timer(TIMER_INTERVAL_ACK_FALLBACK, true)?;
-        }
-        Ok(())
-    }
-
-    /// Returns the timer to the normal interval once a tick has run with
-    /// no fallback flow holding unacknowledged bytes. Downshifting only
-    /// from the timer event keeps the rearm from cancelling an expiration
-    /// other flows are waiting on; an idle transition costs at most one
-    /// extra fast tick.
-    fn settle_timer_interval(&mut self) -> Result<(), Error> {
-        if self.ack_fallback_unacked_flows == 0 && self.timer_interval_fast {
-            self.rearm_timer(TIMER_INTERVAL, false)?;
-        }
-        Ok(())
-    }
-
-    fn rearm_timer(&mut self, interval: Duration, fast: bool) -> Result<(), Error> {
-        self.timer.set_interval(interval)?;
-        self.timer_interval_fast = fast;
-        self.metrics.timer_interval_ms = u64::try_from(interval.as_millis()).unwrap_or(u64::MAX);
         Ok(())
     }
 }
@@ -2629,18 +2399,6 @@ fn test_value<T: std::str::FromStr>(name: &str) -> Option<T> {
     }
 }
 
-fn test_capability_disabled(name: &str) -> bool {
-    #[cfg(debug_assertions)]
-    {
-        std::env::var_os(name).is_some_and(|value| value == "1")
-    }
-    #[cfg(not(debug_assertions))]
-    {
-        let _ = name;
-        false
-    }
-}
-
 fn pending_pressure_state(current: bool, bytes: usize, limit: usize) -> bool {
     let high = limit.saturating_mul(7) / 8;
     let low = limit.saturating_mul(3) / 4;
@@ -2655,7 +2413,7 @@ fn pending_pressure_state(current: bool, bytes: usize, limit: usize) -> bool {
 /// writable almost permanently, so polling it busy-loops the reactor.
 /// ACK progress arrives through TX ACK timestamp error-queue events, with
 /// the periodic timer watchdog bounding the delay when a notification is
-/// lost or the kernel lacks the option.
+/// lost.
 const fn socket_interest(
     connect_pending: bool,
     handshake_output_pending: bool,

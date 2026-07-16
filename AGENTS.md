@@ -22,7 +22,7 @@ Unit tests live beside code in `#[cfg(test)]` modules. Rootless end-to-end tests
 - `cargo check --workspace --all-targets`: type-check all targets.
 - `cargo deny check`: validate supply-chain policy when installed.
 
-Development and integration testing require Linux 5.11+, unprivileged user namespaces, and `/dev/net/tun`.
+Development and integration testing require Linux 6.6+, unprivileged user namespaces, and `/dev/net/tun`.
 
 ## Reference Design & Network Environment
 

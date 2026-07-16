@@ -3,10 +3,6 @@ use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 
-const PEEK_DISCARD_CHUNK: usize = 4096;
-const PEEK_FALLBACK_MAX_OFFSET: usize = u16::MAX as usize;
-const PEEK_FALLBACK_IOVECS: usize = 17;
-
 fn socket_address(address: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
     // SAFETY: zeroed sockaddr_storage is a valid base representation.
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
@@ -283,56 +279,6 @@ pub fn peek(fd: RawFd, out: &mut [u8]) -> io::Result<usize> {
     Ok(count as usize)
 }
 
-pub fn peek_with_offset(fd: RawFd, offset: usize, out: &mut [u8]) -> io::Result<usize> {
-    if offset > PEEK_FALLBACK_MAX_OFFSET {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "socket peek offset exceeds bounded fallback",
-        ));
-    }
-    if offset == 0 {
-        return peek(fd, out);
-    }
-    let mut discard = [0u8; PEEK_DISCARD_CHUNK];
-    let mut iovecs = std::array::from_fn::<libc::iovec, PEEK_FALLBACK_IOVECS, _>(|_| libc::iovec {
-        iov_base: std::ptr::null_mut(),
-        iov_len: 0,
-    });
-    let mut remaining = offset;
-    let mut count = 0usize;
-    while remaining > 0 {
-        let length = remaining.min(discard.len());
-        iovecs[count] = libc::iovec {
-            iov_base: discard.as_mut_ptr().cast(),
-            iov_len: length,
-        };
-        count += 1;
-        remaining -= length;
-    }
-    iovecs[count] = libc::iovec {
-        iov_base: out.as_mut_ptr().cast(),
-        iov_len: out.len(),
-    };
-    count += 1;
-    // SAFETY: zeroed msghdr is valid when only msg_iov and msg_iovlen are set.
-    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
-    message.msg_iov = iovecs.as_mut_ptr();
-    message.msg_iovlen = count;
-    // SAFETY: every iovec references writable storage for the duration of recvmsg.
-    // The discard iovecs intentionally overlap because their contents are ignored.
-    let received = unsafe {
-        libc::recvmsg(
-            fd,
-            std::ptr::from_mut(&mut message),
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    if received == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((received as usize).saturating_sub(offset))
-}
-
 pub fn discard(fd: RawFd, length: usize) -> io::Result<usize> {
     // SAFETY: Linux permits a null buffer with MSG_TRUNC for stream discard.
     let count = unsafe {
@@ -513,47 +459,5 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         assert!(acknowledgments > 0, "no TX ACK timestamp was queued");
-    }
-
-    #[test]
-    fn iovec_peek_skips_a_bounded_prefix_without_consuming_data() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut receiver, _) = listener.accept().unwrap();
-        sender.write_all(b"abcdefgh").unwrap();
-
-        let mut out = [0u8; 3];
-        assert_eq!(
-            peek_with_offset(receiver.as_raw_fd(), 2, &mut out).unwrap(),
-            3
-        );
-        assert_eq!(&out, b"cde");
-
-        let mut all = [0u8; 8];
-        receiver.read_exact(&mut all).unwrap();
-        assert_eq!(&all, b"abcdefgh");
-    }
-
-    #[test]
-    fn iovec_peek_handles_offsets_across_discard_chunks() {
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
-        let (mut receiver, _) = listener.accept().unwrap();
-        let bytes = (0..60 * 1024)
-            .map(|index| (index % 251) as u8)
-            .collect::<Vec<_>>();
-        sender.write_all(&bytes).unwrap();
-
-        let offset = 48 * 1024;
-        let mut out = [0u8; 1460];
-        assert_eq!(
-            peek_with_offset(receiver.as_raw_fd(), offset, &mut out).unwrap(),
-            out.len()
-        );
-        assert_eq!(&out, &bytes[offset..offset + out.len()]);
-
-        let mut prefix = [0u8; 8];
-        receiver.read_exact(&mut prefix).unwrap();
-        assert_eq!(&prefix, &bytes[..prefix.len()]);
     }
 }

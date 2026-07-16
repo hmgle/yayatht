@@ -289,71 +289,6 @@ fn ipv6_busybox_echo() {
 }
 
 #[test]
-fn degraded_kernel_capabilities_preserve_tcp_echo() {
-    let payload = (0..32 * 1024)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
-    let stderr = echo_payload_case(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        "192.0.2.1",
-        "--no-ipv6",
-        "degraded-capabilities",
-        payload,
-        &[
-            ("YAYATHT_TEST_DISABLE_SO_PEEK_OFF", "1"),
-            ("YAYATHT_TEST_DISABLE_TCP_INFO_BYTES_ACKED", "1"),
-            ("YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND", "1"),
-            ("YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS", "1"),
-            ("RUST_LOG", "yayatht_dataplane=warn,yayatht=info"),
-        ],
-    );
-    if !stderr.is_empty() {
-        assert!(
-            stderr.contains("degraded kernel capability paths"),
-            "degraded capability state was not exposed: {stderr}"
-        );
-    }
-}
-
-#[test]
-fn missing_send_window_alone_is_not_reported_as_degraded() {
-    let stderr = echo_payload_case(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        "192.0.2.1",
-        "--no-ipv6",
-        "send-window-capability",
-        b"yayatht-send-window\n".to_vec(),
-        &[
-            ("YAYATHT_TEST_DISABLE_TCP_INFO_SND_WND", "1"),
-            ("RUST_LOG", "yayatht_dataplane=warn,yayatht=info"),
-        ],
-    );
-    assert!(
-        !stderr.contains("degraded kernel capability paths"),
-        "tcpi_snd_wnd absence alone must not be reported as degraded: {stderr}"
-    );
-}
-
-#[test]
-fn tx_timestamp_fallback_completes_without_writable_polling() {
-    // Coverage only: with TX ACK timestamps rejected the echo must still
-    // complete without writable-interest ACK polling. TAP-batch and
-    // EPOLLIN-driven refreshes can carry the whole exchange here, so this
-    // does not isolate the watchdog; the suppression test below does.
-    let payload = (0..48 * 1024)
-        .map(|index| (index % 251) as u8)
-        .collect::<Vec<_>>();
-    echo_payload_case(
-        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-        "192.0.2.1",
-        "--no-ipv6",
-        "tx-ack-watchdog",
-        payload,
-        &[("YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS", "1")],
-    );
-}
-
-#[test]
 fn watchdog_advances_upstream_ack_without_event_refreshes() {
     if !supported() {
         return;
@@ -372,9 +307,9 @@ fn watchdog_advances_upstream_ack_without_event_refreshes() {
         stream.write_all(&received).unwrap();
     });
 
-    // Timestamps are rejected and every event-driven refresh is suppressed,
-    // so the periodic watchdog is the only path that can advance the
-    // upstream ACK. The server holds the echo until the counter is checked.
+    // Every event-driven refresh is suppressed, so the periodic watchdog
+    // is the only path that can advance the upstream ACK. The server holds
+    // the echo until the counter is checked.
     let name = unique_name("watchdog-ack");
     let script = format!(
         "busybox dd if=/dev/zero bs=1024 count=48 2>/dev/null \
@@ -393,7 +328,6 @@ fn watchdog_advances_upstream_ack_without_event_refreshes() {
             "-c",
             &script,
         ])
-        .env("YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS", "1")
         .env("YAYATHT_TEST_SUPPRESS_EVENT_ACK_REFRESH", "1000")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -401,13 +335,10 @@ fn watchdog_advances_upstream_ack_without_event_refreshes() {
         .unwrap();
     read_rx.recv_timeout(Duration::from_secs(10)).unwrap();
     // The upstream kernel has acknowledged the full payload once the server
-    // read it. The fallback tick runs at 10 ms while those bytes are
-    // outstanding, so 400 ms covers dozens of watchdog passes plus the
-    // downshift back to the 100 ms tick once nothing is unacknowledged.
+    // read it. The watchdog runs on the 100 ms tick while those bytes are
+    // outstanding, so 400 ms covers several watchdog passes.
     thread::sleep(Duration::from_millis(400));
     let value = status_json(&name);
-    assert_eq!(value["dataplane"]["tx_ack_watchdog_flows"], 1, "{value}");
-    assert_eq!(value["dataplane"]["timer_interval_ms"], 100, "{value}");
     assert!(
         value["dataplane"]["tx_ack_watchdog_advances"]
             .as_u64()
@@ -439,94 +370,6 @@ fn watchdog_advances_upstream_ack_without_event_refreshes() {
         .unwrap();
     assert!(status.success(), "yayatht failed: {stderr}");
     assert_eq!(output.trim(), BYTE_COUNT.to_string(), "{stderr}");
-    server.join().unwrap();
-}
-
-#[test]
-fn fallback_fast_tick_tracks_unacknowledged_bytes() {
-    if !supported() {
-        return;
-    }
-    // 4 MiB overflows the upstream socket buffers while the server refuses
-    // to read (receive autotuning only grows for a consuming reader), so
-    // upstream_unacked stays positive for as long as the server holds.
-    const BYTE_COUNT: usize = 4 * 1024 * 1024;
-    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let (accept_tx, accept_rx) = mpsc::channel();
-    let (release_tx, release_rx) = mpsc::channel();
-    let (drained_tx, drained_rx) = mpsc::channel();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        accept_tx.send(()).unwrap();
-        release_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-        let mut received = vec![0u8; BYTE_COUNT];
-        stream.read_exact(&mut received).unwrap();
-        drained_tx.send(()).unwrap();
-        // Hold the socket open so the namespace-side sleep below, not a
-        // reset, decides when the child exits.
-        thread::sleep(Duration::from_millis(1500));
-    });
-
-    // The trailing sleep keeps the namespace alive after nc exits so the
-    // post-close timer interval can still be queried over the control
-    // socket.
-    let name = unique_name("fallback-tick");
-    let script = format!(
-        "busybox dd if=/dev/zero bs=65536 count=64 2>/dev/null \
-         | busybox nc -w 8 192.0.2.1 {port}; busybox sleep 2"
-    );
-    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
-        .args([
-            "run",
-            "--direct",
-            "--host-loopback",
-            "--no-ipv6",
-            "--name",
-            &name,
-            "--",
-            "sh",
-            "-c",
-            &script,
-        ])
-        .env("YAYATHT_TEST_DISABLE_TX_ACK_TIMESTAMPS", "1")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .unwrap();
-    accept_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    // Let the transfer fill the upstream buffers and stall: acknowledged
-    // bytes freeze at what the peer buffered while the send buffer stays
-    // full, so the fast tick must be armed whenever status is sampled.
-    thread::sleep(Duration::from_millis(300));
-    let value = status_json(&name);
-    assert_eq!(value["dataplane"]["tx_ack_watchdog_flows"], 1, "{value}");
-    assert_eq!(value["dataplane"]["timer_interval_ms"], 10, "{value}");
-    release_tx.send(()).unwrap();
-    drained_rx.recv_timeout(Duration::from_secs(10)).unwrap();
-    // The server consumed everything but still holds its socket open, so
-    // the flow remains open and idle with nothing unacknowledged; the
-    // timer must settle back to the normal tick on the live flow, not
-    // through flow teardown.
-    thread::sleep(Duration::from_millis(300));
-    let value = status_json(&name);
-    assert_eq!(value["dataplane"]["active_tcp_flows"], 1, "{value}");
-    assert_eq!(value["dataplane"]["timer_interval_ms"], 100, "{value}");
-    let status = child
-        .wait_timeout(Duration::from_secs(15))
-        .unwrap()
-        .unwrap_or_else(|| {
-            child.kill().unwrap();
-            panic!("fallback tick test timed out")
-        });
-    let mut stderr = String::new();
-    child
-        .stderr
-        .take()
-        .unwrap()
-        .read_to_string(&mut stderr)
-        .unwrap();
-    assert!(status.success(), "yayatht failed: {stderr}");
     server.join().unwrap();
 }
 
