@@ -25,6 +25,10 @@ const TAP_BUDGET: usize = 32;
 const TAP_TX_BUDGET: usize = 32;
 const TAP_FRAME_POOL_BYTES: usize = 16 * 1024 * 1024;
 const TAP_FRAME_POOL_MAX_FRAMES: usize = 4096;
+/// Byte budget of the TSO super-frame pool; at the maximum frame size
+/// this yields 64 in-flight super-frames before sends degrade to
+/// MTU-sized frames.
+const TAP_GSO_POOL_BYTES: usize = 4 * 1024 * 1024;
 const EVENT_CAPACITY: usize = 128;
 const RETRANSMIT_INITIAL: Duration = Duration::from_secs(1);
 // Periodic tick driving retransmissions, zero-window probes and the ACK
@@ -112,6 +116,8 @@ pub struct Metrics {
     pub tap_mtu: u64,
     pub tap_offload: u64,
     pub gso_frames_rx: u64,
+    pub gso_frames_tx: u64,
+    pub gso_pool_exhaustions: u64,
     pub tap_frame_capacity: u64,
     pub tap_frame_pool_frames: u64,
     pub tap_frame_pool_bytes: u64,
@@ -302,7 +308,16 @@ struct QueuedFrame {
     reserved_retained: usize,
 }
 
+/// Which fixed pool a frame belongs to: MTU-sized frames for regular
+/// traffic or the small pool of maximum-size TSO super-frames.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrameTier {
+    Mtu,
+    Gso,
+}
+
 struct PooledFrame {
+    tier: FrameTier,
     pool_index: usize,
     buffer: FrameBuffer,
 }
@@ -322,6 +337,9 @@ struct TcpFrameSpec {
     window_scale: Option<u8>,
     window: u16,
     payload_len: usize,
+    /// Segment size the kernel splits the frame into when the payload
+    /// exceeds it; `None` on frames that must never carry GSO state.
+    gso_size: Option<u16>,
 }
 
 pub struct Reactor {
@@ -333,6 +351,10 @@ pub struct Reactor {
     flows: FlowTable<FlowEntry>,
     by_key: HashMap<FlowKey, FlowId>,
     frame_pool: BufferPool,
+    /// Pool of maximum-size frames for TSO sends; empty without offload.
+    gso_pool: BufferPool,
+    /// Capacity of an MTU-tier frame, the boundary for tier selection.
+    mtu_frame_capacity: usize,
     tap_rx_buffer: Vec<u8>,
     tap_queue: VecDeque<QueuedFrame>,
     /// Length of the `virtio_net_hdr` prefix on every TAP read and write;
@@ -411,12 +433,18 @@ impl Reactor {
             ..Metrics::default()
         };
         // Received frames may be GRO/TSO super-frames up to the 16-bit IP
-        // length limit when offload is negotiated; the TX frame pool stays
-        // MTU-sized until TSO transmit lands.
+        // length limit when offload is negotiated; TSO sends draw from a
+        // dedicated pool of maximum-size frames.
+        let gso_frame_capacity = vnet_len + ethernet::ETHERNET_HEADER_LEN + GSO_MAX_L3_BYTES;
         let tap_rx_capacity = if config.tap_offload {
-            vnet_len + ethernet::ETHERNET_HEADER_LEN + GSO_MAX_L3_BYTES
+            gso_frame_capacity
         } else {
             frame_capacity
+        };
+        let gso_pool_frames = if config.tap_offload {
+            (TAP_GSO_POOL_BYTES / gso_frame_capacity).max(1)
+        } else {
+            0
         };
         Ok(Self {
             config,
@@ -427,6 +455,8 @@ impl Reactor {
             flows: FlowTable::with_capacity(max_tcp_flows),
             by_key: HashMap::with_capacity(max_tcp_flows),
             frame_pool: BufferPool::new(frame_pool_frames, frame_capacity),
+            gso_pool: BufferPool::new(gso_pool_frames, gso_frame_capacity),
+            mtu_frame_capacity: frame_capacity,
             tap_rx_buffer: vec![0; tap_rx_capacity],
             tap_queue: VecDeque::new(),
             vnet_len,
@@ -1487,7 +1517,7 @@ impl Reactor {
             if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
                 break;
             }
-            let (state, payload_offset, window, mss) = {
+            let (state, payload_offset, window, mss, key) = {
                 let entry = self.flows.get(id).expect("flow exists");
                 (
                     entry.flow.state(),
@@ -1498,6 +1528,11 @@ impl Reactor {
                         .sum::<usize>(),
                     entry.flow.available_namespace_window(),
                     usize::from(entry.flow.mss()),
+                    entry
+                        .construction
+                        .active_sides()
+                        .ok_or(Error::Invariant("inactive flow reached socket reader"))?
+                        .namespace_key(),
                 )
             };
             if !matches!(state, State::Established | State::NamespaceFinReceived) || window == 0 {
@@ -1511,10 +1546,19 @@ impl Reactor {
                 self.metrics.retained_limit_hits += 1;
                 break;
             }
+            // With offload one send may carry a TSO super-frame up to the
+            // 16-bit IP length limit; the kernel segments it at the MSS.
+            // Without offload each frame carries at most one MSS.
+            let max_send = if self.vnet_len > 0 {
+                let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
+                GSO_MAX_L3_BYTES - ip_header_len - tcp::TCP_MIN_HEADER_LEN
+            } else {
+                mss
+            };
             match self.peek_socket_frame(
                 id,
                 payload_offset,
-                mss.min(window).min(retained_available),
+                max_send.min(window).min(retained_available),
             )? {
                 PeekedFrame::Eof => {
                     let plan = self
@@ -1544,14 +1588,6 @@ impl Reactor {
                         .flow
                         .plan_send(length, false)
                         .ok_or(Error::Invariant("unable to plan TCP payload"))?;
-                    let key = self
-                        .flows
-                        .get(id)
-                        .expect("flow exists")
-                        .construction
-                        .active_sides()
-                        .ok_or(Error::Invariant("inactive flow reached socket reader"))?
-                        .namespace_key();
                     let last_byte = frame.buffer.writable()
                         [self.tcp_payload_offset(key, None, None) + length - 1];
                     self.flows
@@ -1821,29 +1857,54 @@ impl Reactor {
         if self.tap_queue.iter().any(|frame| frame.flow == Some(id)) {
             return Ok(());
         }
-        let (segment, acknowledgment) = {
+        let (segment, acknowledgment, key) = {
             let entry = self.flows.get(id).expect("flow exists");
             let Some(segment) = entry.sent_segments.front() else {
                 return Ok(());
             };
-            (segment.clone(), entry.flow.namespace_ack())
-        };
-        let plan = SendPlan {
-            sequence: segment.sequence,
-            acknowledgment,
-            length: segment.payload_len,
-            syn: segment.syn,
-            fin: segment.fin,
+            (
+                segment.clone(),
+                entry.flow.namespace_ack(),
+                entry
+                    .construction
+                    .active_sides()
+                    .ok_or(Error::Invariant("inactive flow reached retransmit"))?
+                    .namespace_key(),
+            )
         };
         let frame = if segment.payload_len > 0 {
             match self.peek_socket_frame(id, 0, segment.payload_len)? {
-                PeekedFrame::Data { frame, length } if length == segment.payload_len => {
-                    self.finalize_flow_payload_frame(id, frame, plan, segment.flags(), length)?
-                }
-                PeekedFrame::Data { frame, .. } => {
-                    self.release_frame(frame);
-                    self.fail_tcp_flow(id, "retained socket payload is shorter than segment")?;
-                    return Ok(());
+                PeekedFrame::Data { frame, length } => {
+                    // A dry GSO pool can clamp the frame below a super-frame
+                    // segment; retransmitting a prefix of the unacknowledged
+                    // range is valid TCP and the cumulative ACK trims the
+                    // rest. Falling short of both the segment and the frame
+                    // capacity means retained socket data went missing.
+                    let payload_capacity = frame
+                        .buffer
+                        .capacity()
+                        .saturating_sub(self.tcp_payload_offset(key, None, None));
+                    if length != segment.payload_len.min(payload_capacity) {
+                        self.release_frame(frame);
+                        self.fail_tcp_flow(id, "retained socket payload is shorter than segment")?;
+                        return Ok(());
+                    }
+                    let truncated = length < segment.payload_len;
+                    let plan = SendPlan {
+                        sequence: segment.sequence,
+                        acknowledgment,
+                        length,
+                        syn: segment.syn,
+                        fin: segment.fin && !truncated,
+                    };
+                    let flags = TcpFlags {
+                        syn: segment.syn,
+                        fin: segment.fin && !truncated,
+                        psh: true,
+                        ack: true,
+                        ..TcpFlags::default()
+                    };
+                    self.finalize_flow_payload_frame(id, frame, plan, flags, length)?
                 }
                 PeekedFrame::WouldBlock => {
                     self.fail_tcp_flow(id, "retained socket payload is unavailable")?;
@@ -1855,6 +1916,13 @@ impl Reactor {
                 }
             }
         } else {
+            let plan = SendPlan {
+                sequence: segment.sequence,
+                acknowledgment,
+                length: 0,
+                syn: segment.syn,
+                fin: segment.fin,
+            };
             self.build_flow_frame(id, plan, &[], segment.flags())?
         };
         self.queue_tap(Some(id), frame, None)?;
@@ -1934,7 +2002,7 @@ impl Reactor {
         let payload_offset = self.tcp_payload_offset(key, None, None);
         let offset = i32::try_from(offset)
             .map_err(|_| Error::Invariant("socket peek offset exceeds i32"))?;
-        let mut frame = self.acquire_frame()?;
+        let mut frame = self.acquire_payload_frame(payload_offset + capacity)?;
         let capacity = capacity.min(frame.buffer.capacity().saturating_sub(payload_offset));
         let out = &mut frame.buffer.writable()[payload_offset..payload_offset + capacity];
         yayatht_sys::tcp_info::set_peek_offset(fd, offset)?;
@@ -1994,7 +2062,7 @@ impl Reactor {
         flags: TcpFlags,
         payload_len: usize,
     ) -> Result<PooledFrame, Error> {
-        let (key, _, window, _) = match self.flow_frame_parameters(id, false) {
+        let (key, mss, window, _) = match self.flow_frame_parameters(id, false) {
             Ok(parameters) => parameters,
             Err(error) => {
                 self.release_frame(frame);
@@ -2009,6 +2077,9 @@ impl Reactor {
             window_scale: None,
             window,
             payload_len,
+            // Payloads beyond one MSS become TSO super-frames the kernel
+            // segments at the negotiated MSS.
+            gso_size: Some(mss),
         };
         if let Err(error) = self.finalize_tcp_frame(&mut frame, spec) {
             self.release_frame(frame);
@@ -2086,6 +2157,7 @@ impl Reactor {
             window_scale,
             window,
             payload_len: payload.len(),
+            gso_size: None,
         };
         if let Err(error) = self.finalize_tcp_frame(&mut frame, spec) {
             self.release_frame(frame);
@@ -2096,7 +2168,11 @@ impl Reactor {
 
     fn acquire_frame(&mut self) -> Result<PooledFrame, Error> {
         match self.frame_pool.acquire() {
-            Some((pool_index, buffer)) => Ok(PooledFrame { pool_index, buffer }),
+            Some((pool_index, buffer)) => Ok(PooledFrame {
+                tier: FrameTier::Mtu,
+                pool_index,
+                buffer,
+            }),
             None => {
                 self.note_frame_pool_exhaustion();
                 Err(Error::Invariant("TAP frame pool exhausted"))
@@ -2104,12 +2180,33 @@ impl Reactor {
         }
     }
 
+    /// Acquires a frame able to hold `required` bytes, drawing from the
+    /// GSO tier beyond MTU-frame capacity. A dry GSO pool degrades to an
+    /// MTU frame -- the send simply carries less payload -- and is
+    /// counted, never failed.
+    fn acquire_payload_frame(&mut self, required: usize) -> Result<PooledFrame, Error> {
+        if required > self.mtu_frame_capacity {
+            if let Some((pool_index, buffer)) = self.gso_pool.acquire() {
+                return Ok(PooledFrame {
+                    tier: FrameTier::Gso,
+                    pool_index,
+                    buffer,
+                });
+            }
+            self.metrics.gso_pool_exhaustions += 1;
+        }
+        self.acquire_frame()
+    }
+
     fn note_frame_pool_exhaustion(&mut self) {
         self.metrics.frame_pool_exhaustions += 1;
     }
 
     fn release_frame(&mut self, frame: PooledFrame) {
-        self.frame_pool.release(frame.pool_index, frame.buffer);
+        match frame.tier {
+            FrameTier::Mtu => self.frame_pool.release(frame.pool_index, frame.buffer),
+            FrameTier::Gso => self.gso_pool.release(frame.pool_index, frame.buffer),
+        }
     }
 
     /// Offset of the TCP payload within a TAP frame buffer: the
@@ -2128,7 +2225,11 @@ impl Reactor {
         self.vnet_len + ethernet::ETHERNET_HEADER_LEN + ip_header_len + tcp_header_len
     }
 
-    fn finalize_tcp_frame(&self, frame: &mut PooledFrame, spec: TcpFrameSpec) -> Result<(), Error> {
+    fn finalize_tcp_frame(
+        &mut self,
+        frame: &mut PooledFrame,
+        spec: TcpFrameSpec,
+    ) -> Result<(), Error> {
         let TcpFrameSpec {
             key,
             plan,
@@ -2137,6 +2238,7 @@ impl Reactor {
             window_scale,
             window,
             payload_len,
+            gso_size,
         } = spec;
         let ip_header_len = if key.target.is_ipv4() { 20 } else { 40 };
         let payload_offset = self.tcp_payload_offset(key, mss, window_scale);
@@ -2220,12 +2322,22 @@ impl Reactor {
         if offload {
             // The kernel completes the transport checksum from csum_start
             // over the seeded pseudo-header sum; offsets are relative to
-            // the frame body after the vnet header.
+            // the frame body after the vnet header. Payloads beyond one
+            // MSS additionally carry GSO state and are segmented by the
+            // kernel at gso_size.
+            let gso_size = gso_size.filter(|&gso_size| payload_len > usize::from(gso_size));
+            if gso_size.is_some() {
+                self.metrics.gso_frames_tx += 1;
+            }
             vnet::VnetHeader {
                 flags: vnet::FLAG_NEEDS_CSUM,
-                gso_type: vnet::GSO_NONE,
+                gso_type: match gso_size {
+                    None => vnet::GSO_NONE,
+                    Some(_) if key.target.is_ipv4() => vnet::GSO_TCPV4,
+                    Some(_) => vnet::GSO_TCPV6,
+                },
                 hdr_len: (payload_offset - self.vnet_len) as u16,
-                gso_size: 0,
+                gso_size: gso_size.unwrap_or(0),
                 csum_start: (ethernet::ETHERNET_HEADER_LEN + ip_header_len) as u16,
                 csum_offset: 16,
             }

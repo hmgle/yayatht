@@ -414,8 +414,12 @@ impl Flow {
         true
     }
 
+    /// Plans a namespace-bound send. `length` is bounded only by the
+    /// receiver's window: the caller owns the frame-size policy, one MSS
+    /// per frame without offload or a TSO super-frame the kernel segments
+    /// with `gso_size = mss`.
     pub fn plan_send(&self, length: usize, fin: bool) -> Option<SendPlan> {
-        if length > self.available_namespace_window() || length > usize::from(self.mss) {
+        if length > self.available_namespace_window() {
             return None;
         }
         Some(SendPlan {
@@ -586,6 +590,19 @@ mod tests {
         assert_eq!(flow.available_namespace_window(), 4);
         assert!(flow.plan_send(5, false).is_none());
         assert!(flow.plan_send(4, false).is_some());
+    }
+
+    #[test]
+    fn sends_larger_than_one_mss_plan_within_the_window() {
+        // TSO super-frames carry several MSS worth of payload in one
+        // planned send; only the receiver's window bounds the length.
+        let mut flow = flow();
+        flow.socket_connected(0);
+        flow.receive(u32::MAX - 3, Some(101), 65535, 0, false, false);
+        let mss = usize::from(flow.mss());
+        let plan = flow.plan_send(3 * mss, false).unwrap();
+        assert_eq!(plan.length, 3 * mss);
+        assert!(flow.plan_send(65536, false).is_none());
     }
 
     #[test]

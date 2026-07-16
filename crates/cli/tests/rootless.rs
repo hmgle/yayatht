@@ -383,6 +383,81 @@ fn gro_upload_arrives_in_aggregated_frames() {
 }
 
 #[test]
+fn tso_download_leaves_in_super_frames() {
+    if !supported() {
+        return;
+    }
+    // A bulk host->namespace download: the upstream socket buffers more
+    // than one MSS, so peeked sends become TSO super-frames the kernel
+    // segments at the negotiated MSS, observable as gso_frames_tx. The
+    // trailing sleep keeps the instance alive for the status query.
+    const BYTE_COUNT: usize = 4 * 1024 * 1024;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (write_tx, write_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.write_all(&vec![0u8; BYTE_COUNT]).unwrap();
+        write_tx.send(()).unwrap();
+    });
+    let name = unique_name("tso-download");
+    let script = format!(
+        "busybox nc -w 8 192.0.2.1 {port} | busybox wc -c; \
+         busybox sleep 2"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--name",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    write_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    server.join().unwrap();
+    // Give the namespace reader a moment to drain the tail before the
+    // counter is sampled; the assertion only needs one super-frame.
+    thread::sleep(Duration::from_millis(300));
+    let value = status_json(&name);
+    assert!(
+        value["dataplane"]["gso_frames_tx"].as_u64().unwrap() > 0,
+        "no TSO super-frame was sent: {value}"
+    );
+    let status = child
+        .wait_timeout(Duration::from_secs(15))
+        .unwrap()
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("tso download test timed out")
+        });
+    let mut output = String::new();
+    child
+        .stdout
+        .take()
+        .unwrap()
+        .read_to_string(&mut output)
+        .unwrap();
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "yayatht failed: {stderr}");
+    assert_eq!(output.trim(), BYTE_COUNT.to_string(), "{stderr}");
+}
+
+#[test]
 fn watchdog_advances_upstream_ack_without_event_refreshes() {
     if !supported() {
         return;

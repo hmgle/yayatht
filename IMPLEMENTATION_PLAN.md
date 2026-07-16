@@ -51,7 +51,7 @@ byte-exact delivery; loss/zero-window/half-close injections pass in both
 modes.
 **Tests**: `plan_send` bound unit tests; partial-ACK of oversized
 `SentSegment`; download integrity case.
-**Status**: Not Started
+**Status**: Complete
 
 ## Stage 5: benchmark validation + docs closeout
 
