@@ -324,22 +324,27 @@ pub fn enable_tx_ack_timestamps(fd: RawFd) -> io::Result<()> {
 /// clears, and classifies each one. Timestamp messages only signal that
 /// acknowledged bytes advanced; callers read the amount from `TCP_INFO`.
 pub fn drain_tx_timestamps(fd: RawFd) -> io::Result<TxTimestampDrain> {
+    const BATCH: usize = 16;
     let mut drain = TxTimestampDrain::default();
     // OPT_TSONLY leaves the data part empty; control holds the timestamp
     // block plus one extended-error header per message.
-    let mut control = [0u8; 512];
+    let mut controls = [[0u8; 512]; BATCH];
     loop {
-        // SAFETY: zeroed msghdr is valid when only control storage is set.
-        let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
-        message.msg_control = control.as_mut_ptr().cast();
-        message.msg_controllen = control.len() as _;
-        // SAFETY: message references writable storage for the duration of
-        // recvmsg.
+        // SAFETY: zeroed mmsghdrs are valid when only control storage is set.
+        let mut messages = unsafe { std::mem::zeroed::<[libc::mmsghdr; BATCH]>() };
+        for (message, control) in messages.iter_mut().zip(controls.iter_mut()) {
+            message.msg_hdr.msg_control = control.as_mut_ptr().cast();
+            message.msg_hdr.msg_controllen = control.len() as _;
+        }
+        // SAFETY: messages references writable storage for the duration of
+        // recvmmsg.
         let received = unsafe {
-            libc::recvmsg(
+            libc::recvmmsg(
                 fd,
-                std::ptr::from_mut(&mut message),
+                messages.as_mut_ptr(),
+                BATCH as libc::c_uint,
                 libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
             )
         };
         if received == -1 {
@@ -349,34 +354,42 @@ pub fn drain_tx_timestamps(fd: RawFd) -> io::Result<TxTimestampDrain> {
             }
             return Err(error);
         }
-        let mut timestamped = false;
-        let mut foreign = false;
-        // SAFETY: recvmsg initialized the control region it reports.
-        let mut cursor = unsafe { libc::CMSG_FIRSTHDR(&message) };
-        while !cursor.is_null() {
-            // SAFETY: cursor is a valid cmsghdr within the control region.
-            let header = unsafe { &*cursor };
-            match (header.cmsg_level, header.cmsg_type) {
-                (libc::SOL_SOCKET, libc::SCM_TIMESTAMPING) => timestamped = true,
-                (libc::SOL_IP, libc::IP_RECVERR) | (libc::SOL_IPV6, libc::IPV6_RECVERR) => {
-                    // SAFETY: the kernel stores a sock_extended_err payload
-                    // for RECVERR control messages.
-                    let extended =
-                        unsafe { &*libc::CMSG_DATA(cursor).cast::<libc::sock_extended_err>() };
-                    if extended.ee_origin != libc::SO_EE_ORIGIN_TIMESTAMPING {
-                        foreign = true;
+        for message in &messages[..received as usize] {
+            let mut timestamped = false;
+            let mut foreign = false;
+            // SAFETY: recvmmsg initialized the control region it reports.
+            let mut cursor = unsafe { libc::CMSG_FIRSTHDR(&message.msg_hdr) };
+            while !cursor.is_null() {
+                // SAFETY: cursor is a valid cmsghdr within the control region.
+                let header = unsafe { &*cursor };
+                match (header.cmsg_level, header.cmsg_type) {
+                    (libc::SOL_SOCKET, libc::SCM_TIMESTAMPING) => timestamped = true,
+                    (libc::SOL_IP, libc::IP_RECVERR) | (libc::SOL_IPV6, libc::IPV6_RECVERR) => {
+                        // SAFETY: the kernel stores a sock_extended_err payload
+                        // for RECVERR control messages.
+                        let extended =
+                            unsafe { &*libc::CMSG_DATA(cursor).cast::<libc::sock_extended_err>() };
+                        if extended.ee_origin != libc::SO_EE_ORIGIN_TIMESTAMPING {
+                            foreign = true;
+                        }
                     }
+                    _ => {}
                 }
-                _ => {}
+                // SAFETY: message and cursor remain valid for CMSG_NXTHDR.
+                cursor = unsafe { libc::CMSG_NXTHDR(&message.msg_hdr, cursor) };
             }
-            // SAFETY: message and cursor remain valid for CMSG_NXTHDR.
-            cursor = unsafe { libc::CMSG_NXTHDR(&message, cursor) };
+            if timestamped && !foreign {
+                drain.acknowledgments += 1;
+            }
+            if foreign {
+                drain.foreign_errors += 1;
+            }
         }
-        if timestamped && !foreign {
-            drain.acknowledgments += 1;
-        }
-        if foreign {
-            drain.foreign_errors += 1;
+        // A partial batch means the queue emptied; anything enqueued after
+        // that instant re-raises the level-triggered EPOLLERR, exactly as
+        // it would after a terminal-EAGAIN read.
+        if (received as usize) < BATCH {
+            return Ok(drain);
         }
     }
 }

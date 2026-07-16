@@ -98,7 +98,7 @@ level-triggered `EPOLLERR` still clears.
 change in ACK-progress behavior (watchdog tests still pass).
 **Tests**: existing watchdog/timestamp suppression tests; serial workspace
 suite.
-**Status**: Not Started
+**Status**: Complete
 
 ### Stage 4: Re-calibration and acceptance record
 
