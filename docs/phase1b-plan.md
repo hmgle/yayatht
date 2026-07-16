@@ -70,7 +70,7 @@ Default behavior (no `--load-cpu`) is unchanged.
 **Success criteria**: with `--load-cpu`, the data-plane process is the only
 benchmark load on `--cpu`; results record the pinning.
 **Tests**: harness runs in both modes; Python AST parse.
-**Status**: Not Started
+**Status**: Complete
 
 ### Stage 2: Zero-syscall send-buffer occupancy
 

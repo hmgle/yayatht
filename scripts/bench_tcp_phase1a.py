@@ -11,6 +11,7 @@ import json
 import math
 import os
 import resource
+import shutil
 import socket
 import statistics
 import subprocess
@@ -55,6 +56,16 @@ class ProxyRuntime:
     address: str
     process: subprocess.Popen[bytes] | None
     observed_pid: int | None
+
+
+def load_cpu(args: argparse.Namespace) -> int:
+    """CPU for benchmark load generators (sink, local proxy, transfer).
+
+    Defaults to the proxy CPU so the historical whole-stack single-core
+    scope is preserved; `--load-cpu` moves the load off the proxy core so
+    the run measures data-plane-per-core capacity instead.
+    """
+    return args.cpu if args.load_cpu is None else args.load_cpu
 
 
 def affinity(cpu: int):
@@ -401,7 +412,7 @@ def run_case(
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        preexec_fn=affinity(args.cpu),
+        preexec_fn=affinity(load_cpu(args)),
     )
     time.sleep(0.05)
     transfer = [
@@ -429,6 +440,17 @@ def run_case(
         server.terminate()
         server.wait(timeout=5)
         raise RuntimeError(f"{backend.name} does not support {protocol}")
+    if args.load_cpu is not None:
+        # Every backend command ends with the transfer argv; the in-namespace
+        # source inherits the backend's affinity, so a taskset wrapper moves
+        # it onto the load CPU while the proxy instance stays on args.cpu.
+        command = [
+            *command[: len(command) - len(transfer)],
+            "taskset",
+            "-c",
+            str(args.load_cpu),
+            *transfer,
+        ]
     before_usage = Usage.children()
     proxy_cpu_before = process_cpu_seconds(proxy.observed_pid)
     started = time.perf_counter()
@@ -516,6 +538,7 @@ def run_case(
         "flow_throughput_max_mib_s": max(throughputs) / 8 / (1024**2),
         "target": transfer[2],
         "cpu": args.cpu,
+        "load_cpu": "" if args.load_cpu is None else args.load_cpu,
         "requested_tap_mtu": args.tap_mtu,
         "requested_tap_offload": args.tap_offload,
         "requested_tcp_send_buffer_bytes": args.tcp_send_buffer_bytes,
@@ -553,6 +576,7 @@ def error_record(
         "total_bytes": flow_count * byte_count,
         "target": args.target,
         "cpu": args.cpu,
+        "load_cpu": "" if args.load_cpu is None else args.load_cpu,
         "requested_tap_mtu": args.tap_mtu,
         "requested_tap_offload": args.tap_offload,
         "requested_tcp_send_buffer_bytes": args.tcp_send_buffer_bytes,
@@ -608,6 +632,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--cpu", type=int, default=0)
+    parser.add_argument("--load-cpu", type=int, default=None)
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument("--fail-fast", action="store_true")
     return parser.parse_args()
@@ -643,6 +668,11 @@ def main() -> int:
         or any(flow <= 0 for flow in args.flows)
     ):
         raise SystemExit("flow, size, run counts, or TAP MTU are invalid")
+    if args.load_cpu is not None:
+        if args.load_cpu < 0 or args.load_cpu == args.cpu:
+            raise SystemExit("--load-cpu must name a CPU different from --cpu")
+        if shutil.which("taskset") is None:
+            raise SystemExit("--load-cpu requires taskset on PATH")
     args.yayatht = validate_executable(args.yayatht, "yayatht", required=True)
     args.io_binary = validate_executable(args.io_binary, "tcp-bench-io", required=True)
     args.proxy_binary = validate_executable(
@@ -689,7 +719,7 @@ def main() -> int:
                     args.proxy_binary,
                     args.external_proxy,
                     args.target,
-                    args.cpu,
+                    load_cpu(args),
                 ) as proxy:
                     for flow_count in args.flows:
                         for backend in backends:
