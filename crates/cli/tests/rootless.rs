@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use wait_timeout::ChildExt;
+use yayatht_proxy_proto::socks5_udp;
 
 fn supported() -> bool {
     if !std::path::Path::new("/dev/net/tun").exists() {
@@ -56,6 +57,49 @@ fn udp_client_process() {
             let mut reply = [0u8; 1];
             let error = socket.recv(&mut reply).unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        }
+        "multi-echo" => {
+            let mut reply = vec![0u8; payload.len() + 1];
+            let length = socket.recv(&mut reply).expect("receive first UDP echo");
+            assert_eq!(&reply[..length], payload);
+            let second = std::env::var("YAYATHT_TEST_UDP_TARGET2")
+                .expect("second UDP target")
+                .parse::<SocketAddr>()
+                .expect("numeric second UDP target");
+            socket.connect(second).expect("connect second UDP target");
+            socket.send(&payload).expect("send second UDP datagram");
+            let length = socket.recv(&mut reply).expect("receive second UDP echo");
+            assert_eq!(&reply[..length], payload);
+        }
+        "rebuild" => {
+            let mut reply = vec![0u8; payload.len() + 1];
+            let length = socket
+                .recv(&mut reply)
+                .expect("receive pre-rebuild UDP echo");
+            assert_eq!(&reply[..length], payload);
+            thread::sleep(Duration::from_millis(600));
+            socket
+                .send(&payload)
+                .expect("send post-rebuild UDP datagram");
+            let length = socket
+                .recv(&mut reply)
+                .expect("receive post-rebuild UDP echo");
+            assert_eq!(&reply[..length], payload);
+        }
+        "association-failure-tcp" => {
+            thread::sleep(Duration::from_millis(400));
+            let tcp_target = std::env::var("YAYATHT_TEST_TCP_TARGET")
+                .expect("TCP target")
+                .parse::<SocketAddr>()
+                .expect("numeric TCP target");
+            let mut stream = std::net::TcpStream::connect(tcp_target).expect("connect TCP flow");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            stream.write_all(b"tcp-survives").unwrap();
+            let mut reply = [0u8; 12];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"tcp-survives");
         }
         "send-only" => thread::sleep(Duration::from_millis(200)),
         other => panic!("unknown UDP client mode {other:?}"),
@@ -313,10 +357,11 @@ fn proxy_stream(listener: TcpListener) -> std::net::TcpStream {
     stream
 }
 
-fn read_socks_target(stream: &mut std::net::TcpStream) -> SocketAddr {
+fn read_socks_command(stream: &mut std::net::TcpStream) -> (u8, SocketAddr) {
     let mut header = [0u8; 4];
     stream.read_exact(&mut header).unwrap();
-    assert_eq!(&header[..3], &[5, 1, 0]);
+    assert_eq!(header[0], 5);
+    assert_eq!(header[2], 0);
     let ip = match header[3] {
         1 => {
             let mut address = [0u8; 4];
@@ -332,7 +377,13 @@ fn read_socks_target(stream: &mut std::net::TcpStream) -> SocketAddr {
     };
     let mut port = [0u8; 2];
     stream.read_exact(&mut port).unwrap();
-    SocketAddr::new(ip, u16::from_be_bytes(port))
+    (header[1], SocketAddr::new(ip, u16::from_be_bytes(port)))
+}
+
+fn read_socks_target(stream: &mut std::net::TcpStream) -> SocketAddr {
+    let (command, target) = read_socks_command(stream);
+    assert_eq!(command, 1);
+    target
 }
 
 fn proxy_echo(mut stream: std::net::TcpStream, expected: &[u8]) {
@@ -351,6 +402,84 @@ fn accept_socks5_no_auth(listener: TcpListener, expected_port: u16) -> std::net:
     assert_eq!(read_socks_target(&mut stream).port(), expected_port);
     stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
     stream
+}
+
+fn accept_socks5_udp_associate(
+    listener: &TcpListener,
+    relay: &std::net::UdpSocket,
+) -> std::net::TcpStream {
+    let mut stream = proxy_stream(listener.try_clone().unwrap());
+    let mut greeting = [0u8; 3];
+    stream.read_exact(&mut greeting).unwrap();
+    assert_eq!(greeting, [5, 1, 0]);
+    stream.write_all(&[5, 0]).unwrap();
+    let (command, client) = read_socks_command(&mut stream);
+    assert_eq!(command, 3);
+    assert_ne!(client.port(), 0);
+    let relay = relay.local_addr().unwrap();
+    let SocketAddr::V4(relay) = relay else {
+        panic!("test relay must use IPv4");
+    };
+    let mut response = vec![5, 0, 0, 1];
+    // RFC 1928 permits an unspecified BND address. The client must combine
+    // its port with the control peer address instead of sending to 0.0.0.0.
+    response.extend_from_slice(&Ipv4Addr::UNSPECIFIED.octets());
+    response.extend_from_slice(&relay.port().to_be_bytes());
+    stream.write_all(&response).unwrap();
+    stream
+}
+
+fn relay_socks5_udp(relay: &std::net::UdpSocket, exchanges: usize) -> Vec<SocketAddr> {
+    let mut targets = Vec::with_capacity(exchanges);
+    let mut buffer = [0u8; 65_535];
+    for _ in 0..exchanges {
+        let (length, peer) = relay.recv_from(&mut buffer).unwrap();
+        let datagram = socks5_udp::decode(&buffer[..length]).unwrap();
+        let socks5_udp::Address::Socket(target) = datagram.destination else {
+            panic!("test relay expected an IP target");
+        };
+        targets.push(target);
+        relay.send_to(&buffer[..length], peer).unwrap();
+    }
+    targets
+}
+
+fn socks_udp_client_case(
+    proxy: SocketAddr,
+    label: &str,
+    mode: &str,
+    target: SocketAddr,
+    second_target: Option<SocketAddr>,
+) {
+    let name = unique_name(label);
+    let test_binary = std::env::current_exe().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
+    command
+        .args([
+            "run",
+            "--socks5",
+            &proxy.to_string(),
+            "--no-ipv6",
+            "--dns",
+            "off",
+            "--name",
+            &name,
+            "--",
+        ])
+        .arg(test_binary)
+        .args(["--ignored", "--exact", "udp_client_process", "--quiet"])
+        .env("YAYATHT_TEST_UDP_CLIENT", mode)
+        .env("YAYATHT_TEST_UDP_TARGET", target.to_string())
+        .env("YAYATHT_TEST_UDP_PAYLOAD", format!("udp-{label}"));
+    if let Some(second) = second_target {
+        command.env("YAYATHT_TEST_UDP_TARGET2", second.to_string());
+    }
+    let output = command.output().expect("run SOCKS5 UDP client");
+    assert!(
+        output.status.success(),
+        "SOCKS5 UDP client failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn credential_files(label: &str) -> (std::path::PathBuf, std::path::PathBuf, std::path::PathBuf) {
@@ -1086,6 +1215,197 @@ fn socks5_password_busybox_echo() {
     );
     server.join().unwrap();
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn socks5_udp_echo_round_trips_through_association() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    relay
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let server = thread::spawn(move || {
+        let _control = accept_socks5_udp_associate(&listener, &relay);
+        let targets = relay_socks5_udp(&relay, 1);
+        assert_eq!(targets, ["198.51.100.7:7000".parse().unwrap()]);
+    });
+    socks_udp_client_case(
+        proxy,
+        "socks5-udp-echo",
+        "echo",
+        "198.51.100.7:7000".parse().unwrap(),
+        None,
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn association_reuses_one_socket_for_multiple_targets() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    relay
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let server = thread::spawn(move || {
+        let _control = accept_socks5_udp_associate(&listener, &relay);
+        let targets = relay_socks5_udp(&relay, 2);
+        assert_eq!(
+            targets,
+            [
+                "198.51.100.7:7000".parse().unwrap(),
+                "203.0.113.9:9000".parse().unwrap(),
+            ]
+        );
+    });
+    socks_udp_client_case(
+        proxy,
+        "socks5-udp-eim",
+        "multi-echo",
+        "198.51.100.7:7000".parse().unwrap(),
+        Some("203.0.113.9:9000".parse().unwrap()),
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn control_eof_rebuilds_association_with_backoff() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    relay
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let server = thread::spawn(move || {
+        let first = accept_socks5_udp_associate(&listener, &relay);
+        relay_socks5_udp(&relay, 1);
+        drop(first);
+        let _second = accept_socks5_udp_associate(&listener, &relay);
+        relay_socks5_udp(&relay, 1);
+    });
+    socks_udp_client_case(
+        proxy,
+        "socks5-udp-rebuild",
+        "rebuild",
+        "198.51.100.7:7000".parse().unwrap(),
+        None,
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn association_failure_leaves_tcp_flows_untouched() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let server = thread::spawn(move || {
+        let first = accept_socks5_udp_associate(&listener, &relay);
+        drop(first);
+        let mut rebuilt_controls = Vec::new();
+        loop {
+            let mut stream = proxy_stream(listener.try_clone().unwrap());
+            let mut greeting = [0u8; 3];
+            stream.read_exact(&mut greeting).unwrap();
+            assert_eq!(greeting, [5, 1, 0]);
+            stream.write_all(&[5, 0]).unwrap();
+            let (command, target) = read_socks_command(&mut stream);
+            match command {
+                1 => {
+                    assert_eq!(target, "198.51.100.8:443".parse().unwrap());
+                    stream.write_all(&[5, 0, 0, 1, 127, 0, 0, 1, 0, 0]).unwrap();
+                    proxy_echo(stream, b"tcp-survives");
+                    break;
+                }
+                3 => {
+                    let relay_address = relay.local_addr().unwrap();
+                    let SocketAddr::V4(relay_address) = relay_address else {
+                        unreachable!();
+                    };
+                    let mut response = vec![5, 0, 0, 1];
+                    response.extend_from_slice(&relay_address.ip().octets());
+                    response.extend_from_slice(&relay_address.port().to_be_bytes());
+                    stream.write_all(&response).unwrap();
+                    rebuilt_controls.push(stream);
+                }
+                other => panic!("unexpected SOCKS command {other}"),
+            }
+        }
+    });
+    let name = unique_name("socks5-udp-failure-isolation");
+    let test_binary = std::env::current_exe().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--socks5",
+            &proxy.to_string(),
+            "--no-ipv6",
+            "--dns",
+            "off",
+            "--name",
+            &name,
+            "--",
+        ])
+        .arg(test_binary)
+        .args(["--ignored", "--exact", "udp_client_process", "--quiet"])
+        .env("YAYATHT_TEST_UDP_CLIENT", "association-failure-tcp")
+        .env("YAYATHT_TEST_UDP_TARGET", "198.51.100.7:7000")
+        .env("YAYATHT_TEST_TCP_TARGET", "198.51.100.8:443")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "association failure damaged TCP: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn http_connect_udp_returns_port_unreachable() {
+    if !supported() {
+        return;
+    }
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let name = unique_name("http-udp-unreachable");
+    let test_binary = std::env::current_exe().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--http-connect",
+            &proxy.to_string(),
+            "--no-ipv6",
+            "--dns",
+            "off",
+            "--name",
+            &name,
+            "--",
+        ])
+        .arg(test_binary)
+        .args(["--ignored", "--exact", "udp_client_process", "--quiet"])
+        .env("YAYATHT_TEST_UDP_CLIENT", "refused")
+        .env("YAYATHT_TEST_UDP_TARGET", "198.51.100.7:7000")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "HTTP UDP policy did not return ICMP: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    drop(listener);
 }
 
 #[test]

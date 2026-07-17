@@ -188,7 +188,12 @@ TCP flows or other associations.
 `control_eof_rebuilds_association_with_backoff`,
 `http_connect_udp_returns_port_unreachable`,
 `association_failure_leaves_tcp_flows_untouched`.
-**Status**: Not Started
+**Status**: Complete for numeric relay addresses (2026-07-18). The mock uses
+separate control/relay sockets and covers unspecified-BND fallback, EIM,
+control-EOF jittered rebuild, HTTP rejection, and TCP-flow isolation. Domain
+BND values are parsed without blocking but remain in bounded rebuild until
+Stage 4 provides the association DNS path. The suite carries 52 active
+rootless tests plus one ignored in-namespace helper.
 
 ### Stage 4: DNS proxy-udp and IPv6 parity
 

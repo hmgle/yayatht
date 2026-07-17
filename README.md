@@ -10,12 +10,13 @@ no-auth and RFC 1929 username/password authentication; HTTP CONNECT supports
 Basic authentication. DNS is proxied by default (`proxy-tcp`): the namespace
 resolver points at the virtual gateway and queries are carried as
 DNS-over-TCP through the configured upstream. IPv4 and IPv6 UDP forwarding
-is enabled for direct routes, including host-loopback mapping; `--udp off`
-restores drop-all behavior for non-DNS datagrams. SOCKS5 UDP ASSOCIATE and
-TAP multiqueue are the remaining Phase 2 work. The data-plane sandbox is
-enabled by default: it uses a generated seccomp allowlist, pivots to an empty
-tmpfs, and disables core dumps. `--sandbox off` is available for diagnosis
-and emits a warning.
+is enabled for direct routes, including host-loopback mapping, and SOCKS5
+uses one standards-compliant UDP ASSOCIATE per namespace source endpoint.
+`--udp off` restores drop-all behavior for non-DNS datagrams. DNS
+`proxy-udp` and TAP multiqueue are the remaining Phase 2 features. The
+data-plane sandbox is enabled by default: it uses a generated seccomp
+allowlist, pivots to an empty tmpfs, and disables core dumps. `--sandbox off`
+is available for diagnosis and emits a warning.
 
 ## Build
 

@@ -181,6 +181,16 @@ impl Engine {
     }
 
     #[must_use]
+    pub fn id_for_key(&self, key: FlowKey) -> Option<FlowId> {
+        self.by_key.get(&key).copied()
+    }
+
+    #[must_use]
+    pub fn has_association(&self, key: AssociationKey) -> bool {
+        self.associations.contains_key(&key)
+    }
+
+    #[must_use]
     pub fn active_ids(&self) -> Vec<FlowId> {
         self.flows.active_ids()
     }

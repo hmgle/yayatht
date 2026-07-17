@@ -18,7 +18,8 @@ use yayatht_packet::neighbor;
 use yayatht_packet::tcp::{self, TcpFlags, TcpHeaderSpec, TcpSegment};
 use yayatht_packet::udp::{self, UdpDatagram};
 use yayatht_packet::vnet;
-use yayatht_proxy_proto::{Command, Credentials, Handshake, Protocol};
+use yayatht_proxy_proto::socks5_udp;
+use yayatht_proxy_proto::{Command, Credentials, Handshake, Protocol, SocksAddress};
 use yayatht_tcp_adapter::flow::{
     ConstructionState, Flow, FlowConstruction, FlowInterface, FlowKey, FlowSide, FlowType,
     ReceiveDisposition, SendPlan, State,
@@ -65,6 +66,9 @@ const DNS_READ_BUFFER_LIMIT: usize = 128 * 1024;
 /// outstanding transactions (design §7: DNS flow idle timeout).
 const DNS_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
 const UDP_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
+const SOCKS_UDP_QUEUE_BYTES: usize = 64 * 1024;
+const SOCKS_REBUILD_INITIAL: Duration = Duration::from_millis(100);
+const SOCKS_REBUILD_MAX: Duration = Duration::from_secs(5);
 const TEST_DNS_QUERY_TIMEOUT_MS_ENV: &str = "YAYATHT_TEST_DNS_QUERY_TIMEOUT_MS";
 const TEST_DROP_TCP_DATA_ENV: &str = "YAYATHT_TEST_DROP_TCP_DATA";
 const TEST_DROP_TCP_RETRANSMIT_ENV: &str = "YAYATHT_TEST_DROP_TCP_RETRANSMIT";
@@ -156,6 +160,10 @@ pub struct Metrics {
     pub udp_socket_errors: u64,
     pub udp_unmapped_errors: u64,
     pub udp_icmp_errors: u64,
+    pub udp_association_failures: u64,
+    pub udp_association_rebuilds: u64,
+    pub udp_unsupported_fragments: u64,
+    pub udp_unknown_relay_datagrams: u64,
     pub active_udp_flows: u64,
     pub peak_udp_flows: u64,
     pub active_udp_associations: u64,
@@ -434,6 +442,34 @@ struct UdpSocketEntry {
     payload_len: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SocksAssociationState {
+    Backoff,
+    Connecting,
+    Handshaking,
+    PendingActivation,
+    Ready,
+}
+
+struct PendingSocksDatagram {
+    target: SocketAddr,
+    payload: Vec<u8>,
+}
+
+struct SocksAssociation {
+    key: udp_engine::AssociationKey,
+    state: SocksAssociationState,
+    control: Option<OwnedFd>,
+    relay: Option<OwnedFd>,
+    handshake: Option<Handshake>,
+    response: Vec<u8>,
+    pending: VecDeque<PendingSocksDatagram>,
+    pending_bytes: usize,
+    tx_buffer: Vec<u8>,
+    retry_attempt: u8,
+    retry_at: Instant,
+}
+
 pub struct Reactor {
     config: Config,
     tap: OwnedFd,
@@ -445,6 +481,9 @@ pub struct Reactor {
     udp_engine: udp_engine::Engine,
     udp_sockets: HashMap<FlowId, UdpSocketEntry>,
     udp_rx_buffer: Vec<u8>,
+    socks_associations: FlowTable<SocksAssociation>,
+    socks_by_key: HashMap<udp_engine::AssociationKey, FlowId>,
+    socks_rx_buffer: Vec<u8>,
     frame_pool: BufferPool,
     /// Pool of maximum-size frames for TSO sends; empty without offload.
     gso_pool: BufferPool,
@@ -552,6 +591,9 @@ impl Reactor {
         let udp_rx_capacity = usize::try_from(config.tap_mtu)
             .unwrap_or(65_520)
             .saturating_sub(40 + udp::UDP_HEADER_LEN);
+        let socks_buffer_capacity = usize::try_from(config.tap_mtu)
+            .unwrap_or(65_520)
+            .saturating_add(22);
         let gso_pool_frames = if config.tap_offload {
             (TAP_GSO_POOL_BYTES / gso_frame_capacity).max(1)
         } else {
@@ -568,6 +610,9 @@ impl Reactor {
             udp_engine: udp_engine::Engine::new(max_udp_flows, max_udp_associations),
             udp_sockets: HashMap::with_capacity(max_udp_flows),
             udp_rx_buffer: vec![0; udp_rx_capacity],
+            socks_associations: FlowTable::with_capacity(max_udp_associations),
+            socks_by_key: HashMap::with_capacity(max_udp_associations),
+            socks_rx_buffer: vec![0; socks_buffer_capacity],
             frame_pool: BufferPool::new(frame_pool_frames, frame_capacity),
             gso_pool: BufferPool::new(gso_pool_frames, gso_frame_capacity),
             mtu_frame_capacity: frame_capacity,
@@ -633,9 +678,16 @@ impl Reactor {
                     (Some(id), Resource::UdpSocket) => {
                         self.handle_udp_socket(id, event.events)?;
                     }
+                    (Some(id), Resource::SocksControl) => {
+                        self.handle_socks_control(id, event.events)?;
+                    }
+                    (Some(id), Resource::SocksRelay) => {
+                        self.handle_socks_relay(id, event.events)?;
+                    }
                     _ => {}
                 }
             }
+            self.activate_socks_associations()?;
             self.apply_pending_pressure()?;
             self.cleanup_closed()?;
             if self.shutting_down {
@@ -644,6 +696,9 @@ impl Reactor {
                 }
                 for id in self.udp_engine.active_ids() {
                     self.close_udp_flow(id)?;
+                }
+                for id in self.socks_associations.active_ids() {
+                    self.remove_socks_association(id)?;
                 }
             }
         }
@@ -1902,12 +1957,40 @@ impl Reactor {
     fn handle_udp_timers(&mut self, now: Instant) -> Result<(), Error> {
         let associations_before = self.udp_engine.active_associations();
         let expired = self.udp_engine.expire(now);
+        self.metrics.udp_closed += expired.len() as u64;
         for id in expired {
             self.drop_udp_socket(id)?;
         }
         let associations_after = self.udp_engine.active_associations();
         self.metrics.udp_associations_closed +=
             associations_before.saturating_sub(associations_after) as u64;
+        let rebuilds = self
+            .socks_associations
+            .active_ids()
+            .into_iter()
+            .filter(|&id| {
+                self.socks_associations.get(id).is_some_and(|association| {
+                    association.state == SocksAssociationState::Backoff
+                        && association.retry_at <= now
+                })
+            })
+            .collect::<Vec<_>>();
+        for id in rebuilds {
+            self.rebuild_socks_association(id)?;
+        }
+        let stale = self
+            .socks_associations
+            .active_ids()
+            .into_iter()
+            .filter(|&id| {
+                self.socks_associations
+                    .get(id)
+                    .is_some_and(|association| !self.udp_engine.has_association(association.key))
+            })
+            .collect::<Vec<_>>();
+        for id in stale {
+            self.remove_socks_association(id)?;
+        }
         self.refresh_udp_metrics();
         Ok(())
     }
@@ -2221,6 +2304,19 @@ impl Reactor {
         if !self.config.udp_enabled {
             return Ok(());
         }
+        if let Upstream::Proxy { protocol, .. } = &self.config.upstream {
+            return match protocol {
+                Protocol::Socks5 => self.handle_socks_udp(source, target, message),
+                Protocol::HttpConnect => self.queue_udp_icmp_for(
+                    udp_engine::FlowKey { source, target },
+                    message,
+                    message.len(),
+                    UdpError::DestinationUnreachable {
+                        code: if source.is_ipv4() { 3 } else { 4 },
+                    },
+                ),
+            };
+        }
         let transport_target = match &self.config.upstream {
             Upstream::Direct {
                 host_loopback: false,
@@ -2236,7 +2332,7 @@ impl Reactor {
                 }
                 _ => target,
             },
-            Upstream::Proxy { .. } => return Ok(()),
+            Upstream::Proxy { .. } => unreachable!("proxy handled above"),
         };
         let now = Instant::now();
         let accepted = match self
@@ -2322,6 +2418,620 @@ impl Reactor {
                 self.close_udp_flow(accepted.id)?;
             }
         }
+        Ok(())
+    }
+
+    fn handle_socks_udp(
+        &mut self,
+        source: SocketAddr,
+        target: SocketAddr,
+        message: &[u8],
+    ) -> Result<(), Error> {
+        let now = Instant::now();
+        let accepted = match self
+            .udp_engine
+            .accept(udp_engine::FlowKey { source, target }, now)
+        {
+            Ok(accepted) => accepted,
+            Err(udp_engine::AcceptError::FlowLimit) => {
+                self.metrics.udp_flow_limit_drops += 1;
+                return Ok(());
+            }
+            Err(udp_engine::AcceptError::AssociationLimit) => {
+                self.metrics.udp_association_limit_drops += 1;
+                return Ok(());
+            }
+            Err(udp_engine::AcceptError::FamilyMismatch) => return Ok(()),
+        };
+        if accepted.created {
+            self.metrics.udp_created += 1;
+            if accepted.association_created {
+                self.metrics.udp_associations_created += 1;
+            }
+            self.refresh_udp_metrics();
+        }
+        let association_key = udp_engine::AssociationKey { source };
+        let association_id = if let Some(&id) = self.socks_by_key.get(&association_key) {
+            id
+        } else {
+            let association = SocksAssociation {
+                key: association_key,
+                state: SocksAssociationState::Backoff,
+                control: None,
+                relay: None,
+                handshake: None,
+                response: Vec::with_capacity(PROXY_RESPONSE_CAPACITY),
+                pending: VecDeque::new(),
+                pending_bytes: 0,
+                tx_buffer: vec![0; self.socks_rx_buffer.len()],
+                retry_attempt: 0,
+                retry_at: now,
+            };
+            let id = self
+                .socks_associations
+                .insert(association)
+                .map_err(|_| Error::Invariant("SOCKS association table exhausted"))?;
+            self.socks_by_key.insert(association_key, id);
+            self.rebuild_socks_association(id)?;
+            id
+        };
+        if self
+            .socks_associations
+            .get(association_id)
+            .is_some_and(|association| association.state == SocksAssociationState::Ready)
+        {
+            self.send_socks_datagram(association_id, target, message)
+        } else {
+            self.queue_socks_datagram(association_id, target, message)
+        }
+    }
+
+    fn queue_socks_datagram(
+        &mut self,
+        id: FlowId,
+        target: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        let association = self
+            .socks_associations
+            .get_mut(id)
+            .ok_or(Error::Invariant("SOCKS association disappeared"))?;
+        let queued = payload.len().saturating_add(22);
+        if queued > SOCKS_UDP_QUEUE_BYTES.saturating_sub(association.pending_bytes) {
+            self.metrics.udp_queue_drops += 1;
+            return Ok(());
+        }
+        association.pending.push_back(PendingSocksDatagram {
+            target,
+            payload: payload.to_vec(),
+        });
+        association.pending_bytes += queued;
+        Ok(())
+    }
+
+    fn send_socks_datagram(
+        &mut self,
+        id: FlowId,
+        target: SocketAddr,
+        payload: &[u8],
+    ) -> Result<(), Error> {
+        let result = {
+            let association = self
+                .socks_associations
+                .get_mut(id)
+                .ok_or(Error::Invariant("SOCKS association disappeared"))?;
+            if association.state != SocksAssociationState::Ready {
+                return self.queue_socks_datagram(id, target, payload);
+            }
+            let relay = association
+                .relay
+                .as_ref()
+                .ok_or(Error::Invariant("ready SOCKS association has no relay"))?;
+            let length = socks5_udp::encode(
+                &mut association.tx_buffer,
+                &SocksAddress::Socket(target),
+                payload,
+            )
+            .map_err(|_| Error::Invariant("SOCKS UDP datagram exceeds relay buffer"))?;
+            yayatht_sys::socket::send(relay.as_raw_fd(), &association.tx_buffer[..length])
+                .map(|sent| (sent, length))
+        };
+        match result {
+            Ok((sent, expected)) if sent == expected => {
+                self.metrics.udp_datagrams_sent += 1;
+            }
+            Ok(_) => self.metrics.udp_queue_drops += 1,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.metrics.udp_queue_drops += 1;
+            }
+            Err(error) => {
+                self.schedule_socks_rebuild(id, &error.to_string())?;
+            }
+        }
+        Ok(())
+    }
+
+    fn rebuild_socks_association(&mut self, id: FlowId) -> Result<(), Error> {
+        let (proxy, credentials) = match &self.config.upstream {
+            Upstream::Proxy {
+                protocol: Protocol::Socks5,
+                address,
+                credentials,
+            } => (*address, credentials.clone()),
+            _ => return Err(Error::Invariant("SOCKS rebuild without SOCKS upstream")),
+        };
+        let retrying = self
+            .socks_associations
+            .get(id)
+            .is_some_and(|association| association.retry_attempt > 0);
+        let resources = (|| -> Result<(OwnedFd, OwnedFd, bool, Handshake), io::Error> {
+            let relay = yayatht_sys::socket::bind_udp(
+                proxy.is_ipv4(),
+                UDP_SOCKET_BUFFER_BYTES,
+                UDP_SOCKET_BUFFER_BYTES,
+            )?;
+            let relay_local = yayatht_sys::socket::local_address(relay.as_raw_fd())?;
+            let (control, connected) = yayatht_sys::socket::connect_nonblocking(
+                proxy,
+                UDP_SOCKET_BUFFER_BYTES,
+                UDP_SOCKET_BUFFER_BYTES,
+            )?;
+            let control_local = yayatht_sys::socket::local_address(control.as_raw_fd())?;
+            let request_address = SocketAddr::new(control_local.ip(), relay_local.port());
+            let handshake = Handshake::new(
+                Protocol::Socks5,
+                Command::UdpAssociate,
+                request_address,
+                credentials,
+            )
+            .map_err(io::Error::other)?;
+            Ok((control, relay, connected, handshake))
+        })();
+        let (control, relay, connected, handshake) = match resources {
+            Ok(resources) => resources,
+            Err(error) => {
+                self.schedule_socks_rebuild(id, &error.to_string())?;
+                return Ok(());
+            }
+        };
+        self.epoll.add(
+            control.as_raw_fd(),
+            socks_control_interest(true),
+            EpollToken::flow(id, Resource::SocksControl, true)
+                .ok_or(Error::Invariant(
+                    "SOCKS association does not fit epoll token",
+                ))?
+                .raw(),
+        )?;
+        let association = self
+            .socks_associations
+            .get_mut(id)
+            .ok_or(Error::Invariant("SOCKS association disappeared"))?;
+        association.control = Some(control);
+        association.relay = Some(relay);
+        association.handshake = Some(handshake);
+        association.response.clear();
+        association.state = if connected {
+            SocksAssociationState::Handshaking
+        } else {
+            SocksAssociationState::Connecting
+        };
+        if retrying {
+            self.metrics.udp_association_rebuilds += 1;
+        }
+        if connected {
+            self.drive_socks_control(id, yayatht_sys::reactor::WRITABLE)?;
+        }
+        Ok(())
+    }
+
+    fn handle_socks_control(&mut self, id: FlowId, events: u32) -> Result<(), Error> {
+        let Some(association) = self.socks_associations.get(id) else {
+            return Ok(());
+        };
+        if association.state == SocksAssociationState::Backoff {
+            return Ok(());
+        }
+        let Some(fd) = association
+            .control
+            .as_ref()
+            .map(|control| control.as_raw_fd())
+        else {
+            return Ok(());
+        };
+        if events & yayatht_sys::reactor::ERROR != 0
+            && let Some(error) = yayatht_sys::socket::pending_error(fd)?
+        {
+            self.schedule_socks_rebuild(id, &io::Error::from_raw_os_error(error).to_string())?;
+            return Ok(());
+        }
+        if association.state == SocksAssociationState::Ready {
+            if events
+                & (yayatht_sys::reactor::READABLE
+                    | yayatht_sys::reactor::HANGUP
+                    | yayatht_sys::reactor::READ_HANGUP)
+                != 0
+            {
+                let mut byte = [0u8; 1];
+                match yayatht_sys::socket::recv(fd, &mut byte) {
+                    Ok(0) => self.schedule_socks_rebuild(id, "SOCKS control connection closed")?,
+                    Ok(_) => {}
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => self.schedule_socks_rebuild(id, &error.to_string())?,
+                }
+            }
+            return Ok(());
+        }
+        self.drive_socks_control(id, events)
+    }
+
+    fn drive_socks_control(&mut self, id: FlowId, events: u32) -> Result<(), Error> {
+        let (fd, state) = {
+            let association = self
+                .socks_associations
+                .get(id)
+                .ok_or(Error::Invariant("SOCKS association disappeared"))?;
+            (
+                association
+                    .control
+                    .as_ref()
+                    .ok_or(Error::Invariant("SOCKS association has no control socket"))?
+                    .as_raw_fd(),
+                association.state,
+            )
+        };
+        if state == SocksAssociationState::Connecting {
+            if events & yayatht_sys::reactor::WRITABLE == 0 {
+                return Ok(());
+            }
+            if let Some(error) = yayatht_sys::socket::pending_error(fd)? {
+                self.schedule_socks_rebuild(id, &io::Error::from_raw_os_error(error).to_string())?;
+                return Ok(());
+            }
+            self.socks_associations
+                .get_mut(id)
+                .expect("association exists")
+                .state = SocksAssociationState::Handshaking;
+        }
+        if events & yayatht_sys::reactor::WRITABLE != 0 {
+            let send = {
+                let association = self.socks_associations.get(id).expect("association exists");
+                let handshake = association
+                    .handshake
+                    .as_ref()
+                    .ok_or(Error::Invariant("SOCKS association has no handshake"))?;
+                (!handshake.output().is_empty())
+                    .then(|| yayatht_sys::socket::send(fd, handshake.output()))
+            };
+            if let Some(send) = send {
+                match send {
+                    Ok(0) => {
+                        self.schedule_socks_rebuild(id, "SOCKS handshake send returned zero")?;
+                        return Ok(());
+                    }
+                    Ok(length) => {
+                        let result = self
+                            .socks_associations
+                            .get_mut(id)
+                            .expect("association exists")
+                            .handshake
+                            .as_mut()
+                            .expect("handshake exists")
+                            .advance_output(length);
+                        if let Err(error) = result {
+                            self.schedule_socks_rebuild(id, &error.to_string())?;
+                            return Ok(());
+                        }
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(error) => {
+                        self.schedule_socks_rebuild(id, &error.to_string())?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        if events & yayatht_sys::reactor::READABLE != 0 {
+            let mut input = [0u8; 4096];
+            loop {
+                match yayatht_sys::socket::recv(fd, &mut input) {
+                    Ok(0) => {
+                        self.schedule_socks_rebuild(id, "SOCKS control connection closed")?;
+                        return Ok(());
+                    }
+                    Ok(length) => {
+                        let association = self
+                            .socks_associations
+                            .get_mut(id)
+                            .expect("association exists");
+                        if association.response.len() + length > PROXY_RESPONSE_CAPACITY {
+                            self.schedule_socks_rebuild(id, "SOCKS response exceeds buffer")?;
+                            return Ok(());
+                        }
+                        association.response.extend_from_slice(&input[..length]);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        self.schedule_socks_rebuild(id, &error.to_string())?;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+        self.consume_socks_response(id)?;
+        if self
+            .socks_associations
+            .get(id)
+            .is_some_and(|association| association.state == SocksAssociationState::Handshaking)
+        {
+            let wants_write = self
+                .socks_associations
+                .get(id)
+                .and_then(|association| association.handshake.as_ref())
+                .is_some_and(|handshake| !handshake.output().is_empty());
+            self.epoll.modify(
+                fd,
+                socks_control_interest(wants_write),
+                EpollToken::flow(id, Resource::SocksControl, true)
+                    .expect("validated association id")
+                    .raw(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn consume_socks_response(&mut self, id: FlowId) -> Result<(), Error> {
+        loop {
+            let result = {
+                let association = self
+                    .socks_associations
+                    .get_mut(id)
+                    .ok_or(Error::Invariant("SOCKS association disappeared"))?;
+                let handshake = association
+                    .handshake
+                    .as_mut()
+                    .ok_or(Error::Invariant("SOCKS association has no handshake"))?;
+                if !handshake.wants_input() {
+                    break;
+                }
+                handshake.receive(&association.response)
+            };
+            let consumed = match result {
+                Ok(0) => break,
+                Ok(consumed) => consumed,
+                Err(error) => {
+                    self.schedule_socks_rebuild(id, &error.to_string())?;
+                    return Ok(());
+                }
+            };
+            let association = self
+                .socks_associations
+                .get_mut(id)
+                .expect("association exists");
+            association.response.drain(..consumed);
+        }
+        let complete = self
+            .socks_associations
+            .get(id)
+            .and_then(|association| association.handshake.as_ref())
+            .is_some_and(Handshake::is_complete);
+        if !complete {
+            return Ok(());
+        }
+        let bound = self
+            .socks_associations
+            .get(id)
+            .and_then(|association| association.handshake.as_ref())
+            .and_then(Handshake::bound_address)
+            .cloned()
+            .ok_or(Error::Invariant(
+                "SOCKS ASSOCIATE response has no BND address",
+            ))?;
+        let proxy = match &self.config.upstream {
+            Upstream::Proxy { address, .. } => *address,
+            _ => return Err(Error::Invariant("SOCKS association without proxy")),
+        };
+        let relay_endpoint = match bound {
+            SocksAddress::Socket(address) if address.ip().is_unspecified() => {
+                SocketAddr::new(proxy.ip(), address.port())
+            }
+            SocksAddress::Socket(address) => address,
+            SocksAddress::Domain { .. } => {
+                self.schedule_socks_rebuild(id, "SOCKS relay returned a domain BND address")?;
+                return Ok(());
+            }
+        };
+        let relay_fd = self
+            .socks_associations
+            .get(id)
+            .and_then(|association| association.relay.as_ref())
+            .ok_or(Error::Invariant("SOCKS association has no relay socket"))?
+            .as_raw_fd();
+        if relay_endpoint.is_ipv4() != proxy.is_ipv4() {
+            self.schedule_socks_rebuild(id, "SOCKS relay address family changed")?;
+            return Ok(());
+        }
+        if let Err(error) = yayatht_sys::socket::connect_datagram(relay_fd, relay_endpoint) {
+            self.schedule_socks_rebuild(id, &error.to_string())?;
+            return Ok(());
+        }
+        let control_fd = self
+            .socks_associations
+            .get(id)
+            .and_then(|association| association.control.as_ref())
+            .expect("control socket exists")
+            .as_raw_fd();
+        self.epoll.modify(
+            control_fd,
+            socks_control_interest(false),
+            EpollToken::flow(id, Resource::SocksControl, true)
+                .expect("validated association id")
+                .raw(),
+        )?;
+        let association = self
+            .socks_associations
+            .get_mut(id)
+            .expect("association exists");
+        association.handshake = None;
+        association.response.clear();
+        association.state = SocksAssociationState::PendingActivation;
+        Ok(())
+    }
+
+    fn activate_socks_associations(&mut self) -> Result<(), Error> {
+        let ids = self
+            .socks_associations
+            .active_ids()
+            .into_iter()
+            .filter(|&id| {
+                self.socks_associations.get(id).is_some_and(|association| {
+                    association.state == SocksAssociationState::PendingActivation
+                })
+            })
+            .collect::<Vec<_>>();
+        for id in ids {
+            let relay_fd = self
+                .socks_associations
+                .get(id)
+                .and_then(|association| association.relay.as_ref())
+                .expect("pending association has relay")
+                .as_raw_fd();
+            self.epoll.add(
+                relay_fd,
+                yayatht_sys::reactor::READABLE | yayatht_sys::reactor::ERROR,
+                EpollToken::flow(id, Resource::SocksRelay, true)
+                    .expect("validated association id")
+                    .raw(),
+            )?;
+            let pending = {
+                let association = self
+                    .socks_associations
+                    .get_mut(id)
+                    .expect("association exists");
+                association.state = SocksAssociationState::Ready;
+                association.retry_attempt = 0;
+                association.pending_bytes = 0;
+                std::mem::take(&mut association.pending)
+            };
+            for datagram in pending {
+                if !self
+                    .socks_associations
+                    .get(id)
+                    .is_some_and(|association| association.state == SocksAssociationState::Ready)
+                {
+                    break;
+                }
+                self.send_socks_datagram(id, datagram.target, &datagram.payload)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_socks_relay(&mut self, id: FlowId, events: u32) -> Result<(), Error> {
+        let Some(association) = self.socks_associations.get(id) else {
+            return Ok(());
+        };
+        if association.state != SocksAssociationState::Ready {
+            return Ok(());
+        }
+        let relay_fd = association
+            .relay
+            .as_ref()
+            .expect("ready association has relay")
+            .as_raw_fd();
+        if events & yayatht_sys::reactor::ERROR != 0 {
+            while yayatht_sys::socket::receive_udp_error(relay_fd)?.is_some() {
+                self.metrics.udp_socket_errors += 1;
+            }
+            self.schedule_socks_rebuild(id, "SOCKS relay socket error")?;
+            return Ok(());
+        }
+        if events & yayatht_sys::reactor::READABLE == 0 {
+            return Ok(());
+        }
+        let source = association.key.source;
+        let mut buffer = std::mem::take(&mut self.socks_rx_buffer);
+        let result = (|| {
+            for _ in 0..UDP_RX_BUDGET {
+                let length = match yayatht_sys::socket::recv_datagram(relay_fd, &mut buffer) {
+                    Ok(length) => length,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) => {
+                        self.schedule_socks_rebuild(id, &error.to_string())?;
+                        break;
+                    }
+                };
+                if length > buffer.len() {
+                    self.metrics.udp_queue_drops += 1;
+                    continue;
+                }
+                let datagram = match socks5_udp::decode(&buffer[..length]) {
+                    Ok(datagram) => datagram,
+                    Err(socks5_udp::Error::UnsupportedFragment(_)) => {
+                        self.metrics.udp_unsupported_fragments += 1;
+                        continue;
+                    }
+                    Err(_) => {
+                        self.metrics.udp_unknown_relay_datagrams += 1;
+                        continue;
+                    }
+                };
+                let socks5_udp::Address::Socket(target) = datagram.destination else {
+                    self.metrics.udp_unknown_relay_datagrams += 1;
+                    continue;
+                };
+                let key = udp_engine::FlowKey { source, target };
+                let Some(flow_id) = self.udp_engine.id_for_key(key) else {
+                    self.metrics.udp_unknown_relay_datagrams += 1;
+                    continue;
+                };
+                self.udp_engine.record_inbound(flow_id, Instant::now());
+                self.metrics.udp_datagrams_received += 1;
+                if !self.queue_udp_frame(source, target, datagram.payload)? {
+                    self.metrics.udp_queue_drops += 1;
+                }
+            }
+            Ok(())
+        })();
+        self.socks_rx_buffer = buffer;
+        result
+    }
+
+    fn schedule_socks_rebuild(&mut self, id: FlowId, reason: &str) -> Result<(), Error> {
+        debug!(%reason, "SOCKS UDP association failed");
+        let (control, relay, attempt) = {
+            let Some(association) = self.socks_associations.get_mut(id) else {
+                return Ok(());
+            };
+            let attempt = association.retry_attempt.saturating_add(1);
+            association.retry_attempt = attempt;
+            association.state = SocksAssociationState::Backoff;
+            association.handshake = None;
+            association.response.clear();
+            (
+                association.control.take(),
+                association.relay.take(),
+                attempt,
+            )
+        };
+        if let Some(control) = control {
+            self.epoll.delete(control.as_raw_fd())?;
+        }
+        if let Some(relay) = relay {
+            self.epoll.delete(relay.as_raw_fd())?;
+        }
+        let exponent = u32::from(attempt.saturating_sub(1).min(6));
+        let base = (SOCKS_REBUILD_INITIAL * 2u32.pow(exponent)).min(SOCKS_REBUILD_MAX);
+        let mut random = [0u8; 1];
+        random_fill(&mut random)
+            .map_err(|error| io::Error::other(format!("getrandom failed: {error:?}")))?;
+        let jitter = base.mul_f64(f64::from(random[0]) / 255.0);
+        let association = self
+            .socks_associations
+            .get_mut(id)
+            .expect("association exists");
+        association.retry_at = Instant::now() + base + jitter;
+        self.metrics.udp_association_failures += 1;
         Ok(())
     }
 
@@ -2883,6 +3593,22 @@ impl Reactor {
         let payload_prefix = entry.payload_prefix;
         let payload_prefix_len = entry.payload_prefix_len;
         let payload_len = entry.payload_len;
+        self.queue_udp_icmp_for(
+            flow.key,
+            &payload_prefix[..payload_prefix_len],
+            payload_len,
+            error,
+        )?;
+        Ok(())
+    }
+
+    fn queue_udp_icmp_for(
+        &mut self,
+        key: udp_engine::FlowKey,
+        payload: &[u8],
+        original_payload_len: usize,
+        error: UdpError,
+    ) -> Result<(), Error> {
         let mut frame = match self.frame_pool.acquire() {
             Some((pool_index, buffer)) => PooledFrame {
                 tier: FrameTier::Mtu,
@@ -2904,7 +3630,7 @@ impl Reactor {
                 &mut bytes[vnet_len..],
                 self.config.target_mac,
                 self.config.gateway_mac,
-                if flow.key.source.is_ipv4() {
+                if key.source.is_ipv4() {
                     EtherType::Ipv4
                 } else {
                     EtherType::Ipv6
@@ -2912,10 +3638,10 @@ impl Reactor {
             )?;
             icmp::write_udp_error(
                 &mut bytes[ip_offset..],
-                flow.key.source,
-                flow.key.target,
-                &payload_prefix[..payload_prefix_len],
-                payload_len,
+                key.source,
+                key.target,
+                &payload[..payload.len().min(8)],
+                original_payload_len,
                 error,
             )
         })();
@@ -3577,6 +4303,7 @@ impl Reactor {
     }
 
     fn close_udp_flow(&mut self, id: FlowId) -> Result<(), Error> {
+        let association_key = self.udp_engine.flow(id).map(|flow| flow.key.association());
         let associations_before = self.udp_engine.active_associations();
         if !self.udp_engine.remove(id) {
             return Ok(());
@@ -3585,6 +4312,13 @@ impl Reactor {
         self.metrics.udp_associations_closed +=
             associations_before.saturating_sub(associations_after) as u64;
         self.drop_udp_socket(id)?;
+        self.metrics.udp_closed += 1;
+        if let Some(key) = association_key
+            && !self.udp_engine.has_association(key)
+            && let Some(&association_id) = self.socks_by_key.get(&key)
+        {
+            self.remove_socks_association(association_id)?;
+        }
         self.refresh_udp_metrics();
         Ok(())
     }
@@ -3594,7 +4328,26 @@ impl Reactor {
             return Ok(());
         };
         self.epoll.delete(entry.socket.as_raw_fd())?;
-        self.metrics.udp_closed += 1;
+        Ok(())
+    }
+
+    fn remove_socks_association(&mut self, id: FlowId) -> Result<(), Error> {
+        let Some(association) = self.socks_associations.get_mut(id) else {
+            return Ok(());
+        };
+        let key = association.key;
+        let control = association.control.take();
+        let relay = association.relay.take();
+        if let Some(control) = control {
+            self.epoll.delete(control.as_raw_fd())?;
+        }
+        if let Some(relay) = relay {
+            self.epoll.delete(relay.as_raw_fd())?;
+        }
+        self.socks_by_key.remove(&key);
+        self.socks_associations.defer_remove(id);
+        let removed = self.socks_associations.flush_deferred();
+        debug_assert_eq!(removed.len(), 1);
         Ok(())
     }
 
@@ -3644,6 +4397,18 @@ fn pending_pressure_state(current: bool, bytes: usize, limit: usize) -> bool {
     let high = limit.saturating_mul(7) / 8;
     let low = limit.saturating_mul(3) / 4;
     if current { bytes > low } else { bytes >= high }
+}
+
+const fn socks_control_interest(writable: bool) -> u32 {
+    let base = yayatht_sys::reactor::READABLE
+        | yayatht_sys::reactor::ERROR
+        | yayatht_sys::reactor::HANGUP
+        | yayatht_sys::reactor::READ_HANGUP;
+    if writable {
+        base | yayatht_sys::reactor::WRITABLE
+    } else {
+        base
+    }
 }
 
 /// Level-triggered `EPOLLOUT` on an idle socket wakes the reactor on every

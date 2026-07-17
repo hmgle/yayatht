@@ -22,6 +22,8 @@ pub enum Resource {
     Control = 4,
     DnsUpstream = 5,
     UdpSocket = 6,
+    SocksControl = 7,
+    SocksRelay = 8,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,6 +67,8 @@ impl EpollToken {
             4 => Resource::Control,
             5 => Resource::DnsUpstream,
             6 => Resource::UdpSocket,
+            7 => Resource::SocksControl,
+            8 => Resource::SocksRelay,
             _ => return None,
         };
         let generation = (self.0 >> GENERATION_SHIFT) as u32;

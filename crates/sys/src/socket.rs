@@ -82,11 +82,17 @@ pub fn connect_udp(
     receive_buffer_bytes: usize,
     send_buffer_bytes: usize,
 ) -> io::Result<OwnedFd> {
-    let family = if address.is_ipv4() {
-        libc::AF_INET
-    } else {
-        libc::AF_INET6
-    };
+    let fd = bind_udp(address.is_ipv4(), receive_buffer_bytes, send_buffer_bytes)?;
+    connect_datagram(fd.as_raw_fd(), address)?;
+    Ok(fd)
+}
+
+pub fn bind_udp(
+    ipv4: bool,
+    receive_buffer_bytes: usize,
+    send_buffer_bytes: usize,
+) -> io::Result<OwnedFd> {
+    let family = if ipv4 { libc::AF_INET } else { libc::AF_INET6 };
     // SAFETY: socket arguments create a standard nonblocking UDP socket.
     let raw = unsafe {
         libc::socket(
@@ -102,8 +108,8 @@ pub fn connect_udp(
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
     set_buffer_quota(fd.as_raw_fd(), libc::SO_RCVBUF, receive_buffer_bytes)?;
     set_buffer_quota(fd.as_raw_fd(), libc::SO_SNDBUF, send_buffer_bytes)?;
-    enable_udp_errors(fd.as_raw_fd(), address.is_ipv4())?;
-    let bind_address = if address.is_ipv4() {
+    enable_udp_errors(fd.as_raw_fd(), ipv4)?;
+    let bind_address = if ipv4 {
         SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
     } else {
         SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
@@ -113,12 +119,16 @@ pub fn connect_udp(
     if unsafe { libc::bind(fd.as_raw_fd(), std::ptr::from_ref(&storage).cast(), length) } == -1 {
         return Err(io::Error::last_os_error());
     }
+    Ok(fd)
+}
+
+pub fn connect_datagram(fd: RawFd, address: SocketAddr) -> io::Result<()> {
     let (storage, length) = socket_address(address);
     // SAFETY: storage contains the sockaddr variant matching the socket.
-    if unsafe { libc::connect(fd.as_raw_fd(), std::ptr::from_ref(&storage).cast(), length) } == -1 {
+    if unsafe { libc::connect(fd, std::ptr::from_ref(&storage).cast(), length) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    Ok(fd)
+    Ok(())
 }
 
 fn enable_udp_errors(fd: RawFd, ipv4: bool) -> io::Result<()> {
