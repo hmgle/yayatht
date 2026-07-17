@@ -1,4 +1,4 @@
-use crate::config::{DnsMode, LaunchConfig, NetworkConfig};
+use crate::config::{DnsMode, LaunchConfig, NetworkConfig, SandboxConfig};
 use crate::control;
 use crate::instance::Instance;
 use std::ffi::CString;
@@ -68,6 +68,12 @@ impl Supervisor {
             None
         };
         let dataplane_config = config.dataplane();
+        let sandbox = config.sandbox;
+        if !sandbox.enabled() {
+            warn!(
+                "data-plane sandbox disabled: seccomp, filesystem isolation, and core-dump clamp are off"
+            );
+        }
         let (dataplane_pid, dataplane_pidfd) = match clone_namespaced(COMMON_NAMESPACES)? {
             CloneResult::Child => {
                 drop(signal_fd);
@@ -75,7 +81,7 @@ impl Supervisor {
                 drop(ns_parent);
                 drop(ns_child);
                 drop(tap_ns);
-                data_plane_child(dp_child, tap_dp, dataplane_config);
+                data_plane_child(dp_child, tap_dp, sandbox, dataplane_config);
             }
             CloneResult::Parent { pid, pidfd } => (pid, pidfd),
         };
@@ -210,6 +216,7 @@ fn expect_ready(fd: i32, role: &str) -> Result<(), Error> {
 fn data_plane_child(
     control_fd: OwnedFd,
     tap_channel: OwnedFd,
+    sandbox: SandboxConfig,
     config: yayatht_dataplane::reactor::Config,
 ) -> ! {
     let error_control = rustix::io::dup(&control_fd).ok();
@@ -226,10 +233,26 @@ fn data_plane_child(
             ));
         }
         drop(tap_channel);
+        let forbidden_syscall_failpoint = cfg!(debug_assertions)
+            && std::env::var_os("YAYATHT_TEST_FAIL_AT")
+                .is_some_and(|value| value == "dp_forbidden_syscall");
         let nofile_limit = yayatht_sys::resource::dataplane_nofile_limit(config.max_tcp_flows)?;
         yayatht_sys::resource::set_nofile_limit(nofile_limit)?;
+        if sandbox.enabled() {
+            yayatht_sys::resource::disable_core_dumps()?;
+            yayatht_sys::mount::isolate_filesystem()?;
+        }
         yayatht_sys::caps::drop_all_capabilities()?;
         yayatht_sys::caps::set_no_new_privs()?;
+        if sandbox.enabled() {
+            yayatht_sys::seccomp::install(yayatht_sys::seccomp::Profile::DataPlane)?;
+        }
+        if forbidden_syscall_failpoint {
+            // Deliberately absent from the data-plane profile. This is kept
+            // behind a debug-only failpoint for the rootless negative test.
+            let _ = rustix::process::getpid();
+            return Err(io::Error::other("forbidden syscall was not blocked"));
+        }
         control::send(control_fd.as_raw_fd(), Kind::Ready, 1, &[])?;
         yayatht_sys::set_nonblocking(control_fd.as_raw_fd(), true)?;
         let metrics = yayatht_dataplane::reactor::run(config, tap, control_fd)

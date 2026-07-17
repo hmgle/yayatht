@@ -1213,6 +1213,85 @@ fn target_exit_code_and_cleanup() {
 }
 
 #[test]
+fn sandbox_on_by_default_runs_busybox_echo() {
+    echo_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "sandbox-default",
+    );
+}
+
+#[test]
+fn sandbox_off_runs_busybox_echo() {
+    let stderr = echo_payload_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        &["--no-ipv6", "--sandbox", "off"],
+        "sandbox-off",
+        b"sandbox-off\n".to_vec(),
+        &[],
+    );
+    assert!(stderr.contains("data-plane sandbox disabled"));
+}
+
+#[test]
+fn forbidden_syscall_kills_the_data_plane() {
+    if !supported() {
+        return;
+    }
+    let name = unique_name("sandbox-forbidden");
+    let output = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args(["run", "--direct", "--name", &name, "--", "/bin/true"])
+        .env("YAYATHT_TEST_FAIL_AT", "dp_forbidden_syscall")
+        .output()
+        .expect("run forbidden-syscall test");
+    assert_eq!(output.status.code(), Some(125));
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    assert!(
+        !std::path::Path::new(&runtime)
+            .join("yayatht")
+            .join(name)
+            .exists()
+    );
+}
+
+#[test]
+fn pivoted_data_plane_still_serves_status() {
+    if !supported() {
+        return;
+    }
+    let name = unique_name("sandbox-pivot");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args(["run", "--direct", "--name", &name, "--", "/bin/sleep", "1"])
+        .spawn()
+        .expect("spawn sandbox status instance");
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    let socket = std::path::Path::new(&runtime)
+        .join("yayatht")
+        .join(&name)
+        .join("control.sock");
+    for _ in 0..100 {
+        if socket.exists() {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    let value = status_json(&name);
+    let dataplane_pid = value["dataplane_pid"].as_i64().unwrap();
+    let mountinfo = fs::read_to_string(format!("/proc/{dataplane_pid}/mountinfo")).unwrap();
+    let root = mountinfo
+        .lines()
+        .find(|line| line.split_whitespace().nth(4) == Some("/"))
+        .expect("data-plane root mount");
+    assert!(
+        root.contains(" - tmpfs tmpfs "),
+        "unexpected root mount: {root}"
+    );
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
 fn status_socket_reports_running_instance() {
     if !supported() {
         return;
@@ -1264,6 +1343,18 @@ fn status_socket_reports_running_instance() {
     assert!(
         open_files.split_whitespace().any(|field| field == "4128"),
         "unexpected data-plane fd limit: {open_files}"
+    );
+    let core_size = limits
+        .lines()
+        .find(|line| line.starts_with("Max core file size"))
+        .expect("data-plane RLIMIT_CORE entry");
+    assert!(
+        core_size
+            .split_whitespace()
+            .filter(|field| *field == "0")
+            .count()
+            >= 2,
+        "unexpected data-plane core limit: {core_size}"
     );
     assert!(child.wait().unwrap().success());
     assert!(!socket.parent().unwrap().exists());

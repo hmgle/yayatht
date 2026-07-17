@@ -159,8 +159,8 @@ exists, and the soak/oracle work as Stage 6 quality gates. See
 - DNS integration against packetdrill-style capture assertions and the
   design §12 no-leak tshark oracle (Phase 2 Stage 6; the functional matrix
   landed in Phase 1C; `proxy-udp` is Phase 2 Stage 4, `fake-ip` Phase 4).
-- Generated seccomp profiles, pivoted data-plane filesystem, and remaining
-  role-specific rlimits (Phase 2 Stage 1; supervisor/ns-init profiles
-  Stage 6).
-- Final seccomp/rlimit locking and 24-hour soak tests (Phase 2 Stages 1
-  and 6).
+- Supervisor/ns-init seccomp profiles remain Phase 2 Stage 6 work. The
+  generated data-plane profile, pivoted empty tmpfs, and `RLIMIT_CORE=0`
+  landed in Phase 2 Stage 1 on 2026-07-17.
+- Final supervisor/ns-init locking and the 24-hour soak test remain Phase 2
+  Stage 6 work.

@@ -87,9 +87,11 @@ Aligned with design §15 Phase 2, §5.3, §8, §9 and §11:
    the default action to `SECCOMP_RET_LOG` for manifest development; trace
    output never relaxes the profile automatically.
 2. **Sandbox order in the data-plane child**: receive TAP fd → rlimits
-   (`NOFILE`, `CORE=0`) → drop capabilities → `NO_NEW_PRIVS` →
-   `pivot_root` to an empty tmpfs (the child already owns a private mount
-   namespace) → load seccomp → report Ready. The control socket, TAP fd
+   (`NOFILE`, `CORE=0`) → `pivot_root` to an empty tmpfs (the child already
+   owns a private mount namespace) → drop capabilities → `NO_NEW_PRIVS` →
+   load seccomp → report Ready. `pivot_root` necessarily precedes the final
+   capability drop because it requires `CAP_SYS_ADMIN` in the child's user
+   namespace. The control socket, TAP fd
    and stderr are already-open fds and keep working after the pivot; every
    address the data plane dials (proxy, resolver) is parsed to a
    `SocketAddr` before the namespaces are created, so nothing resolves
@@ -147,7 +149,10 @@ keeps answering after the pivot.
 `sandbox_on_by_default_runs_busybox_echo`, `sandbox_off_runs_busybox_echo`,
 `forbidden_syscall_kills_the_data_plane`,
 `pivoted_data_plane_still_serves_status`.
-**Status**: Not Started
+**Status**: Complete (2026-07-17). The release-shaped syscall profile was
+calibrated with debug `SECCOMP_RET_LOG` plus `strace -ff`; `poll(2)` for the
+immediate-connect probe was the only steady-state addition found by the TCP
+echo trace. The serial workspace suite now carries 43 rootless tests.
 
 ### Stage 2: UDP core (direct / host-loopback)
 

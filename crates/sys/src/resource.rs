@@ -33,6 +33,18 @@ pub fn set_nofile_limit(limit: u64) -> io::Result<()> {
     Ok(())
 }
 
+pub fn disable_core_dumps() -> io::Result<()> {
+    let value = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: value is a valid RLIMIT_CORE limit structure.
+    if unsafe { libc::setrlimit(libc::RLIMIT_CORE, std::ptr::from_ref(&value)) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 fn nofile_limit() -> io::Result<libc::rlimit> {
     // SAFETY: zeroed rlimit is valid writable getrlimit storage.
     let mut value = unsafe { std::mem::zeroed::<libc::rlimit>() };

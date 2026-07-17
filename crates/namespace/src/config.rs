@@ -6,6 +6,19 @@ use yayatht_packet::MacAddress;
 use yayatht_proxy_proto::{Credentials, Protocol};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SandboxConfig {
+    On,
+    Off,
+}
+
+impl SandboxConfig {
+    #[must_use]
+    pub const fn enabled(self) -> bool {
+        matches!(self, Self::On)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DnsMode {
     ProxyTcp,
     Off,
@@ -103,6 +116,7 @@ pub struct LaunchConfig {
     pub network: NetworkConfig,
     pub upstream: UpstreamConfig,
     pub dns: DnsConfig,
+    pub sandbox: SandboxConfig,
     pub max_tcp_flows: usize,
     pub max_pending_tcp_bytes: usize,
     pub max_retained_tcp_bytes: usize,

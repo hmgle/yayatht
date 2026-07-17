@@ -7,7 +7,7 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use tracing_subscriber::EnvFilter;
-use yayatht_namespace::{LaunchConfig, NetworkConfig, Supervisor, UpstreamConfig};
+use yayatht_namespace::{LaunchConfig, NetworkConfig, SandboxConfig, Supervisor, UpstreamConfig};
 use yayatht_proxy_proto::{Credentials, Protocol};
 
 #[derive(Debug, Parser)]
@@ -69,6 +69,14 @@ struct RunArgs {
     runtime_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 4096)]
     max_tcp_flows: usize,
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(["on", "off"]),
+        default_value = "on",
+        value_name = "on|off",
+        help = "Apply the data-plane seccomp and filesystem sandbox"
+    )]
+    sandbox: String,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
     max_pending_tcp_bytes: usize,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]
@@ -203,6 +211,11 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         ),
         upstream,
         dns,
+        sandbox: if args.sandbox == "on" {
+            SandboxConfig::On
+        } else {
+            SandboxConfig::Off
+        },
         max_tcp_flows: args.max_tcp_flows,
         max_pending_tcp_bytes: args.max_pending_tcp_bytes,
         max_retained_tcp_bytes: args.max_retained_tcp_bytes,

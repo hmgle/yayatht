@@ -9,6 +9,7 @@ pub mod netlink;
 pub mod process;
 pub mod reactor;
 pub mod resource;
+pub mod seccomp;
 pub mod signal;
 pub mod socket;
 pub mod tcp_info;

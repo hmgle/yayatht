@@ -1,0 +1,89 @@
+# This restricted manifest is parsed by build.rs without a TOML dependency.
+# Each role section is split by feature so every syscall retains a reviewable
+# reason. The build selects the target architecture alias before emitting
+# libc::SYS_* references; a missing constant therefore fails compilation.
+
+[aliases.x86_64]
+epoll_wait = "epoll_wait"
+
+[aliases.aarch64]
+epoll_wait = "epoll_pwait"
+poll = "ppoll"
+
+[role.data_plane.memory]
+brk = "Rust allocator small allocations"
+madvise = "Rust allocator page management"
+mmap = "Rust allocator large allocations"
+mprotect = "Runtime memory protection"
+mremap = "Rust allocator region growth"
+munmap = "Rust allocator release"
+
+[role.data_plane.runtime]
+clock_gettime = "Flow and timer deadlines"
+exit = "Immediate child termination"
+exit_group = "Process termination"
+futex = "Rust and libc synchronization primitives"
+getrandom = "TCP initial sequence number entropy"
+restart_syscall = "Restart interrupted blocking operations"
+rt_sigaction = "Runtime signal disposition"
+rt_sigprocmask = "Runtime signal mask maintenance"
+rt_sigreturn = "Signal handler return"
+sched_yield = "Runtime contention fallback"
+sigaltstack = "Runtime signal stack maintenance"
+
+[arch.x86_64.data_plane.runtime]
+arch_prctl = "x86_64 thread-local runtime support"
+
+[role.data_plane.descriptors]
+close = "Release flow and reactor descriptors"
+fcntl = "Set descriptor status flags"
+ioctl = "Query socket and TAP state"
+read = "Read TAP control and timer descriptors"
+readv = "Vectored descriptor input"
+write = "Write TAP control and diagnostics"
+writev = "Vectored descriptor output"
+
+[role.data_plane.reactor]
+epoll_create1 = "Create the reactor poll set"
+epoll_ctl = "Register and update reactor descriptors"
+epoll_wait = "Wait for reactor events"
+poll = "Probe immediate nonblocking connect completion"
+timerfd_create = "Create the shared timer source"
+timerfd_settime = "Arm the shared timer source"
+
+[role.data_plane.network]
+connect = "Connect TCP flow and resolver sockets"
+getpeername = "Inspect proxy control peers"
+getsockname = "Inspect assigned local addresses"
+getsockopt = "Read TCP state and socket errors"
+recvfrom = "Receive datagrams and stream bytes"
+recvmmsg = "Batch receive socket payload"
+recvmsg = "Receive control and socket metadata"
+sendmmsg = "Batch send socket payload"
+sendmsg = "Send control and socket metadata"
+sendto = "Send datagrams and stream bytes"
+setsockopt = "Configure TCP and UDP sockets"
+shutdown = "Half-close TCP flows"
+socket = "Create upstream flow sockets"
+
+[role.namespace_init.lifecycle]
+close = "Release inherited descriptors"
+exit = "Immediate namespace-init termination"
+exit_group = "Namespace-init process termination"
+read = "Read control and signal descriptors"
+recvfrom = "Receive supervisor control messages"
+rt_sigreturn = "Signal handler return"
+sendto = "Send supervisor control messages"
+wait4 = "Reap target descendants"
+write = "Write diagnostics"
+
+[role.supervisor.lifecycle]
+close = "Release instance descriptors"
+exit = "Process termination"
+exit_group = "Process termination"
+read = "Read signals control and status clients"
+recvfrom = "Receive child control messages"
+rt_sigreturn = "Signal handler return"
+sendto = "Send child control messages"
+wait4 = "Reap child processes"
+write = "Write status and diagnostics"
