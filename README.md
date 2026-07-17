@@ -3,11 +3,14 @@
 `yayatht` runs a command in private Linux user, network, mount, IPC, UTS and
 PID namespaces and adapts traffic from a TAP device to host sockets.
 
-The current `0.1.0` tree is entering Phase 1. IPv4 and IPv6 TCP can use an
+The current `0.1.0` tree completes the Phase 1 functional surface and is
+entering Phase 2 (`docs/phase2-plan.md`). IPv4 and IPv6 TCP can use an
 explicit direct route, SOCKS5 CONNECT, or HTTP CONNECT. SOCKS5 supports
 no-auth and RFC 1929 username/password authentication; HTTP CONNECT supports
-Basic authentication. DNS forwarding, UDP forwarding, and the data-plane
-sandbox are not exposed yet.
+Basic authentication. DNS is proxied by default (`proxy-tcp`): the namespace
+resolver points at the virtual gateway and queries are carried as
+DNS-over-TCP through the configured upstream. General UDP forwarding, SOCKS5
+UDP ASSOCIATE, and the data-plane sandbox are the Phase 2 work in progress.
 
 ## Build
 
@@ -32,11 +35,13 @@ To use the host SOCKS5 proxy from the reference environment:
 
 ```sh
 target/release/yayatht run --socks5 127.0.0.1:7890 -- \
-  curl --resolve example.com:80:93.184.216.34 http://example.com/
+  busybox nslookup example.com
 ```
 
-The explicit address mapping is required until the Phase 1 DNS proxy is
-implemented.
+DNS defaults to `proxy-tcp`: queries to the gateway resolver are tunneled
+through the proxy as DNS-over-TCP. `--dns-upstream ADDR` overrides the
+resolver (otherwise the first host `nameserver` is used) and `--dns off`
+restores the DNS-less behavior.
 
 HTTP CONNECT uses `--http-connect ADDR`. Authentication credentials must be
 provided through `--proxy-username-file` and `--proxy-password-file`; both

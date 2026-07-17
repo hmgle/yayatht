@@ -132,18 +132,35 @@ DNS, or external routing.
   TCP-only workloads. `dns_*` metrics are exported through status. Plan
   and verification: `docs/phase1c-plan.md`.
 
-## Remaining Phase 1 Work
+## Phase 1 functional close
+
+Phase 1 functional deliverables are complete on the tree that opens Phase 2
+(`ed317d6` and descendants): the TCP proxy MVP, TAP offload (backlog #1),
+connect-latency convergence (backlog #2), the data-plane-per-core
+throughput gate (Phase 1B), and DNS `proxy-tcp` with the resolver bind
+mount (Phase 1C). The exit items that did **not** land in Phase 1 move into
+Phase 2 explicitly instead of staying on this list — the sandbox as
+Stage 1, so UDP does not expand the attack surface before a lock-down path
+exists, and the soak/oracle work as Stage 6 quality gates. See
+`docs/phase2-plan.md`.
+
+## Remaining Phase 1 Work (dispositions)
 
 - Per-byte copy costs (TAP read, socket send) dominate the remaining
   single-reactor profile; scaling past ~18 Gibit/s per core belongs to
-  multiqueue (#3) and io_uring/`SEND_ZC` (#4) per the design backlog.
+  multiqueue (#3, Phase 2 Stage 5) and io_uring/`SEND_ZC` (#4, Phase 3)
+  per the design backlog.
 - Single-flow direct throughput variance needs longer interleaved
-  calibration runs before it can gate anything.
-- Isolate real-mihomo 128-flow fairness variance from the shared host TUN path.
-- Review the 2 GiB default worst-case socket-buffer budget.
+  calibration runs before it can gate anything (quality, unscheduled).
+- Isolate real-mihomo 128-flow fairness variance from the shared host TUN
+  path (Phase 2 Stage 6 interop notes).
+- Review the 2 GiB default worst-case socket-buffer budget (Phase 2
+  Stage 6, review-only).
 - DNS integration against packetdrill-style capture assertions and the
-  design §12 no-leak tshark oracle (functional matrix landed in Phase 1C;
-  `proxy-udp`/`fake-ip` modes stay in Phase 2/4 per the backlog).
+  design §12 no-leak tshark oracle (Phase 2 Stage 6; the functional matrix
+  landed in Phase 1C; `proxy-udp` is Phase 2 Stage 4, `fake-ip` Phase 4).
 - Generated seccomp profiles, pivoted data-plane filesystem, and remaining
-  role-specific rlimits.
-- Final seccomp/rlimit locking and 24-hour soak tests.
+  role-specific rlimits (Phase 2 Stage 1; supervisor/ns-init profiles
+  Stage 6).
+- Final seccomp/rlimit locking and 24-hour soak tests (Phase 2 Stages 1
+  and 6).
