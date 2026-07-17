@@ -18,7 +18,7 @@ use yayatht_packet::neighbor;
 use yayatht_packet::tcp::{self, TcpFlags, TcpHeaderSpec, TcpSegment};
 use yayatht_packet::udp::{self, UdpDatagram};
 use yayatht_packet::vnet;
-use yayatht_proxy_proto::{Credentials, Handshake, Protocol};
+use yayatht_proxy_proto::{Command, Credentials, Handshake, Protocol};
 use yayatht_tcp_adapter::flow::{
     ConstructionState, Flow, FlowConstruction, FlowInterface, FlowKey, FlowSide, FlowType,
     ReceiveDisposition, SendPlan, State,
@@ -2479,7 +2479,10 @@ impl Reactor {
                 credentials,
             } => (
                 *address,
-                Some(Handshake::new(*protocol, resolver, credentials.clone())),
+                Some(
+                    Handshake::new(*protocol, Command::Connect, resolver, credentials.clone())
+                        .expect("CONNECT is supported by configured proxy protocols"),
+                ),
             ),
             Upstream::Direct { .. } => (resolver, None),
         };
@@ -2958,7 +2961,10 @@ impl Reactor {
                 protocol,
                 credentials,
                 ..
-            } => Some(Handshake::new(*protocol, logical, credentials.clone())),
+            } => Some(
+                Handshake::new(*protocol, Command::Connect, logical, credentials.clone())
+                    .expect("CONNECT is supported by configured proxy protocols"),
+            ),
         }
     }
 
