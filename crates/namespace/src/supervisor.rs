@@ -65,7 +65,7 @@ impl Supervisor {
         let (ns_parent, ns_child) = yayatht_sys::fdpass::seqpacket_pair()?;
         let (tap_dp, tap_ns) = yayatht_sys::fdpass::seqpacket_pair()?;
 
-        let resolv_conf = if config.dns.mode == DnsMode::ProxyTcp {
+        let resolv_conf = if config.dns.mode != DnsMode::Off {
             Some(instance.write_resolv_conf(&gateway_resolv_conf(&config.network))?)
         } else {
             None

@@ -113,10 +113,10 @@ struct RunArgs {
     tap_offload: String,
     #[arg(
         long,
-        value_parser = clap::builder::PossibleValuesParser::new(["proxy-tcp", "off"]),
+        value_parser = clap::builder::PossibleValuesParser::new(["proxy-tcp", "proxy-udp", "off"]),
         default_value = "proxy-tcp",
-        value_name = "proxy-tcp|off",
-        help = "Intercept namespace DNS and forward it over TCP through the upstream"
+        value_name = "proxy-tcp|proxy-udp|off",
+        help = "Intercept namespace DNS and forward it through the upstream"
     )]
     dns: String,
     #[arg(
@@ -210,6 +210,20 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         }
         _ => return Err("select exactly one of --direct, --socks5, or --http-connect".into()),
     };
+    if args.dns == "proxy-udp"
+        && !matches!(
+            &upstream,
+            UpstreamConfig::Proxy {
+                protocol: Protocol::Socks5,
+                ..
+            }
+        )
+    {
+        return Err("--dns proxy-udp requires --socks5".into());
+    }
+    if args.dns == "proxy-udp" && args.udp == "off" {
+        return Err("--dns proxy-udp requires --udp on".into());
+    }
     let dns = dns_config(&args.dns, args.dns_upstream, &upstream);
     let config = LaunchConfig {
         command: args.command,
@@ -284,7 +298,11 @@ fn dns_config(
         Some(_) => {}
     }
     yayatht_namespace::DnsConfig {
-        mode: yayatht_namespace::DnsMode::ProxyTcp,
+        mode: if mode == "proxy-udp" {
+            yayatht_namespace::DnsMode::ProxyUdp
+        } else {
+            yayatht_namespace::DnsMode::ProxyTcp
+        },
         upstream: resolver,
     }
 }

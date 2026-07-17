@@ -3,7 +3,7 @@
 //! asserts on stdout.
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpStream, UdpSocket};
 use std::time::Duration;
 
 const TIMEOUT: Duration = Duration::from_secs(3);
@@ -95,7 +95,11 @@ fn parse_response(message: &[u8]) -> Option<Response> {
 }
 
 fn udp_exchange(server: SocketAddr, message: &[u8]) -> Option<Vec<u8>> {
-    let socket = UdpSocket::bind(("0.0.0.0", 0)).expect("bind UDP socket");
+    let bind = match server {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    };
+    let socket = UdpSocket::bind(bind).expect("bind UDP socket");
     socket.set_read_timeout(Some(TIMEOUT)).unwrap();
     socket.send_to(message, server).expect("send query");
     let mut buffer = vec![0u8; 65_535];

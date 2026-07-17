@@ -102,8 +102,10 @@ pub struct Config {
     pub tap_mtu: u32,
     pub tap_offload: bool,
     pub upstream: Upstream,
-    /// Intercept gateway-directed 53/UDP and 53/TCP (design §9 `proxy-tcp`).
+    /// Intercept gateway-directed 53/UDP and 53/TCP (design section 9).
     pub dns_proxy_tcp: bool,
+    /// Relay gateway-directed 53/UDP over SOCKS5 UDP ASSOCIATE.
+    pub dns_proxy_udp: bool,
     /// Resolver behind the interception; `None` answers SERVFAIL/RST so a
     /// host without a usable resolver stays leak-free without failing
     /// TCP-only workloads.
@@ -943,7 +945,7 @@ impl Reactor {
         // Gateway-directed DNS keeps stream semantics but is retargeted at
         // the configured resolver (design §9 proxy-tcp). Without a usable
         // resolver the connection is refused rather than leaked.
-        let logical_target = if self.dns_intercepts(key.target) {
+        let logical_target = if self.dns_proxy_tcp_intercepts(key.target) {
             match self.config.dns_upstream {
                 Some(resolver) => resolver,
                 None => {
@@ -2240,8 +2242,18 @@ impl Reactor {
 
     /// Whether a namespace destination falls under DNS interception:
     /// gateway-directed port 53 with `proxy-tcp` mode active.
-    fn dns_intercepts(&self, target: SocketAddr) -> bool {
+    fn dns_proxy_tcp_intercepts(&self, target: SocketAddr) -> bool {
         if !self.config.dns_proxy_tcp || target.port() != 53 {
+            return false;
+        }
+        match target.ip() {
+            IpAddr::V4(ip) => Some(ip) == self.config.gateway_ipv4,
+            IpAddr::V6(ip) => Some(ip) == self.config.gateway_ipv6,
+        }
+    }
+
+    fn dns_proxy_udp_intercepts(&self, target: SocketAddr) -> bool {
+        if !self.config.dns_proxy_udp || target.port() != 53 {
             return false;
         }
         match target.ip() {
@@ -2259,10 +2271,17 @@ impl Reactor {
         target: SocketAddr,
         message: &[u8],
     ) -> Result<(), Error> {
-        if !self.dns_intercepts(target) {
-            return self.handle_forward_udp(client, target, message);
+        if self.dns_proxy_tcp_intercepts(target) {
+            return self.handle_dns_udp(client, target, message);
         }
-        self.handle_dns_udp(client, target, message)
+        if self.dns_proxy_udp_intercepts(target) {
+            let Some(resolver) = self.config.dns_upstream else {
+                return self.handle_dns_udp(client, target, message);
+            };
+            self.metrics.dns_queries += 1;
+            return self.handle_socks_udp_routed(client, resolver, target, message);
+        }
+        self.handle_forward_udp(client, target, message)
     }
 
     fn handle_dns_udp(
@@ -2348,7 +2367,10 @@ impl Reactor {
                 self.metrics.udp_association_limit_drops += 1;
                 return Ok(());
             }
-            Err(udp_engine::AcceptError::FamilyMismatch) => return Ok(()),
+            Err(
+                udp_engine::AcceptError::FamilyMismatch
+                | udp_engine::AcceptError::ReplyRouteConflict,
+            ) => return Ok(()),
         };
         if accepted.created {
             let socket = match yayatht_sys::socket::connect_udp(
@@ -2427,11 +2449,22 @@ impl Reactor {
         target: SocketAddr,
         message: &[u8],
     ) -> Result<(), Error> {
+        self.handle_socks_udp_routed(source, target, target, message)
+    }
+
+    fn handle_socks_udp_routed(
+        &mut self,
+        source: SocketAddr,
+        target: SocketAddr,
+        reply_source: SocketAddr,
+        message: &[u8],
+    ) -> Result<(), Error> {
         let now = Instant::now();
-        let accepted = match self
-            .udp_engine
-            .accept(udp_engine::FlowKey { source, target }, now)
-        {
+        let accepted = match self.udp_engine.accept_routed(
+            udp_engine::FlowKey { source, target },
+            reply_source,
+            now,
+        ) {
             Ok(accepted) => accepted,
             Err(udp_engine::AcceptError::FlowLimit) => {
                 self.metrics.udp_flow_limit_drops += 1;
@@ -2441,7 +2474,10 @@ impl Reactor {
                 self.metrics.udp_association_limit_drops += 1;
                 return Ok(());
             }
-            Err(udp_engine::AcceptError::FamilyMismatch) => return Ok(()),
+            Err(
+                udp_engine::AcceptError::FamilyMismatch
+                | udp_engine::AcceptError::ReplyRouteConflict,
+            ) => return Ok(()),
         };
         if accepted.created {
             self.metrics.udp_created += 1;
@@ -2987,7 +3023,15 @@ impl Reactor {
                 };
                 self.udp_engine.record_inbound(flow_id, Instant::now());
                 self.metrics.udp_datagrams_received += 1;
-                if !self.queue_udp_frame(source, target, datagram.payload)? {
+                let flow = self
+                    .udp_engine
+                    .flow(flow_id)
+                    .expect("flow was found by key");
+                let reply_source = flow.reply_source;
+                if reply_source.port() == 53 && reply_source != flow.key.target {
+                    self.metrics.dns_responses += 1;
+                }
+                if !self.queue_udp_frame(source, reply_source, datagram.payload)? {
                     self.metrics.udp_queue_drops += 1;
                 }
             }
@@ -3077,7 +3121,7 @@ impl Reactor {
                 };
                 self.udp_engine.record_inbound(id, Instant::now());
                 self.metrics.udp_datagrams_received += 1;
-                if !self.queue_udp_frame(flow.key.source, flow.key.target, &buffer[..length])? {
+                if !self.queue_udp_frame(flow.key.source, flow.reply_source, &buffer[..length])? {
                     self.metrics.udp_queue_drops += 1;
                 }
             }
@@ -4561,6 +4605,7 @@ mod tests {
                 host_loopback: false,
             },
             dns_proxy_tcp: true,
+            dns_proxy_udp: false,
             dns_upstream: Some(SocketAddr::from(([127, 0, 0, 1], 53))),
             max_tcp_flows: 8,
             udp_enabled: true,

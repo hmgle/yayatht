@@ -48,6 +48,7 @@ impl TimeoutClass {
 #[derive(Clone, Copy, Debug)]
 pub struct Flow {
     pub key: FlowKey,
+    pub reply_source: SocketAddr,
     last_activity: Instant,
     outbound_datagrams: u8,
     inbound_datagrams: u8,
@@ -81,6 +82,7 @@ pub struct Accept {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum AcceptError {
     FamilyMismatch,
+    ReplyRouteConflict,
     FlowLimit,
     AssociationLimit,
 }
@@ -111,10 +113,28 @@ impl Engine {
     }
 
     pub fn accept(&mut self, key: FlowKey, now: Instant) -> Result<Accept, AcceptError> {
-        if key.source.is_ipv4() != key.target.is_ipv4() {
+        self.accept_routed(key, key.target, now)
+    }
+
+    pub fn accept_routed(
+        &mut self,
+        key: FlowKey,
+        reply_source: SocketAddr,
+        now: Instant,
+    ) -> Result<Accept, AcceptError> {
+        if key.source.is_ipv4() != key.target.is_ipv4()
+            || key.source.is_ipv4() != reply_source.is_ipv4()
+        {
             return Err(AcceptError::FamilyMismatch);
         }
         if let Some(&id) = self.by_key.get(&key) {
+            if self
+                .flows
+                .get(id)
+                .is_some_and(|flow| flow.reply_source != reply_source)
+            {
+                return Err(AcceptError::ReplyRouteConflict);
+            }
             self.record_outbound(id, now);
             return Ok(Accept {
                 id,
@@ -136,6 +156,7 @@ impl Engine {
         }
         let flow = Flow {
             key,
+            reply_source,
             last_activity: now,
             outbound_datagrams: 1,
             inbound_datagrams: 0,
@@ -322,6 +343,20 @@ mod tests {
     }
 
     #[test]
+    fn routed_flow_preserves_its_namespace_reply_source() {
+        let now = Instant::now();
+        let mut engine = Engine::new(1, 1);
+        let key = key(40000, "198.51.100.53:53");
+        let gateway = "192.0.2.1:53".parse().unwrap();
+        let accepted = engine.accept_routed(key, gateway, now).unwrap();
+        assert_eq!(engine.flow(accepted.id).unwrap().reply_source, gateway);
+        assert_eq!(
+            engine.accept_routed(key, "192.0.2.2:53".parse().unwrap(), now),
+            Err(AcceptError::ReplyRouteConflict)
+        );
+    }
+
+    #[test]
     fn mixed_families_are_rejected() {
         let mut engine = Engine::new(1, 1);
         assert_eq!(
@@ -330,6 +365,14 @@ mod tests {
                     source: "192.0.2.2:1234".parse().unwrap(),
                     target: "[2001:db8::1]:7".parse().unwrap(),
                 },
+                Instant::now(),
+            ),
+            Err(AcceptError::FamilyMismatch)
+        );
+        assert_eq!(
+            engine.accept_routed(
+                key(1234, "198.51.100.1:7"),
+                "[2001:db8::1]:7".parse().unwrap(),
                 Instant::now(),
             ),
             Err(AcceptError::FamilyMismatch)

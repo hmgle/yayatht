@@ -21,6 +21,7 @@ impl SandboxConfig {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum DnsMode {
     ProxyTcp,
+    ProxyUdp,
     Off,
 }
 
@@ -156,6 +157,7 @@ impl LaunchConfig {
                 },
             },
             dns_proxy_tcp: self.dns.mode == DnsMode::ProxyTcp,
+            dns_proxy_udp: self.dns.mode == DnsMode::ProxyUdp,
             dns_upstream: self.dns.upstream,
             max_tcp_flows: self.max_tcp_flows,
             udp_enabled: self.udp_enabled,
@@ -189,6 +191,8 @@ pub enum ConfigError {
     InvalidTapMtu,
     #[error("instance name must match [A-Za-z0-9_.-]+")]
     InvalidName,
+    #[error("DNS proxy-udp requires a SOCKS5 upstream and UDP enabled")]
+    InvalidProxyUdp,
 }
 
 impl LaunchConfig {
@@ -212,6 +216,18 @@ impl LaunchConfig {
         }
         if !(1..=1_048_576).contains(&self.max_udp_associations) {
             return Err(ConfigError::InvalidUdpAssociationLimit);
+        }
+        if self.dns.mode == DnsMode::ProxyUdp
+            && (!self.udp_enabled
+                || !matches!(
+                    &self.upstream,
+                    UpstreamConfig::Proxy {
+                        protocol: Protocol::Socks5,
+                        ..
+                    }
+                ))
+        {
+            return Err(ConfigError::InvalidProxyUdp);
         }
         if !(16 * 1024..=1024usize.pow(4)).contains(&self.max_pending_tcp_bytes)
             || !(16 * 1024..=1024usize.pow(4)).contains(&self.max_retained_tcp_bytes)

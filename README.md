@@ -12,11 +12,12 @@ resolver points at the virtual gateway and queries are carried as
 DNS-over-TCP through the configured upstream. IPv4 and IPv6 UDP forwarding
 is enabled for direct routes, including host-loopback mapping, and SOCKS5
 uses one standards-compliant UDP ASSOCIATE per namespace source endpoint.
-`--udp off` restores drop-all behavior for non-DNS datagrams. DNS
-`proxy-udp` and TAP multiqueue are the remaining Phase 2 features. The
-data-plane sandbox is enabled by default: it uses a generated seccomp
-allowlist, pivots to an empty tmpfs, and disables core dumps. `--sandbox off`
-is available for diagnosis and emits a warning.
+`--udp off` restores drop-all behavior for non-DNS datagrams. SOCKS5 can
+also carry gateway DNS over the association with `--dns proxy-udp`; the
+default remains `proxy-tcp`. TAP multiqueue is the remaining Phase 2 data
+path feature. The data-plane sandbox is enabled by default: it uses a
+generated seccomp allowlist, pivots to an empty tmpfs, and disables core
+dumps. `--sandbox off` is available for diagnosis and emits a warning.
 
 ## Build
 
@@ -47,7 +48,9 @@ target/release/yayatht run --socks5 127.0.0.1:7890 -- \
 DNS defaults to `proxy-tcp`: queries to the gateway resolver are tunneled
 through the proxy as DNS-over-TCP. `--dns-upstream ADDR` overrides the
 resolver (otherwise the first host `nameserver` is used) and `--dns off`
-restores the DNS-less behavior.
+restores the DNS-less behavior. With SOCKS5, `--dns proxy-udp` instead
+relays the original query over a per-source-endpoint UDP association; it
+requires `--udp on`.
 
 HTTP CONNECT uses `--http-connect ADDR`. Authentication credentials must be
 provided through `--proxy-username-file` and `--proxy-password-file`; both

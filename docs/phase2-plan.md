@@ -204,7 +204,13 @@ association path with the DNS timeout class; IPv6 UDP/DNS/NDP coverage.
 **Tests**: rootless `proxy_udp_requires_socks5`,
 `udp_dns_resolves_through_an_association`,
 `ipv6_udp_dns_resolves_through_association`.
-**Status**: Not Started
+**Status**: Complete (2026-07-18). Gateway-directed UDP DNS now keeps its
+namespace-visible gateway:53 reply source while relaying the original
+payload and resolver destination through the source endpoint's SOCKS5 UDP
+association. IPv4 and IPv6 rootless cases verify the resolver target and
+unchanged DNS ID. `proxy-tcp` remains the default. Domain-form BND relay
+addresses remain a recorded interoperability limitation because the
+sandboxed reactor has no name-service path before the relay is usable.
 
 ### Stage 5: TAP multiqueue / per-worker reactors
 

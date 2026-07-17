@@ -7,7 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use wait_timeout::ChildExt;
-use yayatht_proxy_proto::socks5_udp;
+use yayatht_proxy_proto::{SocksAddress, socks5_udp};
 
 fn supported() -> bool {
     if !std::path::Path::new("/dev/net/tun").exists() {
@@ -442,6 +442,32 @@ fn relay_socks5_udp(relay: &std::net::UdpSocket, exchanges: usize) -> Vec<Socket
         relay.send_to(&buffer[..length], peer).unwrap();
     }
     targets
+}
+
+fn relay_socks5_dns(
+    relay: &std::net::UdpSocket,
+    expected_resolver: SocketAddr,
+    expected_name: &str,
+    answer: [u8; 4],
+) {
+    let mut buffer = [0u8; 65_535];
+    let (length, peer) = relay.recv_from(&mut buffer).unwrap();
+    let datagram = socks5_udp::decode(&buffer[..length]).unwrap();
+    assert_eq!(
+        datagram.destination,
+        socks5_udp::Address::Socket(expected_resolver)
+    );
+    assert_eq!(dns_qname(datagram.payload), expected_name);
+    let query_id = datagram.payload[..2].to_vec();
+    let answer = dns_answer_message(datagram.payload, answer, 1);
+    assert_eq!(&answer[..2], query_id);
+    let length = socks5_udp::encode(
+        &mut buffer,
+        &SocksAddress::Socket(expected_resolver),
+        &answer,
+    )
+    .unwrap();
+    relay.send_to(&buffer[..length], peer).unwrap();
 }
 
 fn socks_udp_client_case(
@@ -2221,6 +2247,136 @@ fn spawn_mock_resolver(
             thread::spawn(move || serve_dns_connection(stream, lookup));
         }
     });
+}
+
+#[test]
+fn proxy_udp_requires_socks5() {
+    for upstream in [vec!["--direct"], vec!["--http-connect", "127.0.0.1:9"]] {
+        let output = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+            .arg("run")
+            .args(upstream)
+            .args(["--dns", "proxy-udp", "--", "true"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("--dns proxy-udp requires --socks5"),
+            "unexpected validation error: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let output = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--socks5",
+            "127.0.0.1:9",
+            "--dns",
+            "proxy-udp",
+            "--udp",
+            "off",
+            "--",
+            "true",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--dns proxy-udp requires --udp on"));
+}
+
+#[test]
+fn udp_dns_resolves_through_an_association() {
+    if !supported() {
+        return;
+    }
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    relay
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let resolver = "203.0.113.53:53".parse().unwrap();
+    let server = thread::spawn(move || {
+        let _control = accept_socks5_udp_associate(&listener, &relay);
+        relay_socks5_dns(&relay, resolver, "proxy-udp.test", [198, 51, 100, 53]);
+    });
+    let output = namespace_output(
+        &[
+            "--socks5",
+            &proxy.to_string(),
+            "--dns",
+            "proxy-udp",
+            "--dns-upstream",
+            &resolver.to_string(),
+            "--no-ipv6",
+        ],
+        &[&client, "query", "192.0.2.1", "proxy-udp.test"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("rcode=0")
+            && stdout.contains("a=198.51.100.53")
+            && stdout.contains("id=ok"),
+        "unexpected DNS result: {stdout} {stderr}"
+    );
+    server.join().unwrap();
+}
+
+#[test]
+fn ipv6_udp_dns_resolves_through_association() {
+    if !supported() {
+        return;
+    }
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let proxy = listener.local_addr().unwrap();
+    let relay = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    relay
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let resolver = "[2001:db8::53]:53".parse().unwrap();
+    let server = thread::spawn(move || {
+        let _control = accept_socks5_udp_associate(&listener, &relay);
+        relay_socks5_dns(&relay, resolver, "proxy-udp-v6.test", [198, 51, 100, 54]);
+    });
+    let output = namespace_output(
+        &[
+            "--socks5",
+            &proxy.to_string(),
+            "--dns",
+            "proxy-udp",
+            "--dns-upstream",
+            &resolver.to_string(),
+            "--no-ipv4",
+        ],
+        &[
+            &client,
+            "query",
+            "fd79:6179:6174:6874::1",
+            "proxy-udp-v6.test",
+        ],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("rcode=0")
+            && stdout.contains("a=198.51.100.54")
+            && stdout.contains("id=ok"),
+        "unexpected IPv6 DNS result: {stdout} {stderr}"
+    );
+    server.join().unwrap();
 }
 
 #[test]
