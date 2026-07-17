@@ -118,6 +118,9 @@ pub struct LaunchConfig {
     pub dns: DnsConfig,
     pub sandbox: SandboxConfig,
     pub max_tcp_flows: usize,
+    pub udp_enabled: bool,
+    pub max_udp_flows: usize,
+    pub max_udp_associations: usize,
     pub max_pending_tcp_bytes: usize,
     pub max_retained_tcp_bytes: usize,
     pub tcp_receive_buffer_bytes: usize,
@@ -155,6 +158,9 @@ impl LaunchConfig {
             dns_proxy_tcp: self.dns.mode == DnsMode::ProxyTcp,
             dns_upstream: self.dns.upstream,
             max_tcp_flows: self.max_tcp_flows,
+            udp_enabled: self.udp_enabled,
+            max_udp_flows: self.max_udp_flows,
+            max_udp_associations: self.max_udp_associations,
             max_pending_tcp_bytes: self.max_pending_tcp_bytes,
             max_retained_tcp_bytes: self.max_retained_tcp_bytes,
             tcp_receive_buffer_bytes: self.tcp_receive_buffer_bytes,
@@ -171,6 +177,10 @@ pub enum ConfigError {
     NoIpFamily,
     #[error("max_tcp_flows must be between 1 and 1048576")]
     InvalidFlowLimit,
+    #[error("max_udp_flows must be between 1 and 1048576")]
+    InvalidUdpFlowLimit,
+    #[error("max_udp_associations must be between 1 and 1048576")]
+    InvalidUdpAssociationLimit,
     #[error("global TCP byte limits must be between 16384 and 1 TiB")]
     InvalidGlobalByteLimit,
     #[error("per-flow TCP socket buffers must be between 16384 and 16 MiB")]
@@ -196,6 +206,12 @@ impl LaunchConfig {
         }
         if !(1..=1_048_576).contains(&self.max_tcp_flows) {
             return Err(ConfigError::InvalidFlowLimit);
+        }
+        if !(1..=1_048_576).contains(&self.max_udp_flows) {
+            return Err(ConfigError::InvalidUdpFlowLimit);
+        }
+        if !(1..=1_048_576).contains(&self.max_udp_associations) {
+            return Err(ConfigError::InvalidUdpAssociationLimit);
         }
         if !(16 * 1024..=1024usize.pow(4)).contains(&self.max_pending_tcp_bytes)
             || !(16 * 1024..=1024usize.pow(4)).contains(&self.max_retained_tcp_bytes)

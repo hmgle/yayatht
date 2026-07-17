@@ -74,6 +74,18 @@ struct RunArgs {
         value_parser = clap::builder::PossibleValuesParser::new(["on", "off"]),
         default_value = "on",
         value_name = "on|off",
+        help = "Forward namespace UDP datagrams"
+    )]
+    udp: String,
+    #[arg(long, default_value_t = 8192)]
+    max_udp_flows: usize,
+    #[arg(long, default_value_t = 2048)]
+    max_udp_associations: usize,
+    #[arg(
+        long,
+        value_parser = clap::builder::PossibleValuesParser::new(["on", "off"]),
+        default_value = "on",
+        value_name = "on|off",
         help = "Apply the data-plane seccomp and filesystem sandbox"
     )]
     sandbox: String,
@@ -217,6 +229,9 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
             SandboxConfig::Off
         },
         max_tcp_flows: args.max_tcp_flows,
+        udp_enabled: args.udp == "on",
+        max_udp_flows: args.max_udp_flows,
+        max_udp_associations: args.max_udp_associations,
         max_pending_tcp_bytes: args.max_pending_tcp_bytes,
         max_retained_tcp_bytes: args.max_retained_tcp_bytes,
         tcp_receive_buffer_bytes: args.tcp_receive_buffer_bytes,

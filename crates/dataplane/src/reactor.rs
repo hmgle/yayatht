@@ -101,6 +101,9 @@ pub struct Config {
     /// TCP-only workloads.
     pub dns_upstream: Option<SocketAddr>,
     pub max_tcp_flows: usize,
+    pub udp_enabled: bool,
+    pub max_udp_flows: usize,
+    pub max_udp_associations: usize,
     pub max_pending_tcp_bytes: usize,
     pub max_retained_tcp_bytes: usize,
     pub tcp_receive_buffer_bytes: usize,
@@ -483,7 +486,11 @@ impl Reactor {
         let metrics = Metrics {
             max_pending_tcp_bytes: config.max_pending_tcp_bytes as u64,
             max_retained_tcp_bytes: config.max_retained_tcp_bytes as u64,
-            flow_fd_limit: yayatht_sys::resource::dataplane_nofile_limit(max_tcp_flows)?,
+            flow_fd_limit: yayatht_sys::resource::dataplane_nofile_limit(
+                max_tcp_flows,
+                config.max_udp_flows,
+                config.max_udp_associations,
+            )?,
             tap_mtu: u64::from(config.tap_mtu),
             tap_offload: u64::from(config.tap_offload),
             tap_frame_capacity: frame_capacity as u64,
@@ -3385,6 +3392,9 @@ mod tests {
             dns_proxy_tcp: true,
             dns_upstream: Some(SocketAddr::from(([127, 0, 0, 1], 53))),
             max_tcp_flows: 8,
+            udp_enabled: true,
+            max_udp_flows: 16,
+            max_udp_associations: 4,
             max_pending_tcp_bytes: 65536,
             max_retained_tcp_bytes: 65536,
             tcp_receive_buffer_bytes: 65536,

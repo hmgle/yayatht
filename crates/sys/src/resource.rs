@@ -2,11 +2,28 @@ use std::io;
 
 pub const DATAPLANE_FD_HEADROOM: u64 = 32;
 
-pub fn dataplane_nofile_limit(max_tcp_flows: usize) -> io::Result<u64> {
-    let flows = u64::try_from(max_tcp_flows)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "flow limit exceeds u64"))?;
-    flows
-        .checked_add(DATAPLANE_FD_HEADROOM)
+pub fn dataplane_nofile_limit(
+    max_tcp_flows: usize,
+    max_udp_flows: usize,
+    max_udp_associations: usize,
+) -> io::Result<u64> {
+    let tcp = u64::try_from(max_tcp_flows)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "TCP flow limit exceeds u64"))?;
+    let udp = u64::try_from(max_udp_flows)
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "UDP flow limit exceeds u64"))?;
+    let associations = u64::try_from(max_udp_associations).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "UDP association limit exceeds u64",
+        )
+    })?;
+    tcp.checked_add(udp)
+        .and_then(|value| {
+            associations
+                .checked_mul(2)
+                .and_then(|extra| value.checked_add(extra))
+        })
+        .and_then(|value| value.checked_add(DATAPLANE_FD_HEADROOM))
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "fd budget overflow"))
 }
 
@@ -53,4 +70,14 @@ fn nofile_limit() -> io::Result<libc::rlimit> {
         return Err(io::Error::last_os_error());
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_phase2_budget_includes_udp_association_pairs() {
+        assert_eq!(dataplane_nofile_limit(4096, 8192, 2048).unwrap(), 16416);
+    }
 }

@@ -43,8 +43,11 @@ pub struct Supervisor;
 impl Supervisor {
     pub fn run(mut config: LaunchConfig) -> Result<ExitStatus, Error> {
         config.validate()?;
-        let dataplane_fd_limit =
-            yayatht_sys::resource::dataplane_nofile_limit(config.max_tcp_flows)?;
+        let dataplane_fd_limit = yayatht_sys::resource::dataplane_nofile_limit(
+            config.max_tcp_flows,
+            config.max_udp_flows,
+            config.max_udp_associations,
+        )?;
         yayatht_sys::resource::ensure_nofile_capacity(dataplane_fd_limit)?;
         yayatht_sys::caps::set_child_subreaper()?;
         let signal_fd = yayatht_sys::signal::SignalFd::block(&[
@@ -236,7 +239,11 @@ fn data_plane_child(
         let forbidden_syscall_failpoint = cfg!(debug_assertions)
             && std::env::var_os("YAYATHT_TEST_FAIL_AT")
                 .is_some_and(|value| value == "dp_forbidden_syscall");
-        let nofile_limit = yayatht_sys::resource::dataplane_nofile_limit(config.max_tcp_flows)?;
+        let nofile_limit = yayatht_sys::resource::dataplane_nofile_limit(
+            config.max_tcp_flows,
+            config.max_udp_flows,
+            config.max_udp_associations,
+        )?;
         yayatht_sys::resource::set_nofile_limit(nofile_limit)?;
         if sandbox.enabled() {
             yayatht_sys::resource::disable_core_dumps()?;

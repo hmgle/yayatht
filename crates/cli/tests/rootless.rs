@@ -1328,7 +1328,7 @@ fn status_socket_reports_running_instance() {
         value["dataplane"]["max_retained_tcp_bytes"],
         64 * 1024 * 1024
     );
-    assert_eq!(value["dataplane"]["flow_fd_limit"], 4096 + 32);
+    assert_eq!(value["dataplane"]["flow_fd_limit"], 16_416);
     assert_eq!(value["dataplane"]["tap_mtu"], 32_000);
     assert_eq!(value["dataplane"]["tap_offload"], 1);
     // MTU + Ethernet header + the 10-byte virtio_net_hdr prefix.
@@ -1341,7 +1341,7 @@ fn status_socket_reports_running_instance() {
         .find(|line| line.starts_with("Max open files"))
         .expect("data-plane RLIMIT_NOFILE entry");
     assert!(
-        open_files.split_whitespace().any(|field| field == "4128"),
+        open_files.split_whitespace().any(|field| field == "16416"),
         "unexpected data-plane fd limit: {open_files}"
     );
     let core_size = limits
