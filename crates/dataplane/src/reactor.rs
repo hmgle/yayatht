@@ -133,6 +133,10 @@ pub struct Metrics {
     pub dns_upstream_connects: u64,
     /// Unparsable intercepted DNS messages dropped without an answer.
     pub dns_dropped: u64,
+    /// DNS replies dropped because the TAP frame pool was exhausted. The
+    /// client retransmits, so a lost UDP answer is harmless -- unlike a
+    /// propagated error, which would tear down the reactor.
+    pub dns_reply_drops: u64,
     pub tx_ack_watchdog_advances: u64,
     pub tx_ack_watchdog_tail_recoveries: u64,
     pub active_tcp_flows: u64,
@@ -2471,7 +2475,22 @@ impl Reactor {
         let ip_offset = vnet_len + ethernet::ETHERNET_HEADER_LEN;
         let udp_offset = ip_offset + ip_header_len;
         let frame_len = udp_offset + udp::UDP_HEADER_LEN + payload.len();
-        let mut frame = self.acquire_frame()?;
+        // Pool exhaustion is a designed-in state under send-queue pressure,
+        // not a fault. Every timer- and resolver-driven caller propagates
+        // this Result to the run loop, so failing here would kill the whole
+        // reactor. Degrade to a counted drop instead; the DNS client retries.
+        let mut frame = match self.frame_pool.acquire() {
+            Some((pool_index, buffer)) => PooledFrame {
+                tier: FrameTier::Mtu,
+                pool_index,
+                buffer,
+            },
+            None => {
+                self.note_frame_pool_exhaustion();
+                self.metrics.dns_reply_drops += 1;
+                return Ok(());
+            }
+        };
         if frame_len > frame.buffer.capacity() {
             self.release_frame(frame);
             return Err(Error::Invariant("DNS reply exceeds frame capacity"));
@@ -3343,5 +3362,57 @@ mod tests {
         }
         assert!(segment.retries_exhausted());
         assert_eq!(segment.retransmit_timeout, Duration::from_secs(8));
+    }
+
+    fn test_reactor() -> Reactor {
+        use std::net::UdpSocket;
+        // Any epoll-addable fds satisfy Reactor::new; the pool-exhaustion
+        // path never touches them.
+        let tap = OwnedFd::from(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let control = OwnedFd::from(UdpSocket::bind("127.0.0.1:0").unwrap());
+        let config = Config {
+            target_mac: MacAddress([2, 0, 0, 0, 0, 1]),
+            gateway_mac: MacAddress([2, 0, 0, 0, 0, 2]),
+            target_ipv4: Some(Ipv4Addr::new(10, 0, 0, 2)),
+            gateway_ipv4: Some(Ipv4Addr::new(10, 0, 0, 1)),
+            target_ipv6: None,
+            gateway_ipv6: None,
+            tap_mtu: 1500,
+            tap_offload: false,
+            upstream: Upstream::Direct {
+                host_loopback: false,
+            },
+            dns_proxy_tcp: true,
+            dns_upstream: Some(SocketAddr::from(([127, 0, 0, 1], 53))),
+            max_tcp_flows: 8,
+            max_pending_tcp_bytes: 65536,
+            max_retained_tcp_bytes: 65536,
+            tcp_receive_buffer_bytes: 65536,
+            tcp_send_buffer_bytes: 65536,
+        };
+        Reactor::new(config, tap, control).unwrap()
+    }
+
+    #[test]
+    fn dns_reply_degrades_to_a_counted_drop_when_the_frame_pool_is_dry() {
+        let mut reactor = test_reactor();
+        // Drain every frame so the reply cannot acquire one. Leak the
+        // handles; the pool must observe zero availability.
+        let mut held = Vec::new();
+        while let Some(frame) = reactor.frame_pool.acquire() {
+            held.push(frame);
+        }
+        assert_eq!(reactor.frame_pool.available(), 0);
+
+        let client = SocketAddr::from(([10, 0, 0, 2], 40000));
+        let gateway = SocketAddr::from(([10, 0, 0, 1], 53));
+        let result = reactor.queue_dns_reply(client, gateway, &[0u8; 32]);
+
+        // The timer and resolver callers propagate this Result with `?`, so
+        // a dry pool must not surface an error that would kill the reactor.
+        assert!(result.is_ok());
+        assert_eq!(reactor.metrics.dns_reply_drops, 1);
+        assert_eq!(reactor.metrics.frame_pool_exhaustions, 1);
+        assert_eq!(reactor.metrics.tap_tx_packets, 0);
     }
 }
