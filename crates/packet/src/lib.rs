@@ -2,6 +2,7 @@
 
 pub mod checksum;
 pub mod ethernet;
+pub mod icmp;
 pub mod ip;
 pub mod neighbor;
 pub mod tcp;
