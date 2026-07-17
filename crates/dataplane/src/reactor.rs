@@ -1,6 +1,7 @@
 use crate::buffer::{BufferPool, FrameBuffer};
 use crate::dns;
 use crate::flow_table::{EpollToken, FlowId, FlowTable, Resource};
+use crate::udp as udp_engine;
 use getrandom::fill as random_fill;
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -11,6 +12,7 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use tracing::{debug, warn};
 use yayatht_packet::ethernet::{self, EtherType, EthernetFrame, MacAddress};
+use yayatht_packet::icmp::{self, UdpError};
 use yayatht_packet::ip::{self, Ipv4Packet, Ipv6Packet};
 use yayatht_packet::neighbor;
 use yayatht_packet::tcp::{self, TcpFlags, TcpHeaderSpec, TcpSegment};
@@ -25,6 +27,7 @@ use yayatht_tcp_adapter::sequence;
 
 const TAP_BUDGET: usize = 32;
 const TAP_TX_BUDGET: usize = 32;
+const UDP_RX_BUDGET: usize = 32;
 const TAP_FRAME_POOL_BYTES: usize = 16 * 1024 * 1024;
 const TAP_FRAME_POOL_MAX_FRAMES: usize = 4096;
 /// Byte budget of the TSO super-frame pool; at the maximum frame size
@@ -61,6 +64,7 @@ const DNS_READ_BUFFER_LIMIT: usize = 128 * 1024;
 /// Close the resolver connection after this quiet period with no
 /// outstanding transactions (design §7: DNS flow idle timeout).
 const DNS_IDLE_TIMEOUT: Duration = Duration::from_secs(15);
+const UDP_SOCKET_BUFFER_BYTES: usize = 64 * 1024;
 const TEST_DNS_QUERY_TIMEOUT_MS_ENV: &str = "YAYATHT_TEST_DNS_QUERY_TIMEOUT_MS";
 const TEST_DROP_TCP_DATA_ENV: &str = "YAYATHT_TEST_DROP_TCP_DATA";
 const TEST_DROP_TCP_RETRANSMIT_ENV: &str = "YAYATHT_TEST_DROP_TCP_RETRANSMIT";
@@ -140,6 +144,22 @@ pub struct Metrics {
     /// client retransmits, so a lost UDP answer is harmless -- unlike a
     /// propagated error, which would tear down the reactor.
     pub dns_reply_drops: u64,
+    pub udp_datagrams_sent: u64,
+    pub udp_datagrams_received: u64,
+    pub udp_created: u64,
+    pub udp_closed: u64,
+    pub udp_associations_created: u64,
+    pub udp_associations_closed: u64,
+    pub udp_flow_limit_drops: u64,
+    pub udp_association_limit_drops: u64,
+    pub udp_queue_drops: u64,
+    pub udp_socket_errors: u64,
+    pub udp_unmapped_errors: u64,
+    pub udp_icmp_errors: u64,
+    pub active_udp_flows: u64,
+    pub peak_udp_flows: u64,
+    pub active_udp_associations: u64,
+    pub peak_udp_associations: u64,
     pub tx_ack_watchdog_advances: u64,
     pub tx_ack_watchdog_tail_recoveries: u64,
     pub active_tcp_flows: u64,
@@ -407,6 +427,13 @@ impl DnsConnection {
     }
 }
 
+struct UdpSocketEntry {
+    socket: OwnedFd,
+    payload_prefix: [u8; 8],
+    payload_prefix_len: usize,
+    payload_len: usize,
+}
+
 pub struct Reactor {
     config: Config,
     tap: OwnedFd,
@@ -415,6 +442,9 @@ pub struct Reactor {
     timer: yayatht_sys::reactor::TimerFd,
     flows: FlowTable<FlowEntry>,
     by_key: HashMap<FlowKey, FlowId>,
+    udp_engine: udp_engine::Engine,
+    udp_sockets: HashMap<FlowId, UdpSocketEntry>,
+    udp_rx_buffer: Vec<u8>,
     frame_pool: BufferPool,
     /// Pool of maximum-size frames for TSO sends; empty without offload.
     gso_pool: BufferPool,
@@ -472,6 +502,8 @@ impl Reactor {
             EpollToken::global(Resource::Control).raw(),
         )?;
         let max_tcp_flows = config.max_tcp_flows;
+        let max_udp_flows = config.max_udp_flows;
+        let max_udp_associations = config.max_udp_associations;
         let vnet_len = if config.tap_offload {
             vnet::VNET_HEADER_LEN
         } else {
@@ -517,6 +549,9 @@ impl Reactor {
         } else {
             frame_capacity
         };
+        let udp_rx_capacity = usize::try_from(config.tap_mtu)
+            .unwrap_or(65_520)
+            .saturating_sub(40 + udp::UDP_HEADER_LEN);
         let gso_pool_frames = if config.tap_offload {
             (TAP_GSO_POOL_BYTES / gso_frame_capacity).max(1)
         } else {
@@ -530,6 +565,9 @@ impl Reactor {
             timer,
             flows: FlowTable::with_capacity(max_tcp_flows),
             by_key: HashMap::with_capacity(max_tcp_flows),
+            udp_engine: udp_engine::Engine::new(max_udp_flows, max_udp_associations),
+            udp_sockets: HashMap::with_capacity(max_udp_flows),
+            udp_rx_buffer: vec![0; udp_rx_capacity],
             frame_pool: BufferPool::new(frame_pool_frames, frame_capacity),
             gso_pool: BufferPool::new(gso_pool_frames, gso_frame_capacity),
             mtu_frame_capacity: frame_capacity,
@@ -565,7 +603,10 @@ impl Reactor {
 
     pub fn run(mut self) -> Result<Metrics, Error> {
         let mut events = [yayatht_sys::reactor::Event::default(); EVENT_CAPACITY];
-        while !self.shutting_down || !self.flows.active_ids().is_empty() {
+        while !self.shutting_down
+            || !self.flows.active_ids().is_empty()
+            || self.udp_engine.active_flows() > 0
+        {
             let count = self.epoll.wait(&mut events, Some(Duration::from_secs(1)))?;
             for event in &events[..count] {
                 let Some((flow, resource, _side)) = EpollToken::from_raw(event.token).decode()
@@ -589,6 +630,9 @@ impl Reactor {
                     (None, Resource::Control) => self.handle_control()?,
                     (None, Resource::DnsUpstream) => self.handle_dns_upstream(event.events)?,
                     (Some(id), Resource::UpstreamSocket) => self.handle_socket(id, event.events)?,
+                    (Some(id), Resource::UdpSocket) => {
+                        self.handle_udp_socket(id, event.events)?;
+                    }
                     _ => {}
                 }
             }
@@ -597,6 +641,9 @@ impl Reactor {
             if self.shutting_down {
                 for id in self.flows.active_ids() {
                     self.close_flow(id)?;
+                }
+                for id in self.udp_engine.active_ids() {
+                    self.close_udp_flow(id)?;
                 }
             }
         }
@@ -1797,6 +1844,7 @@ impl Reactor {
     fn handle_timers(&mut self) -> Result<(), Error> {
         let now = Instant::now();
         self.handle_dns_timers(now)?;
+        self.handle_udp_timers(now)?;
         let ids = self.flows.active_ids();
         if ids.is_empty() {
             return Ok(());
@@ -1848,6 +1896,19 @@ impl Reactor {
             }
             self.watchdog_upstream_ack(id)?;
         }
+        Ok(())
+    }
+
+    fn handle_udp_timers(&mut self, now: Instant) -> Result<(), Error> {
+        let associations_before = self.udp_engine.active_associations();
+        let expired = self.udp_engine.expire(now);
+        for id in expired {
+            self.drop_udp_socket(id)?;
+        }
+        let associations_after = self.udp_engine.active_associations();
+        self.metrics.udp_associations_closed +=
+            associations_before.saturating_sub(associations_after) as u64;
+        self.refresh_udp_metrics();
         Ok(())
     }
 
@@ -2106,17 +2167,27 @@ impl Reactor {
         }
     }
 
-    /// Entry point for namespace UDP: gateway-directed DNS is intercepted,
-    /// everything else is dropped exactly as before UDP parsing existed.
+    /// Entry point for namespace UDP. Gateway-directed proxy-tcp DNS keeps
+    /// its dedicated transaction engine; other datagrams use logical UDP
+    /// flows when direct forwarding is enabled.
     fn handle_udp(
+        &mut self,
+        client: SocketAddr,
+        target: SocketAddr,
+        message: &[u8],
+    ) -> Result<(), Error> {
+        if !self.dns_intercepts(target) {
+            return self.handle_forward_udp(client, target, message);
+        }
+        self.handle_dns_udp(client, target, message)
+    }
+
+    fn handle_dns_udp(
         &mut self,
         client: SocketAddr,
         gateway: SocketAddr,
         message: &[u8],
     ) -> Result<(), Error> {
-        if !self.dns_intercepts(gateway) {
-            return Ok(());
-        }
         self.metrics.dns_queries += 1;
         let now = Instant::now();
         let resolver_available = self.config.dns_upstream.is_some();
@@ -2139,6 +2210,230 @@ impl Reactor {
                 self.forward_dns_query(upstream_id, message)
             }
         }
+    }
+
+    fn handle_forward_udp(
+        &mut self,
+        source: SocketAddr,
+        target: SocketAddr,
+        message: &[u8],
+    ) -> Result<(), Error> {
+        if !self.config.udp_enabled {
+            return Ok(());
+        }
+        let transport_target = match &self.config.upstream {
+            Upstream::Direct {
+                host_loopback: false,
+            } => target,
+            Upstream::Direct {
+                host_loopback: true,
+            } => match target {
+                SocketAddr::V4(address) if Some(*address.ip()) == self.config.gateway_ipv4 => {
+                    SocketAddr::from((Ipv4Addr::LOCALHOST, address.port()))
+                }
+                SocketAddr::V6(address) if Some(*address.ip()) == self.config.gateway_ipv6 => {
+                    SocketAddr::from((Ipv6Addr::LOCALHOST, address.port()))
+                }
+                _ => target,
+            },
+            Upstream::Proxy { .. } => return Ok(()),
+        };
+        let now = Instant::now();
+        let accepted = match self
+            .udp_engine
+            .accept(udp_engine::FlowKey { source, target }, now)
+        {
+            Ok(accepted) => accepted,
+            Err(udp_engine::AcceptError::FlowLimit) => {
+                self.metrics.udp_flow_limit_drops += 1;
+                return Ok(());
+            }
+            Err(udp_engine::AcceptError::AssociationLimit) => {
+                self.metrics.udp_association_limit_drops += 1;
+                return Ok(());
+            }
+            Err(udp_engine::AcceptError::FamilyMismatch) => return Ok(()),
+        };
+        if accepted.created {
+            let socket = match yayatht_sys::socket::connect_udp(
+                transport_target,
+                UDP_SOCKET_BUFFER_BYTES,
+                UDP_SOCKET_BUFFER_BYTES,
+            ) {
+                Ok(socket) => socket,
+                Err(error) => {
+                    debug!(%error, %target, "UDP socket creation failed");
+                    self.udp_engine.remove(accepted.id);
+                    self.refresh_udp_metrics();
+                    return Ok(());
+                }
+            };
+            self.epoll.add(
+                socket.as_raw_fd(),
+                yayatht_sys::reactor::READABLE | yayatht_sys::reactor::ERROR,
+                EpollToken::flow(accepted.id, Resource::UdpSocket, true)
+                    .ok_or(Error::Invariant("UDP flow does not fit epoll token"))?
+                    .raw(),
+            )?;
+            self.udp_sockets.insert(
+                accepted.id,
+                UdpSocketEntry {
+                    socket,
+                    payload_prefix: [0; 8],
+                    payload_prefix_len: 0,
+                    payload_len: 0,
+                },
+            );
+            self.metrics.udp_created += 1;
+            if accepted.association_created {
+                self.metrics.udp_associations_created += 1;
+            }
+            self.refresh_udp_metrics();
+        }
+        let Some(entry) = self.udp_sockets.get_mut(&accepted.id) else {
+            return Err(Error::Invariant("UDP engine has no socket"));
+        };
+        entry.payload_prefix.fill(0);
+        entry.payload_prefix_len = message.len().min(entry.payload_prefix.len());
+        entry.payload_prefix[..entry.payload_prefix_len]
+            .copy_from_slice(&message[..entry.payload_prefix_len]);
+        entry.payload_len = message.len();
+        let fd = entry.socket.as_raw_fd();
+        match yayatht_sys::socket::send(fd, message) {
+            Ok(length) if length == message.len() => {
+                self.metrics.udp_datagrams_sent += 1;
+            }
+            Ok(_) => {
+                self.metrics.udp_queue_drops += 1;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                self.metrics.udp_queue_drops += 1;
+            }
+            Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                self.queue_udp_icmp_error(
+                    accepted.id,
+                    UdpError::DestinationUnreachable {
+                        code: if source.is_ipv4() { 3 } else { 4 },
+                    },
+                )?;
+            }
+            Err(error) => {
+                debug!(%error, %target, "UDP send failed");
+                self.close_udp_flow(accepted.id)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_udp_socket(&mut self, id: FlowId, events: u32) -> Result<(), Error> {
+        if self.udp_engine.flow(id).is_none() {
+            return Ok(());
+        }
+        if events & yayatht_sys::reactor::ERROR != 0 {
+            self.handle_udp_errors(id)?;
+        }
+        if self.udp_engine.flow(id).is_none() || events & yayatht_sys::reactor::READABLE == 0 {
+            return Ok(());
+        }
+        let Some(fd) = self
+            .udp_sockets
+            .get(&id)
+            .map(|entry| entry.socket.as_raw_fd())
+        else {
+            return Ok(());
+        };
+        let mut buffer = std::mem::take(&mut self.udp_rx_buffer);
+        let result = (|| {
+            for _ in 0..UDP_RX_BUDGET {
+                let length = match yayatht_sys::socket::recv_datagram(fd, &mut buffer) {
+                    Ok(length) => length,
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(error) if error.raw_os_error() == Some(libc::ECONNREFUSED) => {
+                        self.handle_udp_errors(id)?;
+                        break;
+                    }
+                    Err(error) => {
+                        debug!(%error, "UDP receive failed");
+                        self.close_udp_flow(id)?;
+                        break;
+                    }
+                };
+                if length > buffer.len() {
+                    self.metrics.udp_queue_drops += 1;
+                    continue;
+                }
+                let Some(flow) = self.udp_engine.flow(id) else {
+                    break;
+                };
+                self.udp_engine.record_inbound(id, Instant::now());
+                self.metrics.udp_datagrams_received += 1;
+                if !self.queue_udp_frame(flow.key.source, flow.key.target, &buffer[..length])? {
+                    self.metrics.udp_queue_drops += 1;
+                }
+            }
+            Ok(())
+        })();
+        self.udp_rx_buffer = buffer;
+        result
+    }
+
+    fn handle_udp_errors(&mut self, id: FlowId) -> Result<(), Error> {
+        let Some(fd) = self
+            .udp_sockets
+            .get(&id)
+            .map(|entry| entry.socket.as_raw_fd())
+        else {
+            return Ok(());
+        };
+        loop {
+            let error = match yayatht_sys::socket::receive_udp_error(fd) {
+                Ok(Some(error)) => error,
+                Ok(None) => break,
+                Err(error) => {
+                    debug!(%error, "invalid UDP error-queue message");
+                    self.close_udp_flow(id)?;
+                    break;
+                }
+            };
+            self.metrics.udp_socket_errors += 1;
+            let Some(flow) = self.udp_engine.flow(id) else {
+                break;
+            };
+            let family_matches = matches!(
+                (flow.key.source, error.family),
+                (SocketAddr::V4(_), yayatht_sys::socket::UdpErrorFamily::Ipv4)
+                    | (SocketAddr::V6(_), yayatht_sys::socket::UdpErrorFamily::Ipv6)
+            );
+            let origin_matches = match error.family {
+                yayatht_sys::socket::UdpErrorFamily::Ipv4 => error.origin == 2,
+                yayatht_sys::socket::UdpErrorFamily::Ipv6 => error.origin == 3,
+            };
+            if !family_matches || !origin_matches || !error.has_packet_info {
+                self.metrics.udp_unmapped_errors += 1;
+                continue;
+            }
+            let icmp_error = match (error.family, error.kind) {
+                (yayatht_sys::socket::UdpErrorFamily::Ipv4, 3) if error.code == 4 => {
+                    Some(UdpError::PacketTooBig { mtu: error.info })
+                }
+                (yayatht_sys::socket::UdpErrorFamily::Ipv4, 3) => {
+                    Some(UdpError::DestinationUnreachable { code: error.code })
+                }
+                (yayatht_sys::socket::UdpErrorFamily::Ipv6, 2) => {
+                    Some(UdpError::PacketTooBig { mtu: error.info })
+                }
+                (yayatht_sys::socket::UdpErrorFamily::Ipv6, 1) => {
+                    Some(UdpError::DestinationUnreachable { code: error.code })
+                }
+                _ => None,
+            };
+            if let Some(icmp_error) = icmp_error {
+                self.queue_udp_icmp_error(id, icmp_error)?;
+            } else {
+                self.metrics.udp_unmapped_errors += 1;
+            }
+        }
+        Ok(())
     }
 
     /// Appends the query to the resolver stream under its rewritten ID and
@@ -2477,15 +2772,27 @@ impl Reactor {
         gateway: SocketAddr,
         payload: &[u8],
     ) -> Result<(), Error> {
+        if !self.queue_udp_frame(client, gateway, payload)? {
+            self.metrics.dns_reply_drops += 1;
+        }
+        Ok(())
+    }
+
+    fn queue_udp_frame(
+        &mut self,
+        client: SocketAddr,
+        gateway: SocketAddr,
+        payload: &[u8],
+    ) -> Result<bool, Error> {
         let vnet_len = self.vnet_len;
         let ip_header_len = if client.is_ipv4() { 20 } else { 40 };
         let ip_offset = vnet_len + ethernet::ETHERNET_HEADER_LEN;
         let udp_offset = ip_offset + ip_header_len;
         let frame_len = udp_offset + udp::UDP_HEADER_LEN + payload.len();
         // Pool exhaustion is a designed-in state under send-queue pressure,
-        // not a fault. Every timer- and resolver-driven caller propagates
-        // this Result to the run loop, so failing here would kill the whole
-        // reactor. Degrade to a counted drop instead; the DNS client retries.
+        // not a fault. Callers propagate this Result to the run loop, so
+        // failing here would kill the whole reactor. Degrade to a counted
+        // drop and leave retransmission to the datagram client.
         let mut frame = match self.frame_pool.acquire() {
             Some((pool_index, buffer)) => PooledFrame {
                 tier: FrameTier::Mtu,
@@ -2494,8 +2801,7 @@ impl Reactor {
             },
             None => {
                 self.note_frame_pool_exhaustion();
-                self.metrics.dns_reply_drops += 1;
-                return Ok(());
+                return Ok(false);
             }
         };
         if frame_len > frame.buffer.capacity() {
@@ -2560,6 +2866,65 @@ impl Reactor {
             return Err(error.into());
         }
         frame.buffer.set_len(frame_len);
+        self.queue_tap(None, frame, None)?;
+        Ok(true)
+    }
+
+    fn queue_udp_icmp_error(&mut self, id: FlowId, error: UdpError) -> Result<(), Error> {
+        let Some(flow) = self.udp_engine.flow(id) else {
+            return Ok(());
+        };
+        let Some(entry) = self.udp_sockets.get(&id) else {
+            return Ok(());
+        };
+        let payload_prefix = entry.payload_prefix;
+        let payload_prefix_len = entry.payload_prefix_len;
+        let payload_len = entry.payload_len;
+        let mut frame = match self.frame_pool.acquire() {
+            Some((pool_index, buffer)) => PooledFrame {
+                tier: FrameTier::Mtu,
+                pool_index,
+                buffer,
+            },
+            None => {
+                self.note_frame_pool_exhaustion();
+                self.metrics.udp_queue_drops += 1;
+                return Ok(());
+            }
+        };
+        let vnet_len = self.vnet_len;
+        let ip_offset = vnet_len + ethernet::ETHERNET_HEADER_LEN;
+        let result = (|| {
+            let bytes = frame.buffer.writable();
+            bytes[..vnet_len].fill(0);
+            ethernet::write_header(
+                &mut bytes[vnet_len..],
+                self.config.target_mac,
+                self.config.gateway_mac,
+                if flow.key.source.is_ipv4() {
+                    EtherType::Ipv4
+                } else {
+                    EtherType::Ipv6
+                },
+            )?;
+            icmp::write_udp_error(
+                &mut bytes[ip_offset..],
+                flow.key.source,
+                flow.key.target,
+                &payload_prefix[..payload_prefix_len],
+                payload_len,
+                error,
+            )
+        })();
+        let ip_length = match result {
+            Ok(length) => length,
+            Err(error) => {
+                self.release_frame(frame);
+                return Err(error.into());
+            }
+        };
+        frame.buffer.set_len(ip_offset + ip_length);
+        self.metrics.udp_icmp_errors += 1;
         self.queue_tap(None, frame, None)
     }
 
@@ -3203,6 +3568,41 @@ impl Reactor {
         self.flows.get_mut(id).expect("flow exists").flow.close();
         self.flows.defer_remove(id);
         Ok(())
+    }
+
+    fn close_udp_flow(&mut self, id: FlowId) -> Result<(), Error> {
+        let associations_before = self.udp_engine.active_associations();
+        if !self.udp_engine.remove(id) {
+            return Ok(());
+        }
+        let associations_after = self.udp_engine.active_associations();
+        self.metrics.udp_associations_closed +=
+            associations_before.saturating_sub(associations_after) as u64;
+        self.drop_udp_socket(id)?;
+        self.refresh_udp_metrics();
+        Ok(())
+    }
+
+    fn drop_udp_socket(&mut self, id: FlowId) -> Result<(), Error> {
+        let Some(entry) = self.udp_sockets.remove(&id) else {
+            return Ok(());
+        };
+        self.epoll.delete(entry.socket.as_raw_fd())?;
+        self.metrics.udp_closed += 1;
+        Ok(())
+    }
+
+    fn refresh_udp_metrics(&mut self) {
+        self.metrics.active_udp_flows = self.udp_engine.active_flows() as u64;
+        self.metrics.peak_udp_flows = self
+            .metrics
+            .peak_udp_flows
+            .max(self.metrics.active_udp_flows);
+        self.metrics.active_udp_associations = self.udp_engine.active_associations() as u64;
+        self.metrics.peak_udp_associations = self
+            .metrics
+            .peak_udp_associations
+            .max(self.metrics.active_udp_associations);
     }
 
     fn cleanup_closed(&mut self) -> Result<(), Error> {

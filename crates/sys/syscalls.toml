@@ -52,6 +52,7 @@ timerfd_create = "Create the shared timer source"
 timerfd_settime = "Arm the shared timer source"
 
 [role.data_plane.network]
+bind = "Bind per-flow UDP sockets before connect"
 connect = "Connect TCP flow and resolver sockets"
 getpeername = "Inspect proxy control peers"
 getsockname = "Inspect assigned local addresses"

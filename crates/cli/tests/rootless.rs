@@ -22,6 +22,46 @@ fn unique_name(label: &str) -> String {
     format!("test-{label}-{}", std::process::id())
 }
 
+#[test]
+#[ignore = "executed inside the target namespace by UDP integration cases"]
+fn udp_client_process() {
+    let mode = std::env::var("YAYATHT_TEST_UDP_CLIENT").expect("UDP client mode");
+    let target = std::env::var("YAYATHT_TEST_UDP_TARGET")
+        .expect("UDP client target")
+        .parse::<SocketAddr>()
+        .expect("numeric UDP client target");
+    let payload = std::env::var("YAYATHT_TEST_UDP_PAYLOAD")
+        .unwrap_or_else(|_| "yayatht-udp-test".to_owned())
+        .into_bytes();
+    let bind = if target.is_ipv4() {
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0)
+    } else {
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0)
+    };
+    let socket = std::net::UdpSocket::bind(bind).expect("bind namespace UDP socket");
+    socket
+        .connect(target)
+        .expect("connect namespace UDP socket");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    socket.send(&payload).expect("send namespace UDP datagram");
+    match mode.as_str() {
+        "echo" => {
+            let mut reply = vec![0u8; payload.len() + 1];
+            let length = socket.recv(&mut reply).expect("receive namespace UDP echo");
+            assert_eq!(&reply[..length], payload);
+        }
+        "refused" => {
+            let mut reply = [0u8; 1];
+            let error = socket.recv(&mut reply).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::ConnectionRefused);
+        }
+        "send-only" => thread::sleep(Duration::from_millis(200)),
+        other => panic!("unknown UDP client mode {other:?}"),
+    }
+}
+
 fn status_json(name: &str) -> serde_json::Value {
     let output = Command::new(env!("CARGO_BIN_EXE_yayatht"))
         .args(["status", "--name", name, "--json"])
@@ -139,6 +179,75 @@ fn echo_payload_case(
             .exists()
     );
     stderr
+}
+
+fn udp_echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str) {
+    if !supported() {
+        eprintln!("skipping rootless TAP test: user namespaces or /dev/net/tun unavailable");
+        return;
+    }
+    let socket = std::net::UdpSocket::bind(bind).expect("bind UDP echo server");
+    socket
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let endpoint = if bind.is_ipv4() {
+        format!("{gateway}:{port}")
+    } else {
+        format!("[{gateway}]:{port}")
+    };
+    let payload = format!("yayatht-udp-{label}\n").into_bytes();
+    let expected = payload.clone();
+    let server = thread::spawn(move || {
+        let mut received = [0u8; 2048];
+        let (length, peer) = socket.recv_from(&mut received).expect("receive UDP echo");
+        assert_eq!(&received[..length], expected);
+        socket
+            .send_to(&received[..length], peer)
+            .expect("send UDP echo");
+    });
+    let name = unique_name(label);
+    let test_binary = std::env::current_exe().expect("integration test executable");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
+    command
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            family_flag,
+            "--dns",
+            "off",
+            "--name",
+            &name,
+            "--",
+        ])
+        .arg(test_binary)
+        .args(["--ignored", "--exact", "udp_client_process", "--quiet"])
+        .env("YAYATHT_TEST_UDP_CLIENT", "echo")
+        .env("YAYATHT_TEST_UDP_TARGET", endpoint)
+        .env(
+            "YAYATHT_TEST_UDP_PAYLOAD",
+            String::from_utf8(payload).unwrap(),
+        )
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().expect("spawn UDP echo client");
+    let status = child
+        .wait_timeout(Duration::from_secs(8))
+        .expect("wait for UDP echo")
+        .unwrap_or_else(|| {
+            child.kill().unwrap();
+            panic!("UDP echo timed out")
+        });
+    let mut stderr = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    assert!(status.success(), "UDP echo failed: {stderr}");
+    server.join().unwrap();
 }
 
 fn proxy_client_case(proxy_args: &[String], label: &str, payload: &[u8]) {
@@ -1219,6 +1328,102 @@ fn sandbox_on_by_default_runs_busybox_echo() {
         "192.0.2.1",
         "--no-ipv6",
         "sandbox-default",
+    );
+}
+
+#[test]
+fn direct_udp_echo_round_trips() {
+    udp_echo_case(
+        SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+        "192.0.2.1",
+        "--no-ipv6",
+        "udp4-echo",
+    );
+}
+
+#[test]
+fn ipv6_direct_udp_echo_round_trips() {
+    udp_echo_case(
+        SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 0),
+        "fd79:6179:6174:6874::1",
+        "--no-ipv4",
+        "udp6-echo",
+    );
+}
+
+#[test]
+fn udp_off_drops_namespace_datagrams() {
+    if !supported() {
+        return;
+    }
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let port = socket.local_addr().unwrap().port();
+    let name = unique_name("udp-off-drop");
+    let test_binary = std::env::current_exe().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
+    command
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--udp",
+            "off",
+            "--dns",
+            "off",
+            "--name",
+            &name,
+            "--",
+        ])
+        .arg(test_binary)
+        .args(["--ignored", "--exact", "udp_client_process", "--quiet"])
+        .env("YAYATHT_TEST_UDP_CLIENT", "send-only")
+        .env("YAYATHT_TEST_UDP_TARGET", format!("192.0.2.1:{port}"));
+    let output = command.output().expect("run UDP-off client");
+    assert!(output.status.success());
+    let mut received = [0u8; 32];
+    let error = socket.recv_from(&mut received).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+}
+
+#[test]
+fn udp_port_unreachable_synthesizes_icmpv4() {
+    if !supported() {
+        return;
+    }
+    let socket = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = socket.local_addr().unwrap().port();
+    drop(socket);
+    let name = unique_name("udp4-unreachable");
+    let test_binary = std::env::current_exe().unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_yayatht"));
+    command
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--dns",
+            "off",
+            "--name",
+            &name,
+            "--",
+        ])
+        .arg(test_binary)
+        .args(["--ignored", "--exact", "udp_client_process", "--quiet"])
+        .env("YAYATHT_TEST_UDP_CLIENT", "refused")
+        .env("YAYATHT_TEST_UDP_TARGET", format!("192.0.2.1:{port}"));
+    let output = command.output().expect("run closed-port UDP client");
+    assert!(
+        output.status.success(),
+        "namespace did not receive ICMP Port Unreachable: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
 

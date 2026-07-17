@@ -435,6 +435,25 @@ pub fn recv(fd: RawFd, out: &mut [u8]) -> io::Result<usize> {
     Ok(count as usize)
 }
 
+/// Receives one datagram and returns its original length. Linux reports a
+/// length larger than `out` with MSG_TRUNC, allowing callers to drop the
+/// incomplete datagram without mistaking it for a valid shorter payload.
+pub fn recv_datagram(fd: RawFd, out: &mut [u8]) -> io::Result<usize> {
+    // SAFETY: out is writable for the duration of recv.
+    let count = unsafe {
+        libc::recv(
+            fd,
+            out.as_mut_ptr().cast(),
+            out.len(),
+            libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+        )
+    };
+    if count == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(count as usize)
+}
+
 pub fn peek(fd: RawFd, out: &mut [u8]) -> io::Result<usize> {
     // SAFETY: out is writable for the duration of recv.
     let count = unsafe {
@@ -613,10 +632,27 @@ mod tests {
         let (length, peer) = server.recv_from(&mut received).unwrap();
         assert_eq!(&received[..length], b"ping");
         server.send_to(b"pong", peer).unwrap();
+        let mut replied = false;
         for _ in 0..1000 {
             match recv(socket.as_raw_fd(), &mut received) {
                 Ok(length) => {
                     assert_eq!(&received[..length], b"pong");
+                    replied = true;
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("UDP receive failed: {error}"),
+            }
+        }
+        assert!(replied, "UDP response did not arrive");
+        server.send_to(&[0xa5; 32], peer).unwrap();
+        let mut short = [0u8; 4];
+        for _ in 0..1000 {
+            match recv_datagram(socket.as_raw_fd(), &mut short) {
+                Ok(length) => {
+                    assert_eq!(length, 32);
                     return;
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
@@ -625,7 +661,7 @@ mod tests {
                 Err(error) => panic!("UDP receive failed: {error}"),
             }
         }
-        panic!("UDP response did not arrive");
+        panic!("truncated UDP response did not arrive");
     }
 
     #[test]

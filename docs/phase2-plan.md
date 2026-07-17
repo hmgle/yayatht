@@ -166,7 +166,11 @@ namespace; limits refuse and count; DNS regression stays green.
 `ipv6_direct_udp_echo_round_trips`,
 `udp_port_unreachable_synthesizes_icmpv4`,
 `udp_off_drops_namespace_datagrams`.
-**Status**: Not Started
+**Status**: Complete (2026-07-18). Direct UDP uses one bind+connected socket
+per logical five-tuple, with source-endpoint association accounting, bounded
+receive/truncation handling, error-queue attribution, and synthesized ICMP.
+The serial suite carries 47 active rootless tests plus one ignored in-namespace
+UDP client helper; SOCKS5 and HTTP UDP policy remain Stage 3 work.
 
 ### Stage 3: SOCKS5 UDP ASSOCIATE
 

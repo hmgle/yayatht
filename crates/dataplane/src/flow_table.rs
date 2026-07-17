@@ -21,6 +21,7 @@ pub enum Resource {
     Timer = 3,
     Control = 4,
     DnsUpstream = 5,
+    UdpSocket = 6,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -63,6 +64,7 @@ impl EpollToken {
             3 => Resource::Timer,
             4 => Resource::Control,
             5 => Resource::DnsUpstream,
+            6 => Resource::UdpSocket,
             _ => return None,
         };
         let generation = (self.0 >> GENERATION_SHIFT) as u32;
@@ -205,5 +207,7 @@ mod tests {
             token.decode(),
             Some((Some(id), Resource::UpstreamSocket, true))
         );
+        let udp = EpollToken::flow(id, Resource::UdpSocket, true).unwrap();
+        assert_eq!(udp.decode(), Some((Some(id), Resource::UdpSocket, true)));
     }
 }
