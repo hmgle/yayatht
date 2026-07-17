@@ -77,6 +77,176 @@ pub fn connect_nonblocking(
     }
 }
 
+pub fn connect_udp(
+    address: SocketAddr,
+    receive_buffer_bytes: usize,
+    send_buffer_bytes: usize,
+) -> io::Result<OwnedFd> {
+    let family = if address.is_ipv4() {
+        libc::AF_INET
+    } else {
+        libc::AF_INET6
+    };
+    // SAFETY: socket arguments create a standard nonblocking UDP socket.
+    let raw = unsafe {
+        libc::socket(
+            family,
+            libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC,
+            libc::IPPROTO_UDP,
+        )
+    };
+    if raw == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw is a newly owned descriptor.
+    let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+    set_buffer_quota(fd.as_raw_fd(), libc::SO_RCVBUF, receive_buffer_bytes)?;
+    set_buffer_quota(fd.as_raw_fd(), libc::SO_SNDBUF, send_buffer_bytes)?;
+    enable_udp_errors(fd.as_raw_fd(), address.is_ipv4())?;
+    let bind_address = if address.is_ipv4() {
+        SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0))
+    } else {
+        SocketAddr::from((Ipv6Addr::UNSPECIFIED, 0))
+    };
+    let (storage, length) = socket_address(bind_address);
+    // SAFETY: storage contains the matching unspecified sockaddr variant.
+    if unsafe { libc::bind(fd.as_raw_fd(), std::ptr::from_ref(&storage).cast(), length) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let (storage, length) = socket_address(address);
+    // SAFETY: storage contains the sockaddr variant matching the socket.
+    if unsafe { libc::connect(fd.as_raw_fd(), std::ptr::from_ref(&storage).cast(), length) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fd)
+}
+
+fn enable_udp_errors(fd: RawFd, ipv4: bool) -> io::Result<()> {
+    let enabled = 1i32;
+    let options = if ipv4 {
+        [
+            (libc::IPPROTO_IP, libc::IP_RECVERR),
+            (libc::IPPROTO_IP, libc::IP_PKTINFO),
+        ]
+    } else {
+        [
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVERR),
+            (libc::IPPROTO_IPV6, libc::IPV6_RECVPKTINFO),
+        ]
+    };
+    for (level, option) in options {
+        // SAFETY: enabled points to a valid c_int socket option value.
+        if unsafe {
+            libc::setsockopt(
+                fd,
+                level,
+                option,
+                std::ptr::from_ref(&enabled).cast(),
+                size_of::<i32>() as libc::socklen_t,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UdpErrorFamily {
+    Ipv4,
+    Ipv6,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct UdpSocketError {
+    pub family: UdpErrorFamily,
+    pub errno: i32,
+    pub origin: u8,
+    pub kind: u8,
+    pub code: u8,
+    pub info: u32,
+    pub has_packet_info: bool,
+}
+
+pub fn receive_udp_error(fd: RawFd) -> io::Result<Option<UdpSocketError>> {
+    let mut payload = [0u8; 8];
+    let mut control = [0u8; 512];
+    // SAFETY: zeroed sockaddr_storage is valid writable recvmsg storage.
+    let mut name = unsafe { std::mem::zeroed::<libc::sockaddr_storage>() };
+    let mut iovec = libc::iovec {
+        iov_base: payload.as_mut_ptr().cast(),
+        iov_len: payload.len(),
+    };
+    // SAFETY: zeroed msghdr is valid once all referenced storage is assigned.
+    let mut message = unsafe { std::mem::zeroed::<libc::msghdr>() };
+    message.msg_name = std::ptr::from_mut(&mut name).cast();
+    message.msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    message.msg_iov = std::ptr::from_mut(&mut iovec);
+    message.msg_iovlen = 1;
+    message.msg_control = control.as_mut_ptr().cast();
+    message.msg_controllen = control.len();
+    // SAFETY: message references writable payload, address, and control storage.
+    let received = unsafe {
+        libc::recvmsg(
+            fd,
+            std::ptr::from_mut(&mut message),
+            libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT,
+        )
+    };
+    if received == -1 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    let mut extended = None;
+    let mut packet_info = false;
+    // SAFETY: recvmsg initialized the control region it reports.
+    let mut cursor = unsafe { libc::CMSG_FIRSTHDR(&message) };
+    while !cursor.is_null() {
+        // SAFETY: cursor points to a cmsghdr inside message control storage.
+        let header = unsafe { &*cursor };
+        let family = match (header.cmsg_level, header.cmsg_type) {
+            (libc::SOL_IP, libc::IP_RECVERR) => Some(UdpErrorFamily::Ipv4),
+            (libc::SOL_IPV6, libc::IPV6_RECVERR) => Some(UdpErrorFamily::Ipv6),
+            (libc::SOL_IP, libc::IP_PKTINFO) | (libc::SOL_IPV6, libc::IPV6_PKTINFO) => {
+                packet_info = true;
+                None
+            }
+            _ => None,
+        };
+        if let Some(family) = family
+            && header.cmsg_len
+                >= unsafe { libc::CMSG_LEN(size_of::<libc::sock_extended_err>() as u32) } as usize
+        {
+            // SAFETY: cmsg_len covers a complete sock_extended_err payload.
+            let error = unsafe {
+                std::ptr::read_unaligned(libc::CMSG_DATA(cursor).cast::<libc::sock_extended_err>())
+            };
+            extended = Some((family, error));
+        }
+        // SAFETY: message and cursor remain valid for CMSG_NXTHDR.
+        cursor = unsafe { libc::CMSG_NXTHDR(&message, cursor) };
+    }
+    let Some((family, error)) = extended else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UDP error queue message lacks sock_extended_err",
+        ));
+    };
+    Ok(Some(UdpSocketError {
+        family,
+        errno: error.ee_errno as i32,
+        origin: error.ee_origin,
+        kind: error.ee_type,
+        code: error.ee_code,
+        info: error.ee_info,
+        has_packet_info: packet_info,
+    }))
+}
+
 /// Zero-timeout probe for an in-flight nonblocking connect: true once the
 /// socket is writable or carries a pending error. A loopback handshake
 /// usually completes inside the kernel before the caller returns to its
@@ -418,7 +588,7 @@ pub fn shutdown_write(fd: RawFd) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use std::net::{Ipv4Addr, TcpListener, TcpStream, UdpSocket};
 
     #[test]
     fn local_address_matches_connected_socket() {
@@ -428,6 +598,34 @@ mod tests {
             local_address(stream.as_raw_fd()).unwrap(),
             stream.local_addr().unwrap()
         );
+    }
+
+    #[test]
+    fn connected_udp_socket_round_trips_datagrams() {
+        let server = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(1)))
+            .unwrap();
+        let socket = connect_udp(server.local_addr().unwrap(), 64 << 10, 64 << 10).unwrap();
+        assert_ne!(local_address(socket.as_raw_fd()).unwrap().port(), 0);
+        assert_eq!(send(socket.as_raw_fd(), b"ping").unwrap(), 4);
+        let mut received = [0u8; 16];
+        let (length, peer) = server.recv_from(&mut received).unwrap();
+        assert_eq!(&received[..length], b"ping");
+        server.send_to(b"pong", peer).unwrap();
+        for _ in 0..1000 {
+            match recv(socket.as_raw_fd(), &mut received) {
+                Ok(length) => {
+                    assert_eq!(&received[..length], b"pong");
+                    return;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("UDP receive failed: {error}"),
+            }
+        }
+        panic!("UDP response did not arrive");
     }
 
     #[test]
