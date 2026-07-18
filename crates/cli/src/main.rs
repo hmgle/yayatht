@@ -93,7 +93,7 @@ struct RunArgs {
         value_parser = clap::builder::PossibleValuesParser::new(["on", "off"]),
         default_value = "on",
         value_name = "on|off",
-        help = "Apply the data-plane seccomp and filesystem sandbox"
+        help = "Apply role seccomp and the data-plane filesystem sandbox"
     )]
     sandbox: String,
     #[arg(long, default_value_t = 64 * 1024 * 1024)]

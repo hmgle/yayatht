@@ -1,7 +1,8 @@
 use std::fs::{self, OpenOptions};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, TcpListener};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
@@ -1804,7 +1805,7 @@ fn sandbox_off_runs_busybox_echo() {
         b"sandbox-off\n".to_vec(),
         &[],
     );
-    assert!(stderr.contains("data-plane sandbox disabled"));
+    assert!(stderr.contains("sandbox disabled: role seccomp"));
 }
 
 #[test]
@@ -1826,6 +1827,79 @@ fn forbidden_syscall_kills_the_data_plane() {
             .join(name)
             .exists()
     );
+}
+
+#[test]
+fn forbidden_syscall_kills_namespace_init() {
+    if !supported() {
+        return;
+    }
+    let name = unique_name("namespace-seccomp");
+    let status = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args(["run", "--direct", "--name", &name, "--", "/bin/sleep", "30"])
+        .env("YAYATHT_TEST_FAIL_AT", "ns_forbidden_syscall")
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(125));
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR").unwrap();
+    assert!(
+        !std::path::Path::new(&runtime)
+            .join("yayatht")
+            .join(name)
+            .exists()
+    );
+}
+
+#[test]
+fn forbidden_syscall_kills_supervisor() {
+    if !supported() {
+        return;
+    }
+    let root = std::env::temp_dir().join(unique_name("supervisor-seccomp-root"));
+    fs::create_dir(&root).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    let name = unique_name("supervisor-seccomp");
+    let status = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--direct",
+            "--runtime-dir",
+            root.to_str().unwrap(),
+            "--name",
+            &name,
+            "--",
+            "/bin/sleep",
+            "30",
+        ])
+        .env("YAYATHT_TEST_FAIL_AT", "supervisor_forbidden_syscall")
+        .status()
+        .unwrap();
+    assert_eq!(status.signal(), Some(libc::SIGSYS));
+
+    let metadata = fs::read(root.join(&name).join("instance.json")).unwrap();
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata).unwrap();
+    let mut pids = metadata["dataplane_worker_pids"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|pid| pid.as_i64().unwrap())
+        .collect::<Vec<_>>();
+    pids.push(metadata["namespace_init_pid"].as_i64().unwrap());
+    for _ in 0..100 {
+        if pids
+            .iter()
+            .all(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists())
+        {
+            break;
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        pids.iter()
+            .all(|pid| !std::path::Path::new(&format!("/proc/{pid}")).exists()),
+        "sandboxed descendants survived supervisor death: {pids:?}"
+    );
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

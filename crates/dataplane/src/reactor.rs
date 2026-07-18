@@ -200,7 +200,11 @@ pub struct Metrics {
     pub peak_socket_receive_buffer_bytes: u64,
     pub socket_send_buffer_bytes: u64,
     pub peak_socket_send_buffer_bytes: u64,
+    /// Configured TCP socket-buffer ceiling (legacy field retained for API
+    /// compatibility).
     pub max_socket_buffer_bytes: u64,
+    pub max_udp_socket_buffer_bytes: u64,
+    pub max_total_socket_buffer_bytes: u64,
     pub flow_fd_limit: u64,
 }
 
@@ -558,6 +562,40 @@ impl Reactor {
         let worker_pool_bytes = TAP_FRAME_POOL_BYTES / config.worker_count;
         let frame_pool_frames =
             (worker_pool_bytes / frame_capacity).clamp(1, TAP_FRAME_POOL_MAX_FRAMES);
+        let max_tcp_socket_buffer_bytes = u64::try_from(max_tcp_flows)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(
+                u64::try_from(
+                    config
+                        .tcp_receive_buffer_bytes
+                        .saturating_add(config.tcp_send_buffer_bytes),
+                )
+                .unwrap_or(u64::MAX),
+            );
+        let udp_socket_buffer_bytes = u64::try_from(UDP_SOCKET_BUFFER_BYTES)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(2);
+        let udp_socket_count = match &config.upstream {
+            Upstream::Direct { .. } => config.max_udp_flows,
+            Upstream::Proxy {
+                protocol: Protocol::Socks5,
+                ..
+            } => config.max_udp_associations.saturating_mul(2),
+            Upstream::Proxy {
+                protocol: Protocol::HttpConnect,
+                ..
+            } => 0,
+        };
+        let max_udp_socket_buffer_bytes = u64::try_from(udp_socket_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(udp_socket_buffer_bytes);
+        let max_dns_socket_buffer_bytes = if config.dns_proxy_tcp && config.dns_upstream.is_some() {
+            u64::try_from(DNS_SOCKET_BUFFER_BYTES)
+                .unwrap_or(u64::MAX)
+                .saturating_mul(2)
+        } else {
+            0
+        };
         let metrics = Metrics {
             max_pending_tcp_bytes: config.max_pending_tcp_bytes as u64,
             max_retained_tcp_bytes: config.max_retained_tcp_bytes as u64,
@@ -571,16 +609,11 @@ impl Reactor {
             tap_frame_capacity: frame_capacity as u64,
             tap_frame_pool_frames: frame_pool_frames as u64,
             tap_frame_pool_bytes: frame_pool_frames.saturating_mul(frame_capacity) as u64,
-            max_socket_buffer_bytes: u64::try_from(max_tcp_flows)
-                .unwrap_or(u64::MAX)
-                .saturating_mul(
-                    u64::try_from(
-                        config
-                            .tcp_receive_buffer_bytes
-                            .saturating_add(config.tcp_send_buffer_bytes),
-                    )
-                    .unwrap_or(u64::MAX),
-                ),
+            max_socket_buffer_bytes: max_tcp_socket_buffer_bytes,
+            max_udp_socket_buffer_bytes,
+            max_total_socket_buffer_bytes: max_tcp_socket_buffer_bytes
+                .saturating_add(max_udp_socket_buffer_bytes)
+                .saturating_add(max_dns_socket_buffer_bytes),
             ..Metrics::default()
         };
         // Received frames may be GRO/TSO super-frames up to the 16-bit IP
@@ -4643,5 +4676,16 @@ mod tests {
         assert_eq!(reactor.metrics.dns_reply_drops, 1);
         assert_eq!(reactor.metrics.frame_pool_exhaustions, 1);
         assert_eq!(reactor.metrics.tap_tx_packets, 0);
+    }
+
+    #[test]
+    fn socket_buffer_budget_includes_direct_udp_and_dns() {
+        let reactor = test_reactor();
+        assert_eq!(reactor.metrics.max_socket_buffer_bytes, 8 * 128 * 1024);
+        assert_eq!(reactor.metrics.max_udp_socket_buffer_bytes, 16 * 128 * 1024);
+        assert_eq!(
+            reactor.metrics.max_total_socket_buffer_bytes,
+            (8 + 16 + 1) * 128 * 1024
+        );
     }
 }

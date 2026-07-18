@@ -33,7 +33,7 @@ The custom adapter is viable for continued Phase 1 work, but the Phase 0
 implementation intentionally permits only one unacknowledged segment toward
 the namespace at a time. Before calling it a proxy MVP, Phase 1 must add a
 windowed segment scheduler, broader loss/zero-window tests, handshake pending
-queues and 24-hour stress coverage. The smoltcp fallback remains available if
+queues and 1-hour stress coverage. The smoltcp fallback remains available if
 those correctness gates fail.
 
 ## Not Yet Implemented

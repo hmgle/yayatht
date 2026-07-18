@@ -18,7 +18,8 @@ silently dropped:
 - **Data-plane sandbox** (design §5.3): generated seccomp profiles, a pivoted
   data-plane filesystem, and `RLIMIT_CORE=0`. Today the data plane only drops
   capabilities, sets `NO_NEW_PRIVS`, and caps `RLIMIT_NOFILE`.
-- **24-hour soak** and the **DNS no-leak capture oracle** (design §12/§14).
+- **1-hour soak** and the **DNS no-leak capture oracle** (design §12/§14;
+  duration revised from 24 hours on 2026-07-18).
 - Quality items: real-mihomo 128-flow fairness attribution and the 2 GiB
   worst-case socket-buffer budget review.
 
@@ -193,9 +194,9 @@ TCP flows or other associations.
 **Status**: Complete for numeric relay addresses (2026-07-18). The mock uses
 separate control/relay sockets and covers unspecified-BND fallback, EIM,
 control-EOF jittered rebuild, HTTP rejection, and TCP-flow isolation. Domain
-BND values are parsed without blocking but remain in bounded rebuild until
-Stage 4 provides the association DNS path. The suite carries 52 active
-rootless tests plus one ignored in-namespace helper.
+BND values are parsed without blocking but remain in bounded rebuild; an
+asynchronous pre-relay resolution path remains an exit-audit limitation. The
+suite carries 52 active rootless tests plus one ignored in-namespace helper.
 
 ### Stage 4: DNS proxy-udp and IPv6 parity
 
@@ -242,7 +243,15 @@ notes; `docs/phase2-exit-audit.md` with a GO/partial verdict.
 **Success Criteria**: honest exit audit with evidence; remaining risks
 named.
 **Tests**: role-profile negative tests; soak/oracle runs documented.
-**Status**: Not Started
+**Status**: Complete with a PARTIAL GO verdict (2026-07-18). Supervisor and
+ns-init default-kill profiles are enforced and covered by role negative tests.
+The revised 1-hour four-worker mixed soak completed 34,894 TCP/UDP/DNS
+iterations with RSS stable after three minutes and fd use bounded by timeout
+working sets. The resolver-socket no-leak oracle passed both proxy modes;
+all-interface pcap remains unavailable on this host. Memory and real-mihomo
+results are recorded in `docs/phase2-exit-audit.md`, with domain BND,
+capture-capable CI, and external dual-stack/fairness attribution named as
+remaining risks.
 
 ## Verification
 

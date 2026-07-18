@@ -3,11 +3,12 @@
 `yayatht` runs a command in private Linux user, network, mount, IPC, UTS and
 PID namespaces and adapts traffic from a TAP device to host sockets.
 
-The current `0.1.0` tree completes the Phase 1 functional surface and is
-entering Phase 2 (`docs/phase2-plan.md`). IPv4 and IPv6 TCP can use an
-explicit direct route, SOCKS5 CONNECT, or HTTP CONNECT. SOCKS5 supports
-no-auth and RFC 1929 username/password authentication; HTTP CONNECT supports
-Basic authentication. DNS is proxied by default (`proxy-tcp`): the namespace
+The current `0.1.0` tree completes the Phase 2 functional surface described
+in `docs/phase2-plan.md`; the exit audit records a PARTIAL GO with explicit
+interoperability and capture gaps. IPv4 and IPv6 TCP can use an explicit
+direct route, SOCKS5 CONNECT, or HTTP CONNECT. SOCKS5 supports no-auth and
+RFC 1929 username/password authentication; HTTP CONNECT supports Basic
+authentication. DNS is proxied by default (`proxy-tcp`): the namespace
 resolver points at the virtual gateway and queries are carried as
 DNS-over-TCP through the configured upstream. IPv4 and IPv6 UDP forwarding
 is enabled for direct routes, including host-loopback mapping, and SOCKS5
@@ -17,8 +18,9 @@ also carry gateway DNS over the association with `--dns proxy-udp`; the
 default remains `proxy-tcp`. `--workers COUNT` enables one share-nothing
 reactor per TAP queue; it defaults to 1, while 4 workers are calibrated for
 multi-flow workloads. The data-plane sandbox is enabled by default: it uses
-a generated seccomp allowlist, pivots to an empty tmpfs, and disables core
-dumps. `--sandbox off` is available for diagnosis and emits a warning.
+generated role-specific seccomp allowlists; the data plane additionally
+pivots to an empty tmpfs and disables core dumps. `--sandbox off` is
+available for diagnosis and emits a warning.
 
 ## Build
 
@@ -64,3 +66,8 @@ The default filesystem mode is network isolation only. The command can still
 access files available to the invoking user and must not be treated as an
 untrusted filesystem sandbox. The empty filesystem described above belongs
 only to the separate data-plane process, not to the target command.
+
+Phase 2 verification and remaining risks are summarized in
+`docs/phase2-exit-audit.md`. The reproducible 1-hour soak and DNS no-leak
+socket oracle are `scripts/soak_phase2.py` and
+`scripts/dns_no_leak_oracle.py`.

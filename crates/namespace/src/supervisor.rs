@@ -49,6 +49,9 @@ struct DataPlaneWorker {
 impl Supervisor {
     pub fn run(mut config: LaunchConfig) -> Result<ExitStatus, Error> {
         config.validate()?;
+        let forbidden_syscall_failpoint = cfg!(debug_assertions)
+            && std::env::var_os("YAYATHT_TEST_FAIL_AT")
+                .is_some_and(|value| value == "supervisor_forbidden_syscall");
         let dataplane_fd_limit = (0..config.workers)
             .map(|worker_index| {
                 let worker = config.dataplane(worker_index);
@@ -89,7 +92,7 @@ impl Supervisor {
         let sandbox = config.sandbox;
         if !sandbox.enabled() {
             warn!(
-                "data-plane sandbox disabled: seccomp, filesystem isolation, and core-dump clamp are off"
+                "sandbox disabled: role seccomp, data-plane filesystem isolation, and core-dump clamp are off"
             );
         }
         let mut workers = Vec::with_capacity(config.workers);
@@ -200,6 +203,14 @@ impl Supervisor {
         yayatht_sys::set_nonblocking(ns_parent.as_raw_fd(), true)?;
         for worker in &workers {
             yayatht_sys::set_nonblocking(worker.control.as_raw_fd(), true)?;
+        }
+        if sandbox.enabled() {
+            yayatht_sys::caps::set_no_new_privs()?;
+            yayatht_sys::seccomp::install(yayatht_sys::seccomp::Profile::Supervisor)?;
+        }
+        if forbidden_syscall_failpoint {
+            let _ = rustix::process::getpid();
+            return Err(io::Error::other("forbidden syscall was not blocked").into());
         }
         let exit_code = supervise_running(
             &mut instance,
@@ -333,6 +344,9 @@ fn namespace_child_inner(
     config: &LaunchConfig,
     resolv_conf: Option<&Path>,
 ) -> io::Result<i32> {
+    let forbidden_syscall_failpoint = cfg!(debug_assertions)
+        && std::env::var_os("YAYATHT_TEST_FAIL_AT")
+            .is_some_and(|value| value == "ns_forbidden_syscall");
     yayatht_sys::caps::set_parent_death_signal(libc::SIGKILL)?;
     control::expect(control_fd.as_raw_fd(), Kind::MapsReady)?;
     yayatht_sys::mount::mount_private_proc()?;
@@ -386,14 +400,6 @@ fn namespace_child_inner(
             })
         })
         .collect::<io::Result<Vec<_>>>()?;
-    let target_pid = yayatht_sys::process::fork_exec(&command)?;
-    control::send(
-        control_fd.as_raw_fd(),
-        Kind::Status,
-        2,
-        &target_pid.to_le_bytes(),
-    )?;
-    yayatht_sys::set_nonblocking(control_fd.as_raw_fd(), true)?;
     let signals = yayatht_sys::signal::SignalFd::block(&[
         libc::SIGINT,
         libc::SIGTERM,
@@ -401,6 +407,22 @@ fn namespace_child_inner(
         libc::SIGQUIT,
         libc::SIGCHLD,
     ])?;
+    let target_pid = yayatht_sys::process::fork_exec(&command)?;
+    yayatht_sys::set_nonblocking(control_fd.as_raw_fd(), true)?;
+    if config.sandbox.enabled() {
+        yayatht_sys::caps::set_no_new_privs()?;
+        yayatht_sys::seccomp::install(yayatht_sys::seccomp::Profile::NamespaceInit)?;
+    }
+    control::send(
+        control_fd.as_raw_fd(),
+        Kind::Status,
+        2,
+        &target_pid.to_le_bytes(),
+    )?;
+    if forbidden_syscall_failpoint {
+        let _ = rustix::process::getpid();
+        return Err(io::Error::other("forbidden syscall was not blocked"));
+    }
     let mut main_status = None;
     loop {
         while let Some(signal) = signals.read()? {

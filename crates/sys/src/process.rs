@@ -13,14 +13,24 @@ pub fn fork_exec(command: &[CString]) -> io::Result<libc::pid_t> {
     if command.is_empty() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty command"));
     }
+    // SAFETY: getpid has no preconditions. Record the expected parent before
+    // fork so the child can close the race around PR_SET_PDEATHSIG.
+    let parent_pid = unsafe { libc::getpid() };
     // SAFETY: fork is called in the single-threaded namespace init process.
     let pid = unsafe { libc::fork() };
     if pid == -1 {
         return Err(io::Error::last_os_error());
     }
     if pid == 0 {
-        // SAFETY: child initializes an empty mask and its own process group.
+        // SAFETY: child initializes its lifecycle, an empty mask, and its own
+        // process group before replacing the image.
         unsafe {
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) == -1 {
+                libc::_exit(126);
+            }
+            if libc::getppid() != parent_pid {
+                libc::_exit(126);
+            }
             let mut mask: libc::sigset_t = std::mem::zeroed();
             libc::sigemptyset(std::ptr::from_mut(&mut mask));
             libc::pthread_sigmask(

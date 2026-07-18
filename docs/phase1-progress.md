@@ -152,15 +152,13 @@ exists, and the soak/oracle work as Stage 6 quality gates. See
   per the design backlog.
 - Single-flow direct throughput variance needs longer interleaved
   calibration runs before it can gate anything (quality, unscheduled).
-- Isolate real-mihomo 128-flow fairness variance from the shared host TUN
-  path (Phase 2 Stage 6 interop notes).
-- Review the 2 GiB default worst-case socket-buffer budget (Phase 2
-  Stage 6, review-only).
-- DNS integration against packetdrill-style capture assertions and the
-  design §12 no-leak tshark oracle (Phase 2 Stage 6; the functional matrix
-  landed in Phase 1C; `proxy-udp` is Phase 2 Stage 4, `fake-ip` Phase 4).
-- Supervisor/ns-init seccomp profiles remain Phase 2 Stage 6 work. The
-  generated data-plane profile, pivoted empty tmpfs, and `RLIMIT_CORE=0`
-  landed in Phase 2 Stage 1 on 2026-07-17.
-- Final supervisor/ns-init locking and the 24-hour soak test remain Phase 2
-  Stage 6 work.
+- Real-mihomo 128-flow fairness was rerun in Phase 2 Stage 6 and improved to
+  a 0.861 median, but isolated-host attribution remains open.
+- The 2 GiB TCP socket-buffer budget was reviewed in Phase 2 Stage 6; UDP and
+  total ceilings are now exported and a low-memory profile is documented.
+- A deterministic resolver-socket no-leak oracle passed both DNS proxy modes
+  in Phase 2 Stage 6; all-interface pcap remains open because capture tools
+  are unavailable on the host.
+- Supervisor/ns-init generated seccomp profiles and the 1-hour mixed soak
+  completed in Phase 2 Stage 6. The data-plane profile, pivoted empty tmpfs,
+  and `RLIMIT_CORE=0` landed earlier in Phase 2 Stage 1.
