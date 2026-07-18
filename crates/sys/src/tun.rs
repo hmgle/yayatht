@@ -19,7 +19,9 @@ struct IfReq {
     padding: [u8; 22],
 }
 
-/// Creates the namespace-side TAP device. `offload` negotiates
+/// Creates one namespace-side TAP queue. `multi_queue` makes repeated calls
+/// with the same name attach independent queues to one interface. `offload`
+/// negotiates
 /// `IFF_VNET_HDR`, prefixing every read and write on the returned fd with
 /// a `virtio_net_hdr`, and enables checksum plus TCP segmentation
 /// offload: the namespace kernel may then hand over `NEEDS_CSUM` frames
@@ -27,7 +29,7 @@ struct IfReq {
 /// plane. UDP offloads (USO) wait for UDP support. The Linux 6.6
 /// baseline guarantees these feature bits, so a rejected negotiation is
 /// an error rather than a degraded mode.
-pub fn create_tap(name: &str, offload: bool) -> io::Result<OwnedFd> {
+pub fn create_tap(name: &str, offload: bool, multi_queue: bool) -> io::Result<OwnedFd> {
     let name = CString::new(name)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "interface name contains NUL"))?;
     if name.as_bytes().len() >= libc::IFNAMSIZ {
@@ -49,10 +51,7 @@ pub fn create_tap(name: &str, offload: bool) -> io::Result<OwnedFd> {
     }
     // SAFETY: raw was returned by open and ownership is transferred here.
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    let mut flags = libc::IFF_TAP | libc::IFF_NO_PI;
-    if offload {
-        flags |= libc::IFF_VNET_HDR;
-    }
+    let flags = tap_flags(offload, multi_queue);
     let mut request = IfReq {
         name: [0; libc::IFNAMSIZ],
         flags: flags as libc::c_short,
@@ -79,4 +78,29 @@ pub fn create_tap(name: &str, offload: bool) -> io::Result<OwnedFd> {
         }
     }
     Ok(fd)
+}
+
+const fn tap_flags(offload: bool, multi_queue: bool) -> libc::c_int {
+    let mut flags = libc::IFF_TAP | libc::IFF_NO_PI;
+    if offload {
+        flags |= libc::IFF_VNET_HDR;
+    }
+    if multi_queue {
+        flags |= libc::IFF_MULTI_QUEUE;
+    }
+    flags
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tap_flags;
+
+    #[test]
+    fn multiqueue_flag_is_opt_in() {
+        let single = tap_flags(true, false);
+        let multi = tap_flags(true, true);
+        assert_eq!(single & libc::IFF_MULTI_QUEUE, 0);
+        assert_ne!(multi & libc::IFF_MULTI_QUEUE, 0);
+        assert_ne!(multi & libc::IFF_VNET_HDR, 0);
+    }
 }

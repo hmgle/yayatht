@@ -40,15 +40,33 @@ pub enum Error {
 
 pub struct Supervisor;
 
+struct DataPlaneWorker {
+    pid: i32,
+    pidfd: OwnedFd,
+    control: OwnedFd,
+}
+
 impl Supervisor {
     pub fn run(mut config: LaunchConfig) -> Result<ExitStatus, Error> {
         config.validate()?;
-        let dataplane_fd_limit = yayatht_sys::resource::dataplane_nofile_limit(
-            config.max_tcp_flows,
-            config.max_udp_flows,
-            config.max_udp_associations,
-        )?;
-        yayatht_sys::resource::ensure_nofile_capacity(dataplane_fd_limit)?;
+        let dataplane_fd_limit = (0..config.workers)
+            .map(|worker_index| {
+                let worker = config.dataplane(worker_index);
+                yayatht_sys::resource::dataplane_nofile_limit(
+                    worker.max_tcp_flows,
+                    worker.max_udp_flows,
+                    worker.max_udp_associations,
+                )
+            })
+            .collect::<io::Result<Vec<_>>>()?
+            .into_iter()
+            .max()
+            .expect("configuration has at least one worker");
+        let supervisor_fd_limit = u64::try_from(config.workers)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(4)
+            .saturating_add(32);
+        yayatht_sys::resource::ensure_nofile_capacity(dataplane_fd_limit.max(supervisor_fd_limit))?;
         yayatht_sys::caps::set_child_subreaper()?;
         let signal_fd = yayatht_sys::signal::SignalFd::block(&[
             libc::SIGINT,
@@ -61,34 +79,64 @@ impl Supervisor {
             Instance::create(config.name.as_deref(), config.runtime_root.as_deref())?;
         info!(instance = %instance.metadata().instance_id, runtime = %instance.directory.display(), "starting instance");
 
-        let (dp_parent, dp_child) = yayatht_sys::fdpass::seqpacket_pair()?;
         let (ns_parent, ns_child) = yayatht_sys::fdpass::seqpacket_pair()?;
-        let (tap_dp, tap_ns) = yayatht_sys::fdpass::seqpacket_pair()?;
 
         let resolv_conf = if config.dns.mode != DnsMode::Off {
             Some(instance.write_resolv_conf(&gateway_resolv_conf(&config.network))?)
         } else {
             None
         };
-        let dataplane_config = config.dataplane();
         let sandbox = config.sandbox;
         if !sandbox.enabled() {
             warn!(
                 "data-plane sandbox disabled: seccomp, filesystem isolation, and core-dump clamp are off"
             );
         }
-        let (dataplane_pid, dataplane_pidfd) = match clone_namespaced(COMMON_NAMESPACES)? {
-            CloneResult::Child => {
-                drop(signal_fd);
-                drop(dp_parent);
-                drop(ns_parent);
-                drop(ns_child);
-                drop(tap_ns);
-                data_plane_child(dp_child, tap_dp, sandbox, dataplane_config);
+        let mut workers = Vec::with_capacity(config.workers);
+        let mut tap_channels = Vec::with_capacity(config.workers);
+        for worker_index in 0..config.workers {
+            let (dp_parent, dp_child) = match yayatht_sys::fdpass::seqpacket_pair() {
+                Ok(pair) => pair,
+                Err(error) => {
+                    kill_dataplanes(&workers);
+                    return Err(error.into());
+                }
+            };
+            let (tap_dp, tap_ns) = match yayatht_sys::fdpass::seqpacket_pair() {
+                Ok(pair) => pair,
+                Err(error) => {
+                    kill_dataplanes(&workers);
+                    return Err(error.into());
+                }
+            };
+            let dataplane_config = config.dataplane(worker_index);
+            match clone_namespaced(COMMON_NAMESPACES) {
+                Ok(CloneResult::Child) => {
+                    drop(signal_fd);
+                    drop(ns_parent);
+                    drop(ns_child);
+                    drop(dp_parent);
+                    drop(tap_ns);
+                    drop(workers);
+                    drop(tap_channels);
+                    data_plane_child(dp_child, tap_dp, sandbox, dataplane_config);
+                }
+                Ok(CloneResult::Parent { pid, pidfd }) => {
+                    drop(dp_child);
+                    drop(tap_dp);
+                    workers.push(DataPlaneWorker {
+                        pid,
+                        pidfd,
+                        control: dp_parent,
+                    });
+                    tap_channels.push(tap_ns);
+                }
+                Err(error) => {
+                    kill_dataplanes(&workers);
+                    return Err(error.into());
+                }
             }
-            CloneResult::Parent { pid, pidfd } => (pid, pidfd),
-        };
-        drop(dataplane_config);
+        }
         config.clear_proxy_credentials();
 
         let (namespace_pid, namespace_pidfd) =
@@ -96,83 +144,53 @@ impl Supervisor {
                 Ok(CloneResult::Child) => {
                     drop(signal_fd);
                     drop(ns_parent);
-                    drop(dp_parent);
-                    drop(dp_child);
-                    drop(tap_dp);
-                    namespace_child(ns_child, tap_ns, config, resolv_conf);
+                    drop(workers);
+                    namespace_child(ns_child, tap_channels, config, resolv_conf);
                 }
                 Ok(CloneResult::Parent { pid, pidfd }) => (pid, pidfd),
                 Err(error) => {
-                    let _ = yayatht_sys::clone::pidfd_send_signal(
-                        dataplane_pidfd.as_raw_fd(),
-                        libc::SIGKILL,
-                    );
-                    let _ = yayatht_sys::process::wait_pid(dataplane_pid, false);
+                    kill_dataplanes(&workers);
                     return Err(error.into());
                 }
             };
-        let mut child_guard = ChildGuard::new(
-            dataplane_pid,
-            dataplane_pidfd.as_raw_fd(),
-            namespace_pid,
-            namespace_pidfd.as_raw_fd(),
-        );
+        let mut child_guard = ChildGuard::new(&workers, namespace_pid, &namespace_pidfd);
 
-        drop(dp_child);
         drop(ns_child);
-        drop(tap_dp);
-        drop(tap_ns);
+        drop(tap_channels);
 
-        if let Err(error) = write_identity_maps(dataplane_pid) {
-            kill_children(
-                &dataplane_pidfd,
-                &namespace_pidfd,
-                dataplane_pid,
-                namespace_pid,
-            );
-            return Err(error.into());
+        for worker in &workers {
+            if let Err(error) = write_identity_maps(worker.pid) {
+                kill_children(&workers, &namespace_pidfd, namespace_pid);
+                return Err(error.into());
+            }
         }
         if let Err(error) = write_identity_maps(namespace_pid) {
-            kill_children(
-                &dataplane_pidfd,
-                &namespace_pidfd,
-                dataplane_pid,
-                namespace_pid,
-            );
+            kill_children(&workers, &namespace_pidfd, namespace_pid);
             return Err(error.into());
         }
-        control::send(dp_parent.as_raw_fd(), Kind::MapsReady, 1, &[])?;
+        for worker in &workers {
+            control::send(worker.control.as_raw_fd(), Kind::MapsReady, 1, &[])?;
+        }
         control::send(ns_parent.as_raw_fd(), Kind::MapsReady, 1, &[])?;
 
         if let Err(error) = expect_ready(ns_parent.as_raw_fd(), "namespace") {
-            kill_children(
-                &dataplane_pidfd,
-                &namespace_pidfd,
-                dataplane_pid,
-                namespace_pid,
-            );
+            kill_children(&workers, &namespace_pidfd, namespace_pid);
             return Err(error);
         }
-        if let Err(error) = expect_ready(dp_parent.as_raw_fd(), "data plane") {
-            kill_children(
-                &dataplane_pidfd,
-                &namespace_pidfd,
-                dataplane_pid,
-                namespace_pid,
-            );
-            return Err(error);
+        for (worker_index, worker) in workers.iter().enumerate() {
+            if let Err(error) = expect_ready(worker.control.as_raw_fd(), "data plane") {
+                warn!(worker_index, "data-plane worker failed during startup");
+                kill_children(&workers, &namespace_pidfd, namespace_pid);
+                return Err(error);
+            }
         }
 
-        instance.update_children(dataplane_pid, namespace_pid)?;
+        let worker_pids = workers.iter().map(|worker| worker.pid).collect::<Vec<_>>();
+        instance.update_children(&worker_pids, namespace_pid)?;
         control::send(ns_parent.as_raw_fd(), Kind::Exec, 2, &[])?;
         let target_payload = control::expect(ns_parent.as_raw_fd(), Kind::Status)?;
         if target_payload.len() != 4 {
-            kill_children(
-                &dataplane_pidfd,
-                &namespace_pidfd,
-                dataplane_pid,
-                namespace_pid,
-            );
+            kill_children(&workers, &namespace_pidfd, namespace_pid);
             return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid target pid").into());
         }
         let target_pid = i32::from_le_bytes(target_payload.try_into().expect("target pid length"));
@@ -180,16 +198,16 @@ impl Supervisor {
         info!(target_pid, "target command started");
 
         yayatht_sys::set_nonblocking(ns_parent.as_raw_fd(), true)?;
-        yayatht_sys::set_nonblocking(dp_parent.as_raw_fd(), true)?;
+        for worker in &workers {
+            yayatht_sys::set_nonblocking(worker.control.as_raw_fd(), true)?;
+        }
         let exit_code = supervise_running(
             &mut instance,
             &signal_fd,
             &ns_parent,
-            &dp_parent,
+            &workers,
             namespace_pid,
             &namespace_pidfd,
-            dataplane_pid,
-            &dataplane_pidfd,
         )?;
         child_guard.disarm();
         instance.set_state("exited")?;
@@ -286,11 +304,11 @@ fn data_plane_child(
 
 fn namespace_child(
     control_fd: OwnedFd,
-    tap_channel: OwnedFd,
+    tap_channels: Vec<OwnedFd>,
     config: LaunchConfig,
     resolv_conf: Option<PathBuf>,
 ) -> ! {
-    let result = namespace_child_inner(&control_fd, &tap_channel, &config, resolv_conf.as_deref());
+    let result = namespace_child_inner(&control_fd, &tap_channels, &config, resolv_conf.as_deref());
     match result {
         Ok(code) => {
             let _ = control::send(control_fd.as_raw_fd(), Kind::Exit, 3, &code.to_le_bytes());
@@ -311,7 +329,7 @@ fn namespace_child(
 
 fn namespace_child_inner(
     control_fd: &OwnedFd,
-    tap_channel: &OwnedFd,
+    tap_channels: &[OwnedFd],
     config: &LaunchConfig,
     resolv_conf: Option<&Path>,
 ) -> io::Result<i32> {
@@ -322,8 +340,17 @@ fn namespace_child_inner(
         yayatht_sys::mount::bind_resolv_conf(source)?;
     }
     debug_failpoint("ns_tap")?;
-    let tap =
-        yayatht_sys::tun::create_tap(&config.network.interface_name, config.network.tap_offload)?;
+    let multi_queue = tap_channels.len() > 1;
+    let taps = tap_channels
+        .iter()
+        .map(|_| {
+            yayatht_sys::tun::create_tap(
+                &config.network.interface_name,
+                config.network.tap_offload,
+                multi_queue,
+            )
+        })
+        .collect::<io::Result<Vec<_>>>()?;
     yayatht_sys::netlink::configure_namespace(
         &config.network.interface_name,
         config.network.target_mac.octets(),
@@ -340,8 +367,10 @@ fn namespace_child_inner(
             .map(|((address, prefix), gateway)| (address, prefix, gateway)),
     )?;
     let message = yayatht_sys::control::encode(Kind::Ready, 1, &[])?;
-    yayatht_sys::fdpass::send_fd(tap_channel.as_raw_fd(), tap.as_raw_fd(), &message)?;
-    drop(tap);
+    for (channel, tap) in tap_channels.iter().zip(&taps) {
+        yayatht_sys::fdpass::send_fd(channel.as_raw_fd(), tap.as_raw_fd(), &message)?;
+    }
+    drop(taps);
     control::send(control_fd.as_raw_fd(), Kind::Ready, 1, &[])?;
     control::expect(control_fd.as_raw_fd(), Kind::Exec)?;
 
@@ -422,11 +451,9 @@ fn supervise_running(
     instance: &mut Instance,
     signals: &yayatht_sys::signal::SignalFd,
     ns_control: &OwnedFd,
-    dp_control: &OwnedFd,
+    workers: &[DataPlaneWorker],
     namespace_pid: i32,
     namespace_pidfd: &OwnedFd,
-    dataplane_pid: i32,
-    dataplane_pidfd: &OwnedFd,
 ) -> Result<i32, Error> {
     loop {
         while let Some(signal) = signals.read()? {
@@ -434,7 +461,7 @@ fn supervise_running(
                 yayatht_sys::clone::pidfd_send_signal(namespace_pidfd.as_raw_fd(), signal)?;
             }
         }
-        serve_status(instance, dp_control)?;
+        serve_status(instance, workers)?;
         let mut buffer = vec![0u8; yayatht_sys::control::MAX_PAYLOAD + 20];
         match control::receive(ns_control.as_raw_fd(), &mut buffer) {
             Ok(message) if message.kind == Kind::Exit => {
@@ -445,10 +472,9 @@ fn supervise_running(
                 }
                 let code =
                     i32::from_le_bytes(message.payload.try_into().expect("exit status length"));
-                let shutdown = yayatht_sys::control::encode(Kind::Shutdown, 3, &[])?;
-                let _ = yayatht_sys::fdpass::send_packet(dp_control.as_raw_fd(), &shutdown);
+                shutdown_dataplanes(workers);
                 let _ = yayatht_sys::process::wait_pid(namespace_pid, false);
-                let _ = yayatht_sys::process::wait_pid(dataplane_pid, false);
+                wait_dataplanes(workers);
                 return Ok(code);
             }
             Ok(message) if message.kind == Kind::Error => {
@@ -463,34 +489,57 @@ fn supervise_running(
             }
             Err(error) => return Err(error.into()),
         }
-        match yayatht_sys::process::wait_pid(dataplane_pid, true)? {
-            WaitStatus::StillRunning => {}
-            status => {
-                warn!(?status, "data plane exited before target");
-                let _ = yayatht_sys::clone::pidfd_send_signal(
-                    namespace_pidfd.as_raw_fd(),
-                    libc::SIGTERM,
-                );
-                let _ = yayatht_sys::process::wait_pid(namespace_pid, false);
-                return Err(Error::Dataplane("exited before target command".to_owned()));
+        for (worker_index, worker) in workers.iter().enumerate() {
+            match yayatht_sys::process::wait_pid(worker.pid, true)? {
+                WaitStatus::StillRunning => {}
+                status => {
+                    warn!(
+                        worker_index,
+                        ?status,
+                        "data-plane worker exited before target"
+                    );
+                    shutdown_dataplanes(workers);
+                    let _ = yayatht_sys::clone::pidfd_send_signal(
+                        namespace_pidfd.as_raw_fd(),
+                        libc::SIGTERM,
+                    );
+                    let _ = yayatht_sys::process::wait_pid(namespace_pid, false);
+                    wait_dataplanes(workers);
+                    return Err(Error::Dataplane(format!(
+                        "worker {worker_index} exited before target command"
+                    )));
+                }
             }
         }
         match yayatht_sys::process::wait_pid(namespace_pid, true)? {
             WaitStatus::StillRunning => {}
             status => {
                 warn!(?status, "namespace init exited without status message");
-                let shutdown = yayatht_sys::control::encode(Kind::Shutdown, 3, &[])?;
-                let _ = yayatht_sys::fdpass::send_packet(dp_control.as_raw_fd(), &shutdown);
-                let _ = yayatht_sys::process::wait_pid(dataplane_pid, false);
+                shutdown_dataplanes(workers);
+                wait_dataplanes(workers);
                 return Err(Error::Namespace("exited without target status".to_owned()));
             }
         }
-        let _ = dataplane_pidfd;
         std::thread::sleep(Duration::from_millis(20));
     }
 }
 
-fn serve_status(instance: &Instance, dataplane_control: &OwnedFd) -> io::Result<()> {
+fn shutdown_dataplanes(workers: &[DataPlaneWorker]) {
+    let Ok(shutdown) = yayatht_sys::control::encode(Kind::Shutdown, 3, &[]) else {
+        return;
+    };
+    for worker in workers {
+        let _ = yayatht_sys::fdpass::send_packet(worker.control.as_raw_fd(), &shutdown);
+    }
+}
+
+fn wait_dataplanes(workers: &[DataPlaneWorker]) {
+    for worker in workers {
+        let _ = yayatht_sys::process::wait_pid(worker.pid, false);
+    }
+}
+
+fn serve_status(instance: &Instance, workers: &[DataPlaneWorker]) -> io::Result<()> {
     loop {
         let (mut stream, _) = match instance.listener.accept() {
             Ok(value) => value,
@@ -506,7 +555,7 @@ fn serve_status(instance: &Instance, dataplane_control: &OwnedFd) -> io::Result<
         }
         let mut payload: serde_json::Value =
             serde_json::from_slice(&instance.metadata_json()?).map_err(io::Error::other)?;
-        let metrics = query_dataplane_metrics(dataplane_control)?;
+        let metrics = query_dataplane_metrics(workers)?;
         payload
             .as_object_mut()
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid instance JSON"))?
@@ -518,14 +567,27 @@ fn serve_status(instance: &Instance, dataplane_control: &OwnedFd) -> io::Result<
     Ok(())
 }
 
-fn query_dataplane_metrics(control_fd: &OwnedFd) -> io::Result<serde_json::Value> {
-    const REQUEST_ID: u64 = 0x6d65_7472_6963_7301;
-    control::send(control_fd.as_raw_fd(), Kind::Status, REQUEST_ID, &[])?;
+fn query_dataplane_metrics(workers: &[DataPlaneWorker]) -> io::Result<serde_json::Value> {
+    let metrics = workers
+        .iter()
+        .enumerate()
+        .map(|(worker_index, worker)| query_worker_metrics(worker_index, &worker.control))
+        .collect::<io::Result<Vec<_>>>()?;
+    merge_dataplane_metrics(metrics)
+}
+
+fn query_worker_metrics(
+    worker_index: usize,
+    control_fd: &OwnedFd,
+) -> io::Result<serde_json::Value> {
+    const REQUEST_ID_BASE: u64 = 0x6d65_7472_6963_7300;
+    let request_id = REQUEST_ID_BASE + worker_index as u64;
+    control::send(control_fd.as_raw_fd(), Kind::Status, request_id, &[])?;
     let deadline = std::time::Instant::now() + Duration::from_millis(200);
     let mut buffer = vec![0u8; yayatht_sys::control::MAX_PAYLOAD + 20];
     loop {
         match control::receive(control_fd.as_raw_fd(), &mut buffer) {
-            Ok(message) if message.kind == Kind::Status && message.request_id == REQUEST_ID => {
+            Ok(message) if message.kind == Kind::Status && message.request_id == request_id => {
                 return serde_json::from_slice(message.payload).map_err(io::Error::other);
             }
             Ok(message) if message.kind == Kind::Error => {
@@ -538,7 +600,7 @@ fn query_dataplane_metrics(control_fd: &OwnedFd) -> io::Result<serde_json::Value
                 if std::time::Instant::now() >= deadline {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
-                        "timed out querying data-plane metrics",
+                        format!("timed out querying data-plane worker {worker_index} metrics"),
                     ));
                 }
                 std::thread::sleep(Duration::from_millis(1));
@@ -546,6 +608,51 @@ fn query_dataplane_metrics(control_fd: &OwnedFd) -> io::Result<serde_json::Value
             Err(error) => return Err(error),
         }
     }
+}
+
+fn merge_dataplane_metrics(metrics: Vec<serde_json::Value>) -> io::Result<serde_json::Value> {
+    const INVARIANT_FIELDS: [&str; 3] = ["tap_mtu", "tap_offload", "tap_frame_capacity"];
+    let worker_count = metrics.len();
+    let mut metrics = metrics.into_iter();
+    let mut aggregate = metrics
+        .next()
+        .and_then(|value| value.as_object().cloned())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing worker metrics"))?;
+    for worker in metrics {
+        let worker = worker
+            .as_object()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid worker metrics"))?;
+        for (key, value) in worker {
+            let Some(current) = aggregate.get_mut(key) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("worker metric {key:?} is inconsistent"),
+                ));
+            };
+            if INVARIANT_FIELDS.contains(&key.as_str()) {
+                if current != value {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("worker metric {key:?} differs"),
+                    ));
+                }
+                continue;
+            }
+            let total = current
+                .as_u64()
+                .zip(value.as_u64())
+                .map(|(left, right)| left.saturating_add(right))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("worker metric {key:?} is not an unsigned integer"),
+                    )
+                })?;
+            *current = serde_json::Value::from(total);
+        }
+    }
+    aggregate.insert("workers".to_owned(), serde_json::Value::from(worker_count));
+    Ok(serde_json::Value::Object(aggregate))
 }
 
 fn write_identity_maps(pid: i32) -> io::Result<()> {
@@ -562,38 +669,42 @@ fn write_identity_maps(pid: i32) -> io::Result<()> {
     Ok(())
 }
 
-fn kill_children(
-    dataplane_pidfd: &OwnedFd,
-    namespace_pidfd: &OwnedFd,
-    dataplane_pid: i32,
-    namespace_pid: i32,
-) {
-    let _ = yayatht_sys::clone::pidfd_send_signal(dataplane_pidfd.as_raw_fd(), libc::SIGKILL);
+fn kill_dataplanes(workers: &[DataPlaneWorker]) {
+    for worker in workers {
+        let _ = yayatht_sys::clone::pidfd_send_signal(worker.pidfd.as_raw_fd(), libc::SIGKILL);
+    }
+    for worker in workers {
+        let _ = yayatht_sys::process::wait_pid(worker.pid, false);
+    }
+}
+
+fn kill_children(workers: &[DataPlaneWorker], namespace_pidfd: &OwnedFd, namespace_pid: i32) {
+    for worker in workers {
+        let _ = yayatht_sys::clone::pidfd_send_signal(worker.pidfd.as_raw_fd(), libc::SIGKILL);
+    }
     let _ = yayatht_sys::clone::pidfd_send_signal(namespace_pidfd.as_raw_fd(), libc::SIGKILL);
-    let _ = yayatht_sys::process::wait_pid(dataplane_pid, false);
+    for worker in workers {
+        let _ = yayatht_sys::process::wait_pid(worker.pid, false);
+    }
     let _ = yayatht_sys::process::wait_pid(namespace_pid, false);
 }
 
 struct ChildGuard {
-    dataplane_pid: i32,
-    dataplane_pidfd: i32,
+    dataplanes: Vec<(i32, i32)>,
     namespace_pid: i32,
     namespace_pidfd: i32,
     armed: bool,
 }
 
 impl ChildGuard {
-    const fn new(
-        dataplane_pid: i32,
-        dataplane_pidfd: i32,
-        namespace_pid: i32,
-        namespace_pidfd: i32,
-    ) -> Self {
+    fn new(workers: &[DataPlaneWorker], namespace_pid: i32, namespace_pidfd: &OwnedFd) -> Self {
         Self {
-            dataplane_pid,
-            dataplane_pidfd,
+            dataplanes: workers
+                .iter()
+                .map(|worker| (worker.pid, worker.pidfd.as_raw_fd()))
+                .collect(),
             namespace_pid,
-            namespace_pidfd,
+            namespace_pidfd: namespace_pidfd.as_raw_fd(),
             armed: true,
         }
     }
@@ -608,9 +719,13 @@ impl Drop for ChildGuard {
         if !self.armed {
             return;
         }
-        let _ = yayatht_sys::clone::pidfd_send_signal(self.dataplane_pidfd, libc::SIGKILL);
+        for &(_, pidfd) in &self.dataplanes {
+            let _ = yayatht_sys::clone::pidfd_send_signal(pidfd, libc::SIGKILL);
+        }
         let _ = yayatht_sys::clone::pidfd_send_signal(self.namespace_pidfd, libc::SIGKILL);
-        let _ = yayatht_sys::process::wait_pid(self.dataplane_pid, false);
+        for &(pid, _) in &self.dataplanes {
+            let _ = yayatht_sys::process::wait_pid(pid, false);
+        }
         let _ = yayatht_sys::process::wait_pid(self.namespace_pid, false);
     }
 }
@@ -635,4 +750,42 @@ fn debug_failpoint(name: &str) -> io::Result<()> {
         return Err(io::Error::other(format!("injected failure at {name}")));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::merge_dataplane_metrics;
+    use serde_json::json;
+
+    #[test]
+    fn worker_metrics_sum_counters_and_preserve_tap_configuration() {
+        let merged = merge_dataplane_metrics(vec![
+            json!({
+                "tap_rx_packets": 2,
+                "active_tcp_flows": 1,
+                "tap_mtu": 32000,
+                "tap_offload": 1,
+                "tap_frame_capacity": 32024
+            }),
+            json!({
+                "tap_rx_packets": 3,
+                "active_tcp_flows": 4,
+                "tap_mtu": 32000,
+                "tap_offload": 1,
+                "tap_frame_capacity": 32024
+            }),
+        ])
+        .unwrap();
+        assert_eq!(merged["workers"], 2);
+        assert_eq!(merged["tap_rx_packets"], 5);
+        assert_eq!(merged["active_tcp_flows"], 5);
+        assert_eq!(merged["tap_mtu"], 32000);
+    }
+
+    #[test]
+    fn worker_metrics_reject_inconsistent_tap_configuration() {
+        let result =
+            merge_dataplane_metrics(vec![json!({"tap_mtu": 1500}), json!({"tap_mtu": 32000})]);
+        assert!(result.is_err());
+    }
 }

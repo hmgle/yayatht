@@ -114,6 +114,7 @@ pub struct Config {
     pub udp_enabled: bool,
     pub max_udp_flows: usize,
     pub max_udp_associations: usize,
+    pub worker_count: usize,
     pub max_pending_tcp_bytes: usize,
     pub max_retained_tcp_bytes: usize,
     pub tcp_receive_buffer_bytes: usize,
@@ -554,8 +555,9 @@ impl Reactor {
             .map_err(|_| Error::Invariant("TAP MTU exceeds usize"))?
             .checked_add(ethernet::ETHERNET_HEADER_LEN + vnet_len)
             .ok_or(Error::Invariant("TAP frame capacity overflow"))?;
+        let worker_pool_bytes = TAP_FRAME_POOL_BYTES / config.worker_count;
         let frame_pool_frames =
-            (TAP_FRAME_POOL_BYTES / frame_capacity).clamp(1, TAP_FRAME_POOL_MAX_FRAMES);
+            (worker_pool_bytes / frame_capacity).clamp(1, TAP_FRAME_POOL_MAX_FRAMES);
         let metrics = Metrics {
             max_pending_tcp_bytes: config.max_pending_tcp_bytes as u64,
             max_retained_tcp_bytes: config.max_retained_tcp_bytes as u64,
@@ -597,7 +599,7 @@ impl Reactor {
             .unwrap_or(65_520)
             .saturating_add(22);
         let gso_pool_frames = if config.tap_offload {
-            (TAP_GSO_POOL_BYTES / gso_frame_capacity).max(1)
+            (TAP_GSO_POOL_BYTES / config.worker_count / gso_frame_capacity).max(1)
         } else {
             0
         };
@@ -4611,6 +4613,7 @@ mod tests {
             udp_enabled: true,
             max_udp_flows: 16,
             max_udp_associations: 4,
+            worker_count: 1,
             max_pending_tcp_bytes: 65536,
             max_retained_tcp_bytes: 65536,
             tcp_receive_buffer_bytes: 65536,

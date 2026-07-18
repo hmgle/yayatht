@@ -226,6 +226,16 @@ fn echo_payload_case(
 }
 
 fn udp_echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str) {
+    udp_echo_case_with_flags(bind, gateway, family_flag, label, &[]);
+}
+
+fn udp_echo_case_with_flags(
+    bind: SocketAddr,
+    gateway: &str,
+    family_flag: &str,
+    label: &str,
+    run_flags: &[&str],
+) {
     if !supported() {
         eprintln!("skipping rootless TAP test: user namespaces or /dev/net/tun unavailable");
         return;
@@ -261,10 +271,9 @@ fn udp_echo_case(bind: SocketAddr, gateway: &str, family_flag: &str, label: &str
             family_flag,
             "--dns",
             "off",
-            "--name",
-            &name,
-            "--",
         ])
+        .args(run_flags)
+        .args(["--name", &name, "--"])
         .arg(test_binary)
         .args(["--ignored", "--exact", "udp_client_process", "--quiet"])
         .env("YAYATHT_TEST_UDP_CLIENT", "echo")
@@ -1698,6 +1707,18 @@ fn ipv6_direct_udp_echo_round_trips() {
 }
 
 #[test]
+fn four_workers_preserve_tcp_echo() {
+    echo_payload_case(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        "192.0.2.1",
+        &["--no-ipv6", "--workers", "4"],
+        "four-worker-tcp",
+        vec![0x5a; 32 * 1024],
+        &[],
+    );
+}
+
+#[test]
 fn udp_off_drops_namespace_datagrams() {
     if !supported() {
         return;
@@ -1909,6 +1930,77 @@ fn status_socket_reports_running_instance() {
     );
     assert!(child.wait().unwrap().success());
     assert!(!socket.parent().unwrap().exists());
+}
+
+#[test]
+fn default_is_single_worker() {
+    if !supported() {
+        return;
+    }
+    let name = unique_name("default-worker");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args(["run", "--direct", "--name", &name, "--", "/bin/sleep", "1"])
+        .spawn()
+        .expect("spawn default worker instance");
+    thread::sleep(Duration::from_millis(100));
+    let value = status_json(&name);
+    assert_eq!(value["dataplane"]["workers"], 1);
+    assert_eq!(value["dataplane_worker_pids"].as_array().unwrap().len(), 1);
+    assert_eq!(value["dataplane_pid"], value["dataplane_worker_pids"][0]);
+    assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn status_aggregates_worker_metrics() {
+    if !supported() {
+        return;
+    }
+    const FLOWS: usize = 8;
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let (complete_tx, complete_rx) = mpsc::channel();
+    let server = thread::spawn(move || {
+        for _ in 0..FLOWS {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut byte = [0u8; 1];
+            stream.read_exact(&mut byte).unwrap();
+            stream.write_all(&byte).unwrap();
+        }
+        complete_tx.send(()).unwrap();
+    });
+    let name = unique_name("worker-status");
+    let script = format!(
+        "for i in 1 2 3 4 5 6 7 8; do printf x | busybox nc -w 3 192.0.2.1 {port}; done; \
+         busybox sleep 2"
+    );
+    let mut child = Command::new(env!("CARGO_BIN_EXE_yayatht"))
+        .args([
+            "run",
+            "--direct",
+            "--host-loopback",
+            "--no-ipv6",
+            "--dns",
+            "off",
+            "--workers",
+            "4",
+            "--name",
+            &name,
+            "--",
+            "sh",
+            "-c",
+            &script,
+        ])
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    complete_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    let value = status_json(&name);
+    assert_eq!(value["dataplane"]["workers"], 4);
+    assert_eq!(value["dataplane_worker_pids"].as_array().unwrap().len(), 4);
+    assert_eq!(value["dataplane"]["tcp_created"], FLOWS);
+    assert!(value["dataplane"]["tap_rx_packets"].as_u64().unwrap() > FLOWS as u64);
+    assert!(child.wait().unwrap().success());
+    server.join().unwrap();
 }
 
 #[test]
@@ -2247,6 +2339,50 @@ fn spawn_mock_resolver(
             thread::spawn(move || serve_dns_connection(stream, lookup));
         }
     });
+}
+
+#[test]
+fn four_workers_preserve_udp_and_dns() {
+    if !supported() {
+        return;
+    }
+    udp_echo_case_with_flags(
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
+        "192.0.2.1",
+        "--no-ipv6",
+        "four-worker-udp",
+        &["--workers", "4"],
+    );
+
+    let Some(client) = dns_client_binary() else {
+        eprintln!("skipping DNS test: dns-client helper not built");
+        return;
+    };
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let resolver = listener.local_addr().unwrap();
+    spawn_mock_resolver(listener, |name| {
+        assert_eq!(name, "four-worker.test");
+        Some(([198, 51, 100, 55], 1))
+    });
+    let output = namespace_output(
+        &[
+            "--direct",
+            "--workers",
+            "4",
+            "--no-ipv6",
+            "--dns-upstream",
+            &resolver.to_string(),
+        ],
+        &[&client, "query", "192.0.2.1", "four-worker.test"],
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "yayatht failed: {stderr}");
+    assert!(
+        stdout.contains("a=198.51.100.55") && stdout.contains("id=ok"),
+        "unexpected DNS result: {stdout} {stderr}"
+    );
 }
 
 #[test]

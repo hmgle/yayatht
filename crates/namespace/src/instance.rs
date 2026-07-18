@@ -15,6 +15,8 @@ pub struct InstanceMetadata {
     pub started_unix_ms: u128,
     pub supervisor_pid: u32,
     pub dataplane_pid: Option<i32>,
+    #[serde(default)]
+    pub dataplane_worker_pids: Vec<i32>,
     pub namespace_init_pid: Option<i32>,
     pub target_pid: Option<i32>,
     pub network_namespace_inode: Option<u64>,
@@ -51,6 +53,7 @@ impl Instance {
                 .as_millis(),
             supervisor_pid: std::process::id(),
             dataplane_pid: None,
+            dataplane_worker_pids: Vec::new(),
             namespace_init_pid: None,
             target_pid: None,
             network_namespace_inode: None,
@@ -72,8 +75,9 @@ impl Instance {
         &self.metadata
     }
 
-    pub fn update_children(&mut self, dataplane: i32, namespace_init: i32) -> io::Result<()> {
-        self.metadata.dataplane_pid = Some(dataplane);
+    pub fn update_children(&mut self, dataplanes: &[i32], namespace_init: i32) -> io::Result<()> {
+        self.metadata.dataplane_pid = dataplanes.first().copied();
+        self.metadata.dataplane_worker_pids = dataplanes.to_vec();
         self.metadata.namespace_init_pid = Some(namespace_init);
         let namespace = fs::metadata(format!("/proc/{namespace_init}/ns/net"))?;
         self.metadata.network_namespace_inode = Some(namespace.ino());

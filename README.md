@@ -14,9 +14,10 @@ is enabled for direct routes, including host-loopback mapping, and SOCKS5
 uses one standards-compliant UDP ASSOCIATE per namespace source endpoint.
 `--udp off` restores drop-all behavior for non-DNS datagrams. SOCKS5 can
 also carry gateway DNS over the association with `--dns proxy-udp`; the
-default remains `proxy-tcp`. TAP multiqueue is the remaining Phase 2 data
-path feature. The data-plane sandbox is enabled by default: it uses a
-generated seccomp allowlist, pivots to an empty tmpfs, and disables core
+default remains `proxy-tcp`. `--workers COUNT` enables one share-nothing
+reactor per TAP queue; it defaults to 1, while 4 workers are calibrated for
+multi-flow workloads. The data-plane sandbox is enabled by default: it uses
+a generated seccomp allowlist, pivots to an empty tmpfs, and disables core
 dumps. `--sandbox off` is available for diagnosis and emits a warning.
 
 ## Build
@@ -36,7 +37,9 @@ target/release/yayatht run --direct --host-loopback -- \
 ```
 
 `--host-loopback` maps the synthetic gateway to the host loopback address on
-the same port. It is disabled by default.
+the same port. It is disabled by default. `--workers 4` enables TAP
+multiqueue for multi-flow workloads; each worker owns an independent reactor,
+flow tables, timers, and buffer pools.
 
 To use the host SOCKS5 proxy from the reference environment:
 

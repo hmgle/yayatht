@@ -123,7 +123,9 @@ Aligned with design §15 Phase 2, §5.3, §8, §9 and §11:
 8. **fd budget**: the data-plane `RLIMIT_NOFILE` generalizes to
    `max_tcp_flows + max_udp_flows + 2·max_udp_associations + 32`
    (default 16416). The rootless assertion on the old `4096 + 32` value is
-   updated deliberately with this change.
+   updated deliberately with this change. With multiqueue, configured flow
+   limits divide across worker processes and the 32-fd runtime headroom
+   applies independently to each worker.
 
 ## Stages
 
@@ -223,7 +225,14 @@ aggregate scaling evidence recorded.
 **Tests**: rootless `default_is_single_worker`,
 `four_workers_preserve_tcp_echo`, `four_workers_preserve_udp_and_dns`,
 `status_aggregates_worker_metrics`; benchmark extension.
-**Status**: Not Started
+**Status**: Complete (2026-07-18). `IFF_MULTI_QUEUE` creates one TAP queue
+and sandboxed reactor process per worker. Flow, association, byte and buffer
+budgets divide across workers; the supervisor broadcasts shutdown, treats
+any worker death as fatal, and merges metric counters while preserving TAP
+configuration fields. The rootless cases pass at 1 and 4 workers. A 32-flow
+release calibration recorded 19.55 Gbit/s at 1 worker and 30.84 Gbit/s at 4
+workers (median of three), a 57.8% improvement; see
+`docs/phase2-multiqueue-calibration-2026-07-18.md`. Default remains 1.
 
 ### Stage 6: Exit work
 

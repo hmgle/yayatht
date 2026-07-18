@@ -83,6 +83,13 @@ struct RunArgs {
     max_udp_associations: usize,
     #[arg(
         long,
+        default_value_t = 1,
+        value_name = "COUNT",
+        help = "Run one data-plane reactor per TAP queue"
+    )]
+    workers: usize,
+    #[arg(
+        long,
         value_parser = clap::builder::PossibleValuesParser::new(["on", "off"]),
         default_value = "on",
         value_name = "on|off",
@@ -246,6 +253,7 @@ fn run(args: RunArgs) -> Result<i32, Box<dyn std::error::Error>> {
         udp_enabled: args.udp == "on",
         max_udp_flows: args.max_udp_flows,
         max_udp_associations: args.max_udp_associations,
+        workers: args.workers,
         max_pending_tcp_bytes: args.max_pending_tcp_bytes,
         max_retained_tcp_bytes: args.max_retained_tcp_bytes,
         tcp_receive_buffer_bytes: args.tcp_receive_buffer_bytes,
