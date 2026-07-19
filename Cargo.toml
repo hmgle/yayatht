@@ -27,7 +27,7 @@ arrayvec = "0.7.6"
 base64 = "0.22.1"
 bitflags = "2.9.4"
 clap = { version = "4.5.48", features = ["derive"] }
-getrandom = "0.3.3"
+getrandom = "0.4.3"
 libc = "0.2.176"
 linux-raw-sys = { version = "0.12.1", features = ["net"] }
 rustix = { version = "1.1.2", features = ["event", "fs", "mount", "net", "pipe", "process", "rand", "runtime", "system", "thread", "time"] }
