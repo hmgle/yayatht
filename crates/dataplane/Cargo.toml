@@ -19,10 +19,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-yayatht-packet = { path = "../packet" }
-yayatht-proxy-proto = { path = "../proxy-proto" }
-yayatht-sys = { path = "../sys" }
-yayatht-tcp-adapter = { path = "../tcp-adapter" }
+yayatht-packet = { version = "=0.1.0", path = "../packet" }
+yayatht-proxy-proto = { version = "=0.1.0", path = "../proxy-proto" }
+yayatht-sys = { version = "=0.1.0", path = "../sys" }
+yayatht-tcp-adapter = { version = "=0.1.0", path = "../tcp-adapter" }
 
 [lints]
 workspace = true

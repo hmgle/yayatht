@@ -13,7 +13,7 @@ publish.workspace = true
 [dependencies]
 arrayvec.workspace = true
 thiserror.workspace = true
-yayatht-packet = { path = "../packet" }
+yayatht-packet = { version = "=0.1.0", path = "../packet" }
 
 [lints]
 workspace = true

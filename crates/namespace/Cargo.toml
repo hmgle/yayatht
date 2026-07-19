@@ -18,10 +18,10 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-yayatht-dataplane = { path = "../dataplane" }
-yayatht-packet = { path = "../packet" }
-yayatht-proxy-proto = { path = "../proxy-proto" }
-yayatht-sys = { path = "../sys" }
+yayatht-dataplane = { version = "=0.1.0", path = "../dataplane" }
+yayatht-packet = { version = "=0.1.0", path = "../packet" }
+yayatht-proxy-proto = { version = "=0.1.0", path = "../proxy-proto" }
+yayatht-sys = { version = "=0.1.0", path = "../sys" }
 
 [lints]
 workspace = true

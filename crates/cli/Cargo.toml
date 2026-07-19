@@ -18,9 +18,9 @@ rustix.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-yayatht-sys = { path = "../sys" }
-yayatht-namespace = { path = "../namespace" }
-yayatht-proxy-proto = { path = "../proxy-proto" }
+yayatht-sys = { version = "=0.1.0", path = "../sys" }
+yayatht-namespace = { version = "=0.1.0", path = "../namespace" }
+yayatht-proxy-proto = { version = "=0.1.0", path = "../proxy-proto" }
 
 [lints]
 workspace = true

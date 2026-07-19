@@ -1800,6 +1800,9 @@ fn udp_port_unreachable_synthesizes_icmpv4() {
 
 #[test]
 fn sandbox_off_runs_busybox_echo() {
+    if !supported() {
+        return;
+    }
     let stderr = echo_payload_case(
         SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
         "192.0.2.1",
