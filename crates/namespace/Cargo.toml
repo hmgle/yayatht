@@ -3,7 +3,12 @@ name = "yayatht-namespace"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+description = "Linux namespace lifecycle and supervision for yayatht"
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 getrandom.workspace = true

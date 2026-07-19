@@ -15,8 +15,12 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.93"
+authors = ["hmgle"]
+description = "A rootless Linux namespace network proxy with direct, SOCKS5, and HTTP CONNECT upstreams"
 license = "GPL-3.0-only"
+homepage = "https://github.com/hmgle/yayatht"
 repository = "https://github.com/hmgle/yayatht"
+publish = false
 
 [workspace.dependencies]
 arrayvec = "0.7.6"

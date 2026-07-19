@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Legacy `virtio_net_hdr` prefix carried on every TAP frame when the
 //! device is opened with `IFF_VNET_HDR` (Linux `linux/virtio_net.h`).
 //! The TUN interface exchanges the header in native endianness.

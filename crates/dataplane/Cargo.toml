@@ -3,7 +3,12 @@ name = "yayatht-dataplane"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+description = "Packet-processing reactor for the yayatht rootless network proxy"
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 arrayvec.workspace = true

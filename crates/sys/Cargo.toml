@@ -3,7 +3,12 @@ name = "yayatht-sys"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+description = "Linux TUN, netlink, socket, process, and sandbox primitives for yayatht"
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
 build = "build.rs"
 
 [dependencies]

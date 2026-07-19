@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! Minimal DNS test client run inside the namespace by the rootless
 //! integration suite. Prints machine-checkable summaries; the host test
 //! asserts on stdout.

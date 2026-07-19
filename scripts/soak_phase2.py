@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 hmgle
+# SPDX-License-Identifier: GPL-3.0-only
+
 
 """Run a bounded Phase 2 TCP/UDP/DNS soak and sample worker resources."""
 

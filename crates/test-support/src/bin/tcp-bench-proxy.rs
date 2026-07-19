@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use std::env;

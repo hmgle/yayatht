@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 hmgle
+# SPDX-License-Identifier: GPL-3.0-only
+
 
 """Measure namespace TCP connect latency through yayatht.
 

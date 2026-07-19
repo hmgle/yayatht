@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use std::io;
 use std::os::fd::RawFd;
 use yayatht_sys::control::{Kind, Message};

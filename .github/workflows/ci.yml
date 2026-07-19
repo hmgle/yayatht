@@ -3,17 +3,53 @@ name: ci
 on:
   push:
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
+  repository-hygiene:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - name: Reject local development paths
+        shell: bash
+        run: |
+          if git grep -nE '/(home|Users)/[^/[:space:]]+' -- .; then
+            echo "tracked files contain a local development path" >&2
+            exit 1
+          fi
+      - name: Verify source license headers
+        shell: bash
+        run: |
+          set -euo pipefail
+          missing=0
+          while IFS= read -r file; do
+            if ! head -n 6 "$file" | grep -Eq '^(//|#) SPDX-FileCopyrightText: 2026 hmgle$'; then
+              echo "missing SPDX copyright: $file" >&2
+              missing=1
+            fi
+            if ! head -n 6 "$file" | grep -Eq '^(//|#) SPDX-License-Identifier: GPL-3.0-only$'; then
+              echo "missing SPDX license: $file" >&2
+              missing=1
+            fi
+          done < <(git ls-files '*.rs' '*.py')
+          exit "$missing"
+
   stable:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: stable
           components: clippy,rustfmt
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -21,19 +57,22 @@ jobs:
 
   msrv:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@master
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
           toolchain: "1.93.1"
       - run: cargo check --workspace --all-targets
 
   targets:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
         with:
+          toolchain: stable
           targets: x86_64-unknown-linux-musl,aarch64-unknown-linux-gnu,aarch64-unknown-linux-musl
       - run: cargo check --workspace --target x86_64-unknown-linux-musl
       - run: cargo check --workspace --target aarch64-unknown-linux-gnu
@@ -41,9 +80,7 @@ jobs:
 
   supply-chain:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: EmbarkStudios/cargo-deny-action@v2
-      - uses: rustsec/audit-check@v2
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1

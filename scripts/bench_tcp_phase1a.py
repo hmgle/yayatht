@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 hmgle
+# SPDX-License-Identifier: GPL-3.0-only
+
 
 """Run the Phase 1A direct and explicit-proxy TCP calibration matrix."""
 
@@ -91,6 +94,12 @@ def run_text(command: list[str]) -> str:
         text=True,
     )
     return result.stdout.strip() if result.returncode == 0 else "unavailable"
+
+
+def mihomo_version(path: Path | None) -> str:
+    if path is None:
+        return "not configured"
+    return run_text([str(path), "-v"]).replace("\n", "; ")
 
 
 def git_revision(path: Path | None) -> str:
@@ -543,7 +552,7 @@ def run_case(
         "requested_tap_offload": args.tap_offload,
         "requested_tcp_send_buffer_bytes": args.tcp_send_buffer_bytes,
         "kernel": run_text(["uname", "-srmo"]),
-        "mihomo_version": run_text([str(args.mihomo), "-v"]).replace("\n", "; "),
+        "mihomo_version": mihomo_version(args.mihomo),
         "mihomo_tun_state": mihomo_tun_state(),
         "status": "ok",
         "error": "",
@@ -581,7 +590,7 @@ def error_record(
         "requested_tap_offload": args.tap_offload,
         "requested_tcp_send_buffer_bytes": args.tcp_send_buffer_bytes,
         "kernel": run_text(["uname", "-srmo"]),
-        "mihomo_version": run_text([str(args.mihomo), "-v"]).replace("\n", "; "),
+        "mihomo_version": mihomo_version(args.mihomo),
         "mihomo_tun_state": mihomo_tun_state(),
         "status": "error",
         "error": str(error).replace("\n", " | ")[:2000],
@@ -610,7 +619,9 @@ def parse_args() -> argparse.Namespace:
         "--proxy-binary", type=Path, default=Path("target/release/tcp-bench-proxy")
     )
     parser.add_argument(
-        "--mihomo", type=Path, default=Path("/home/gle/.local/bin/mihomo")
+        "--mihomo",
+        type=Path,
+        help="mihomo executable (default: find mihomo on PATH when needed)",
     )
     parser.add_argument("--external-proxy", default="127.0.0.1:7890")
     parser.add_argument(
@@ -645,6 +656,9 @@ def validate_executable(
         if required:
             raise SystemExit(f"{label} is required")
         return None
+    if not path.is_absolute() and path.parent == Path("."):
+        discovered = shutil.which(str(path))
+        path = Path(discovered) if discovered is not None else path
     path = Path(os.path.abspath(path))
     if not path.is_file() or not os.access(path, os.X_OK):
         raise SystemExit(f"not executable: {path}")
@@ -682,7 +696,13 @@ def main() -> int:
     args.proxy_dev = validate_executable(args.proxy_dev, "proxy-dev pasta")
     args.nsproxy = validate_executable(args.nsproxy, "nsproxy")
     args.proxy_ns = validate_executable(args.proxy_ns, "proxy-ns")
-    args.mihomo = args.mihomo.resolve()
+    if args.mihomo is None and "mihomo" in args.scenarios:
+        discovered = shutil.which("mihomo")
+        if discovered is not None:
+            args.mihomo = Path(discovered)
+    args.mihomo = validate_executable(
+        args.mihomo, "mihomo", required="mihomo" in args.scenarios
+    )
 
     direct_backends = [Backend("yayatht-direct", args.yayatht, "yayatht-direct")]
     if args.pasta:

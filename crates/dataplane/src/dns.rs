@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 //! DNS `proxy-tcp` transaction engine (design §9 mode 1).
 //!
 //! Pure message logic: UDP queries are validated, given a private upstream

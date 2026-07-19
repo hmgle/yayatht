@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 #[must_use]
 pub const fn before(left: u32, right: u32) -> bool {
     (left.wrapping_sub(right) as i32) < 0

@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use clap::{ArgGroup, Args, Parser, Subcommand};
 use std::ffi::OsString;
 use std::fs::OpenOptions;
@@ -23,7 +26,9 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Run a command in a private namespace with the selected network upstream.
     Run(Box<RunArgs>),
+    /// Query a running named instance.
     Status(StatusArgs),
 }
 
@@ -63,29 +68,52 @@ struct RunArgs {
         help = "Read the proxy password from a protected file"
     )]
     proxy_password_file: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "NAME",
+        help = "Assign an instance name for status queries and runtime state"
+    )]
     name: Option<String>,
-    #[arg(long, value_name = "ROOT")]
+    #[arg(
+        long,
+        value_name = "ROOT",
+        help = "Store runtime state under ROOT (default: $XDG_RUNTIME_DIR/yayatht)"
+    )]
     runtime_dir: Option<PathBuf>,
-    #[arg(long, default_value_t = 4096)]
+    #[arg(
+        long,
+        default_value_t = 4096,
+        value_name = "COUNT",
+        help = "Limit concurrent TCP flows across all workers (1..=1048576)"
+    )]
     max_tcp_flows: usize,
     #[arg(
         long,
         value_parser = clap::builder::PossibleValuesParser::new(["on", "off"]),
         default_value = "on",
         value_name = "on|off",
-        help = "Forward namespace UDP datagrams"
+        help = "Forward namespace UDP datagrams (HTTP CONNECT remains TCP-only)"
     )]
     udp: String,
-    #[arg(long, default_value_t = 8192)]
+    #[arg(
+        long,
+        default_value_t = 8192,
+        value_name = "COUNT",
+        help = "Limit concurrent UDP flows across all workers (1..=1048576)"
+    )]
     max_udp_flows: usize,
-    #[arg(long, default_value_t = 2048)]
+    #[arg(
+        long,
+        default_value_t = 2048,
+        value_name = "COUNT",
+        help = "Limit SOCKS5 UDP associations across all workers (1..=1048576)"
+    )]
     max_udp_associations: usize,
     #[arg(
         long,
         default_value_t = 1,
         value_name = "COUNT",
-        help = "Run one data-plane reactor per TAP queue"
+        help = "Run 1 to 256 data-plane reactors, one per TAP queue"
     )]
     workers: usize,
     #[arg(
@@ -96,18 +124,39 @@ struct RunArgs {
         help = "Apply role seccomp and the data-plane filesystem sandbox"
     )]
     sandbox: String,
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    #[arg(
+        long,
+        default_value_t = 64 * 1024 * 1024,
+        value_name = "BYTES",
+        help = "Limit queued namespace-to-upstream TCP bytes globally (16 KiB..=1 TiB)"
+    )]
     max_pending_tcp_bytes: usize,
-    #[arg(long, default_value_t = 64 * 1024 * 1024)]
+    #[arg(
+        long,
+        default_value_t = 64 * 1024 * 1024,
+        value_name = "BYTES",
+        help = "Limit retained retransmission TCP bytes globally (16 KiB..=1 TiB)"
+    )]
     max_retained_tcp_bytes: usize,
-    #[arg(long, default_value_t = 256 * 1024)]
+    #[arg(
+        long,
+        default_value_t = 256 * 1024,
+        value_name = "BYTES",
+        help = "Set each upstream TCP receive buffer (16 KiB..=16 MiB)"
+    )]
     tcp_receive_buffer_bytes: usize,
-    #[arg(long, default_value_t = 256 * 1024)]
+    #[arg(
+        long,
+        default_value_t = 256 * 1024,
+        value_name = "BYTES",
+        help = "Set each upstream TCP send buffer (16 KiB..=16 MiB)"
+    )]
     tcp_send_buffer_bytes: usize,
     #[arg(
         long,
         default_value_t = yayatht_sys::tun::DEFAULT_TAP_MTU,
-        value_name = "BYTES"
+        value_name = "BYTES",
+        help = "Set the namespace TAP MTU (1280..=65520)"
     )]
     tap_mtu: u32,
     #[arg(
@@ -123,7 +172,7 @@ struct RunArgs {
         value_parser = clap::builder::PossibleValuesParser::new(["proxy-tcp", "proxy-udp", "off"]),
         default_value = "proxy-tcp",
         value_name = "proxy-tcp|proxy-udp|off",
-        help = "Intercept namespace DNS and forward it through the upstream"
+        help = "Intercept DNS; proxy-udp requires SOCKS5 and UDP enabled"
     )]
     dns: String,
     #[arg(
@@ -133,26 +182,37 @@ struct RunArgs {
         help = "Resolver for intercepted DNS (default: first host resolv.conf nameserver, port 53)"
     )]
     dns_upstream: Option<SocketAddr>,
-    #[arg(long)]
+    #[arg(long, help = "Disable IPv4 inside the target namespace")]
     no_ipv4: bool,
-    #[arg(long)]
+    #[arg(long, help = "Disable IPv6 inside the target namespace")]
     no_ipv6: bool,
     #[arg(
         long,
-        help = "Map the synthetic gateway to host loopback on the same port"
+        help = "Map the synthetic gateway to host loopback; valid only with --direct"
     )]
     host_loopback: bool,
-    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    #[arg(
+        last = true,
+        required = true,
+        num_args = 1..,
+        allow_hyphen_values = true,
+        value_name = "COMMAND",
+        help = "Command and arguments to execute in the namespace"
+    )]
     command: Vec<OsString>,
 }
 
 #[derive(Debug, Args)]
 struct StatusArgs {
-    #[arg(long)]
+    #[arg(long, value_name = "NAME", help = "Name of the running instance")]
     name: String,
-    #[arg(long, value_name = "ROOT")]
+    #[arg(
+        long,
+        value_name = "ROOT",
+        help = "Read runtime state under ROOT (default: $XDG_RUNTIME_DIR/yayatht)"
+    )]
     runtime_dir: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, help = "Print the full status response as JSON")]
     json: bool,
 }
 
@@ -383,4 +443,15 @@ fn status(args: StatusArgs) -> Result<i32, Box<dyn std::error::Error>> {
         );
     }
     Ok(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
 }

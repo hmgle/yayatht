@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use crate::ip::{Ipv4Packet, Ipv6Packet};
 use crate::{PacketError, checksum};
 

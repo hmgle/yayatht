@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use std::ffi::CString;
 use std::io;
 use std::mem::size_of;

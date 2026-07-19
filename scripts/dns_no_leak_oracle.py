@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: 2026 hmgle
+# SPDX-License-Identifier: GPL-3.0-only
+
 
 """Capture direct resolver access while exercising proxy-tcp and proxy-udp."""
 

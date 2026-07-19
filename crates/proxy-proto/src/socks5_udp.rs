@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use crate::SocksAddress;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use thiserror::Error;

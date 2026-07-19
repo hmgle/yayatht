@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use std::num::NonZeroU32;
 
 const SLOT_BITS: u64 = 20;

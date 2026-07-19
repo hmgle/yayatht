@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use crate::buffer::{BufferPool, FrameBuffer};
 use crate::dns;
 use crate::flow_table::{EpollToken, FlowId, FlowTable, Resource};

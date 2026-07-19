@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use crate::{PacketError, checksum, ip::Ipv4Packet, ip::Ipv6Packet};
 
 pub const TCP_MIN_HEADER_LEN: usize = 20;

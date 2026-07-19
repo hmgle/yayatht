@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use crate::config::{DnsMode, LaunchConfig, NetworkConfig, SandboxConfig};
 use crate::control;
 use crate::instance::Instance;

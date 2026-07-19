@@ -3,7 +3,13 @@ name = "yayatht"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+description = "Rootless Linux namespace network proxy with direct, SOCKS5, and HTTP CONNECT upstreams"
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
+readme = "../../README.md"
 
 [dependencies]
 clap.workspace = true

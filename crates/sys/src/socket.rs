@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use std::io;
 use std::mem::size_of;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -195,7 +198,7 @@ pub fn receive_udp_error(fd: RawFd) -> io::Result<Option<UdpSocketError>> {
     message.msg_iov = std::ptr::from_mut(&mut iovec);
     message.msg_iovlen = 1;
     message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = control.len();
+    message.msg_controllen = control.len() as _;
     // SAFETY: message references writable payload, address, and control storage.
     let received = unsafe {
         libc::recvmsg(
@@ -227,8 +230,12 @@ pub fn receive_udp_error(fd: RawFd) -> io::Result<Option<UdpSocketError>> {
             }
             _ => None,
         };
+        #[cfg(target_env = "musl")]
+        let control_len = header.cmsg_len as usize;
+        #[cfg(not(target_env = "musl"))]
+        let control_len = header.cmsg_len;
         if let Some(family) = family
-            && header.cmsg_len
+            && control_len
                 >= unsafe { libc::CMSG_LEN(size_of::<libc::sock_extended_err>() as u32) } as usize
         {
             // SAFETY: cmsg_len covers a complete sock_extended_err payload.
@@ -546,12 +553,17 @@ pub fn drain_tx_timestamps(fd: RawFd) -> io::Result<TxTimestampDrain> {
         }
         // SAFETY: messages references writable storage for the duration of
         // recvmmsg.
+        // musl types the flags argument as c_uint, glibc as c_int.
+        #[cfg(target_env = "musl")]
+        let errqueue_flags = (libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT) as libc::c_uint;
+        #[cfg(not(target_env = "musl"))]
+        let errqueue_flags = libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT;
         let received = unsafe {
             libc::recvmmsg(
                 fd,
                 messages.as_mut_ptr(),
                 BATCH as libc::c_uint,
-                libc::MSG_ERRQUEUE | libc::MSG_DONTWAIT,
+                errqueue_flags,
                 std::ptr::null_mut(),
             )
         };

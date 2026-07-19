@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs;

@@ -3,7 +3,12 @@ name = "yayatht-test-support"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
+authors.workspace = true
+description = "Integration-test and benchmark helpers for yayatht"
 license.workspace = true
+homepage.workspace = true
+repository.workspace = true
+publish.workspace = true
 
 [dependencies]
 base64.workspace = true

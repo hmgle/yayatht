@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use crate::flow_table::{FlowId, FlowTable};
 use std::collections::HashMap;
 use std::net::SocketAddr;

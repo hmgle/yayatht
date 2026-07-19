@@ -1,4 +1,9 @@
 /target/
 /.cache/
+/.ruff_cache/
+/AGENTS.md
+/CLAUDE.md
+__pycache__/
+*.py[cod]
 *.pcap
 *.log

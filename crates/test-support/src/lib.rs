@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 #![forbid(unsafe_code)]
 
 pub const HOST_LOOPBACK_V4: &str = "192.0.2.1";

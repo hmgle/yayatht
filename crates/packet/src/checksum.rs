@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 #![allow(clippy::cast_possible_truncation)]
 
 pub fn sum_words(mut sum: u32, mut bytes: &[u8]) -> u32 {

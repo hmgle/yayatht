@@ -1,3 +1,6 @@
+// SPDX-FileCopyrightText: 2026 hmgle
+// SPDX-License-Identifier: GPL-3.0-only
+
 use linux_raw_sys::net::tcp_info;
 use std::io;
 use std::mem::{MaybeUninit, offset_of, size_of};
